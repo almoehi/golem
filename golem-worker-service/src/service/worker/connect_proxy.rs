@@ -22,7 +22,7 @@ use golem_api_grpc::proto::golem::worker::LogEvent;
 use golem_common::model::{AgentEvent, AgentId};
 use poem::web::websocket::Message;
 use tonic::Status;
-use tracing::{error, info};
+use tracing::{debug, info};
 
 /// Proxies a worker connection, listening for either connection to close. Websocket sink will be closed at the end.
 ///
@@ -91,7 +91,7 @@ pub async fn proxy_worker_connection(
 
     info!("Closing websocket connection");
     if let Err(error) = websocket.close().await {
-        error!(
+        debug!(
             error = error.to_string(),
             "Error closing WebSocket connection"
         );

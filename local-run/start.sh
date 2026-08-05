@@ -18,6 +18,38 @@ LOCAL_RUN_DIR="${GOLEM_DIR}/local-run"
 
 rm -rf "${LOCAL_RUN_DIR}/data/shard-manager"
 mkdir -pv "${LOCAL_RUN_DIR}/data/redis" "${LOCAL_RUN_DIR}/data/shard-manager" "${LOCAL_RUN_DIR}/logs"
+mkdir -pv "${GOLEM_DIR}/data"
+
+# Kill any process currently listening on a TCP port (macOS / Linux).
+kill_port() {
+  local port=$1
+  local pid
+  pid=$(lsof -ti tcp:"$port" 2>/dev/null) || true
+  if [ -n "$pid" ]; then
+    echo "Killing existing process on port $port (pid $pid)"
+    kill -9 $pid 2>/dev/null || true
+  fi
+}
+
+# Release all ports used by golem services before (re-)starting, so a leftover
+# process from a previous run never causes "Address already in use".
+for port in \
+  ${REGISTRY_SERVICE_HTTP_PORT:-8080} \
+  ${COMPONENT_COMPILATION_SERVICE_HTTP_PORT:-8081} \
+  ${SHARD_MANAGER_HTTP_PORT:-8082} \
+  ${WORKER_EXECUTOR_HTTP_PORT:-8083} \
+  ${WORKER_SERVICE_HTTP_PORT:-8084} \
+  ${DEBUGGING_SERVICE_HTTP_PORT:-8085} \
+  ${REGISTRY_SERVICE_GRPC_PORT:-9090} \
+  ${COMPONENT_COMPILATION_SERVICE_GRPC_PORT:-9091} \
+  ${SHARD_MANAGER_GRPC_PORT:-9092} \
+  ${WORKER_EXECUTOR_GRPC_PORT:-9093} \
+  ${WORKER_SERVICE_GRPC_PORT:-9094} \
+  ${WORKER_SERVICE_CUSTOM_REQUEST_HTTP_PORT:-9005} \
+  ${WORKER_SERVICE_MCP_HTTP_PORT:-9006} \
+  9881; do
+  kill_port "$port"
+done
 
 # start redis
 # Redis persistence isn't needed for local-run, and misconfigured snapshotting can force Redis into

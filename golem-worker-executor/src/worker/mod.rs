@@ -1475,7 +1475,12 @@ impl<Ctx: WorkerCtx> Worker<Ctx> {
 
             let (idempotency_key, invocation_payload, invocation_context) = invocation.into_parts();
             let invocation_context = invocation_context
-                .limit_depth(self.deps.config().limits.max_invocation_context_stack_depth);
+                .limit_depth(self.deps.config().limits.max_invocation_context_stack_depth)
+                // Strips linked_context chains that grow exponentially across pipeline stages
+                // when contexts are inherited via clone_as_inherited_stack. Without this, the
+                // AgentStatusRecord.pending_invocations blob reaches hundreds of MB and triggers
+                // SQLite TOOBIG on update_cached_status.
+                .without_linked_contexts();
             let invocation = AgentInvocation::from_parts(
                 idempotency_key.clone(),
                 invocation_payload.clone(),

@@ -816,6 +816,7 @@ impl MultiLayerOplog {
                 } => {
                     async {
                         info!(
+                            agent_id = %owned_agent_id.agent_id,
                             "Transferring oplog entries up to index {last_transferred_idx} of the primary oplog to the next layer"
                         );
                         debug!("Reading entries from the primary oplog");

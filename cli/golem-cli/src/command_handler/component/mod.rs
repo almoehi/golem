@@ -51,7 +51,10 @@ use futures_util::future::OptionFuture;
 use golem_client::api::ComponentClient;
 use golem_client::model::{ComponentCreation, ComponentDto};
 use golem_common::cache::SimpleCache;
+use golem_common::base_model::json::NormalizedJsonValue;
 use golem_common::model::agent::{AgentConfigSource, AgentType, AgentTypeName};
+use golem_wasm::json::ValueAndTypeJsonExtensions;
+use golem_wasm::ValueAndType;
 use golem_common::model::application::ApplicationName;
 use golem_common::model::component::{
     AgentConfigEntryDto, ComponentId, ComponentName, ComponentRevision, ComponentUpdate,
@@ -1035,10 +1038,30 @@ impl ComponentCommandHandler {
                 })
                 .collect::<anyhow::Result<_>>()?;
 
+            // Normalize config values through parse_with_type + to_json_value so the
+            // hash we compute here matches what the server computes in to_diffable().
+            // Without this, missing Option fields (added as null) and integer-typed-as-F64
+            // values (5 → 5.0) produce different JSON and cause DEPLOYMENT_HASH_MISMATCH.
+            let agent_type_decl = properties
+                .agent_types
+                .iter()
+                .find(|at| at.type_name.0 == agent_type_name.0);
             let config = manifest_config
                 .config
                 .iter()
-                .map(|c| (c.path.join("."), c.value.clone()))
+                .map(|c| {
+                    let key = c.path.join(".");
+                    let normalized = agent_type_decl
+                        .and_then(|at| at.config.iter().find(|d| d.path == c.path))
+                        .and_then(|decl| {
+                            ValueAndType::parse_with_type(&c.value.0, &decl.value_type)
+                                .ok()
+                                .and_then(|typed| typed.to_json_value().ok())
+                                .map(NormalizedJsonValue::new)
+                        })
+                        .unwrap_or_else(|| c.value.clone());
+                    (key, normalized)
+                })
                 .collect();
 
             let provision_config = diff::AgentTypeProvisionConfig {

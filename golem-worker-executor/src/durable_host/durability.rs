@@ -591,6 +591,7 @@ impl From<DurableFunctionType> for durability::DurableFunctionType {
             }
             DurableFunctionType::ReadRemote => durability::DurableFunctionType::ReadRemote,
             DurableFunctionType::ReadLocal => durability::DurableFunctionType::ReadLocal,
+            DurableFunctionType::ReadLocalPollable(_) => durability::DurableFunctionType::ReadLocal,
             DurableFunctionType::WriteRemoteTransaction(oplog_index) => {
                 durability::DurableFunctionType::WriteRemoteTransaction(
                     oplog_index.map(|idx| idx.into()),
@@ -1062,6 +1063,10 @@ impl<Pair: HostPayloadPair> Durability<Pair> {
         self.durable_execution_state.is_live
     }
 
+    pub fn begin_index(&self) -> OplogIndex {
+        self.begin_index
+    }
+
     /// Checks if the current retry policy allows more retries, and if yes, then returns
     /// with `Err(failure)`. This error should be directly returned from host function
     /// implementations, triggering a retry.
@@ -1204,6 +1209,7 @@ impl<Pair: HostPayloadPair> Durability<Pair> {
         match &self.function_type {
             DurableFunctionType::ReadRemote
             | DurableFunctionType::ReadLocal
+            | DurableFunctionType::ReadLocalPollable(_)
             | DurableFunctionType::WriteLocal => true,
             DurableFunctionType::WriteRemote => self.durable_execution_state.assume_idempotence,
             DurableFunctionType::WriteRemoteBatched(_)

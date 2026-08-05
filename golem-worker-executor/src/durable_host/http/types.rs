@@ -713,15 +713,28 @@ impl<Ctx: WorkerCtx> HostOutgoingBody for DurableWorkerCtx<Ctx> {
             if let Some(request_handle) = self.state.find_request_handle_by_outgoing_body(body_rep)
             {
                 if let Some(state) = self.state.open_http_requests.get_mut(&request_handle) {
+                    tracing::debug!(
+                        body_rep,
+                        stream_rep,
+                        request_handle,
+                        "OutgoingBody::write: handle() already called, setting output_stream_rep directly"
+                    );
                     state.output_stream_rep = Some(stream_rep);
                 }
             } else {
                 // handle() hasn't been called yet — store the pending mapping so
                 // handle() can populate output_stream_rep when it creates the state.
+                tracing::debug!(
+                    body_rep,
+                    stream_rep,
+                    "OutgoingBody::write: handle() not called yet, storing in pending_http_outgoing_body_stream"
+                );
                 self.state
                     .pending_http_outgoing_body_stream
                     .insert(body_rep, stream_rep);
             }
+        } else {
+            tracing::error!(body_rep, "OutgoingBody::write: returned error or Err(())");
         }
         result
     }
@@ -1337,7 +1350,7 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
         };
         use crate::services::HasOplog;
 
-        tracing::debug!(
+        tracing::error!(
             handle = handle,
             "Rebuilding HTTP request from oplog after replayed body writes"
         );

@@ -1245,6 +1245,7 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
                             debug!(
                                 "Remote write operation {begin_index} already completed at {index}, continue replaying"
                             );
+                            self.state.replaying_http_batch = Some(begin_index);
                             Ok(begin_index)
                         }
                         OplogEntryLookupResult::NotFound {
@@ -1348,6 +1349,7 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
                     .await;
                 Ok(())
             } else {
+                self.state.replaying_http_batch = None;
                 let (_, _) =
                     crate::get_oplog_entry!(self.state.replay_state, OplogEntry::EndRemoteWrite)?;
                 Ok(())
@@ -4029,6 +4031,12 @@ struct PrivateDurableWorkerState {
 
     snapshotting_mode: Option<PersistenceLevel>,
 
+    /// Set during replay when replaying through a completed WriteRemoteBatched(None) HTTP
+    /// request cycle. The value is the BeginRemoteWrite oplog index for the batch.
+    /// Used by check_write/write in streams.rs to take the durable replay path even when
+    /// open_http_requests is empty (it is never populated during replay).
+    replaying_http_batch: Option<OplogIndex>,
+
     component_metadata: Component,
 
     total_linear_memory_size: u64,
@@ -4203,6 +4211,7 @@ impl PrivateDurableWorkerState {
             pending_http_retry_eligibility: HashMap::new(),
             open_filesystem_output_streams: HashMap::new(),
             snapshotting_mode: None,
+            replaying_http_batch: None,
             component_metadata,
             total_linear_memory_size,
             current_filesystem_storage_usage,

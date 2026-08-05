@@ -915,6 +915,129 @@ mod tests {
         ));
     }
 
+    /// Verifies the predicate used in `poll()`'s rep-mismatch fallback (our fix):
+    /// when the next oplog entry is `IoPollReady`, `try_get_oplog_entry` should
+    /// consume it and return `Some`.
+    #[test]
+    async fn try_get_oplog_entry_matches_io_poll_ready() {
+        use golem_common::model::oplog::{
+            DurableFunctionType, HostRequest, HostRequestNoInput, HostResponse,
+            HostResponsePollReady, OplogPayload,
+        };
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+        let io_poll_ready = OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::IoPollReady,
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
+                HostRequestNoInput {},
+            ))),
+            response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
+                HostResponsePollReady { result: Ok(true) },
+            ))),
+            durable_function_type: DurableFunctionType::ReadLocalPollable(42),
+        };
+        // ReplayState::new() processes OplogIndex::INITIAL; the first readable
+        // entry for try_get_oplog_entry is at INITIAL.next().
+        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
+            (
+                OplogIndex::INITIAL,
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                },
+            ),
+            (OplogIndex::INITIAL.next(), io_poll_ready),
+        ])));
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            oplog,
+            DeletedRegions::new(),
+        )
+        .await
+        .unwrap();
+
+        let matched = state
+            .try_get_oplog_entry(|e| {
+                matches!(
+                    e,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollReady,
+                        ..
+                    }
+                )
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            matched.is_some(),
+            "predicate should match IoPollReady and consume the entry"
+        );
+    }
+
+    /// Verifies the predicate used in `poll()`'s rep-mismatch fallback does NOT
+    /// consume an `IoPollPoll` entry (the normal case handled by `durability.replay()`).
+    #[test]
+    async fn try_get_oplog_entry_does_not_match_io_poll_poll() {
+        use golem_common::model::oplog::{
+            DurableFunctionType, HostRequest, HostRequestPollCount, HostResponse,
+            HostResponsePollResult, OplogPayload,
+        };
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+        let io_poll_poll = OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::IoPollPoll,
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
+                HostRequestPollCount { count: 1 },
+            ))),
+            response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
+                HostResponsePollResult {
+                    result: Ok(vec![0]),
+                },
+            ))),
+            durable_function_type: DurableFunctionType::ReadLocal,
+        };
+        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
+            (
+                OplogIndex::INITIAL,
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                },
+            ),
+            (OplogIndex::INITIAL.next(), io_poll_poll),
+        ])));
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            oplog,
+            DeletedRegions::new(),
+        )
+        .await
+        .unwrap();
+
+        let matched = state
+            .try_get_oplog_entry(|e| {
+                matches!(
+                    e,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollReady,
+                        ..
+                    }
+                )
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            matched.is_none(),
+            "predicate must not consume IoPollPoll when looking for IoPollReady"
+        );
+    }
+
     #[test]
     async fn lowering_replay_target_discards_prefetched_future_entries() {
         let agent_id = AgentId {
@@ -949,6 +1072,159 @@ mod tests {
             state.get_oplog_entry().await.unwrap().1,
             replacement,
             "replay must not consume entries prefetched before its target moved backward"
+        );
+    }
+
+    /// Regression test for: "Unexpected oplog entry during replay: expected io::poll::poll,
+    /// got http::types::outgoing_body_stream::check_write"
+    ///
+    /// Pathology: a periodic snapshot is taken mid-HTTP-batch (between BeginRemoteWrite and
+    /// EndRemoteWrite). On restore, `open_http_requests` and `replaying_http_batch` are both
+    /// gone (runtime state not persisted). The next oplog entry is `CheckWrite` (from the
+    /// original HTTP call). Without the fix, `check_write()` falls through to the plain-WASI
+    /// branch (no oplog access), stalling the cursor. The subsequent `poll()` then reads the
+    /// `CheckWrite` entry expecting `IoPollPoll` → permanent WASM trap.
+    ///
+    /// The fix peeks with `try_get_oplog_entry` and consumes the `CheckWrite` entry, keeping
+    /// the cursor in sync. This test verifies that `try_get_oplog_entry` correctly matches and
+    /// consumes `HttpTypesOutgoingBodyStreamCheckWrite` entries.
+    #[test]
+    async fn try_get_oplog_entry_matches_http_outgoing_check_write() {
+        use golem_common::model::oplog::{
+            DurableFunctionType, HostRequest, HostRequestHttpRequest, HostResponse,
+            HostResponseStreamCheckWrite, OplogPayload,
+        };
+        use golem_common::model::oplog::host_functions::HostFunctionName;
+        use golem_common::model::oplog::types::{SerializableHttpMethod};
+        use std::collections::HashMap;
+
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+
+        let check_write_entry = OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+            request: OplogPayload::Inline(Box::new(HostRequest::HttpRequest(
+                HostRequestHttpRequest {
+                    uri: "https://api.example.com/".to_string(),
+                    method: SerializableHttpMethod::Post,
+                    headers: HashMap::new(),
+                },
+            ))),
+            response: OplogPayload::Inline(Box::new(HostResponse::StreamCheckWrite(
+                HostResponseStreamCheckWrite { result: Ok(8192) },
+            ))),
+            durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(
+                OplogIndex::INITIAL,
+            )),
+        };
+
+        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
+            (
+                OplogIndex::INITIAL,
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                },
+            ),
+            (OplogIndex::INITIAL.next(), check_write_entry),
+        ])));
+
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            oplog,
+            DeletedRegions::new(),
+        )
+        .await
+        .unwrap();
+
+        // This predicate mirrors the fix in check_write()'s else-branch.
+        let matched = state
+            .try_get_oplog_entry(|entry| {
+                matches!(
+                    entry,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+                        ..
+                    }
+                )
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            matched.is_some(),
+            "post-snapshot-restore fix must consume the CheckWrite entry to unblock poll()"
+        );
+    }
+
+    /// Companion to `try_get_oplog_entry_matches_http_outgoing_check_write`: verifies that
+    /// `try_get_oplog_entry` does NOT consume an `IoPollPoll` entry when looking for a
+    /// `CheckWrite`. After the fix consumes a CheckWrite, the next entry (`IoPollPoll`) must
+    /// remain unconsumed for `poll()`'s normal replay path.
+    #[test]
+    async fn try_get_oplog_entry_does_not_match_io_poll_poll_for_check_write_predicate() {
+        use golem_common::model::oplog::{
+            DurableFunctionType, HostRequest, HostRequestPollCount, HostResponse,
+            HostResponsePollResult, OplogPayload,
+        };
+        use golem_common::model::oplog::host_functions::HostFunctionName;
+
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+
+        let poll_entry = OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::IoPollPoll,
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
+                HostRequestPollCount { count: 1 },
+            ))),
+            response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
+                HostResponsePollResult {
+                    result: Ok(vec![0]),
+                },
+            ))),
+            durable_function_type: DurableFunctionType::ReadLocal,
+        };
+
+        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
+            (
+                OplogIndex::INITIAL,
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                },
+            ),
+            (OplogIndex::INITIAL.next(), poll_entry),
+        ])));
+
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            oplog,
+            DeletedRegions::new(),
+        )
+        .await
+        .unwrap();
+
+        // The check_write fix predicate must not consume an IoPollPoll entry.
+        let matched = state
+            .try_get_oplog_entry(|entry| {
+                matches!(
+                    entry,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+                        ..
+                    }
+                )
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            matched.is_none(),
+            "CheckWrite predicate must not consume IoPollPoll — that would break the poll() replay path"
         );
     }
 }

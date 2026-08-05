@@ -4305,6 +4305,94 @@ async fn oplog_replay_after_parallel_streaming_http_reads(
 /// This test mimics the production pattern from wasm-rquickjs/golem-wasi-http:
 /// - Uses raw WASI HTTP APIs to send a request
 /// - Reads the response body with subscribe() + AsyncPollable::wait_for() + read()
+/// Regression test for the IoPollReady rep-mismatch bug after snapshot restore.
+///
+/// Bug: after a snapshot is restored, Wasmtime rebuilds ResourceTable from
+/// scratch with new resource reps. When the replay reaches an `IoPollReady`
+/// oplog entry, `ready()` checks `*recorded_rep == current_rep`. If they
+/// differ, it synthesizes `false`. The WASM falls through to `poll()`, which
+/// then finds `IoPollReady` in the oplog instead of the expected `IoPollPoll`
+/// → "Unexpected oplog entry during replay: expected io::poll::poll, got
+/// io::poll::pollable::ready".
+///
+/// Fix location: `durable_host/io/poll.rs` — `poll()` replay fallback.
+/// Primary regression tests: `replay_state.rs::try_get_oplog_entry_matches_io_poll_ready`
+///                             and `try_get_oplog_entry_does_not_match_io_poll_poll`.
+///
+/// This integration test exercises the snapshot → IoPollReady-entries → replay
+/// sequence end-to-end to confirm the fix does not break normal operation.
+#[test]
+#[tracing::instrument]
+async fn snapshot_replay_handles_io_poll_ready_rep_mismatch(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("http_tests")] http_tests: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    use golem_common::{agent_id, data_value};
+    use golem_worker_executor::services::golem_config::SnapshotPolicy;
+    use golem_worker_executor_test_utils::start_with_snapshot_policy;
+
+    let context = TestContext::new(last_unique_id);
+    let (port, server) = streaming_chunk_server(20, Duration::from_millis(10)).await;
+
+    // Phase 1: complete one invocation with EveryNInvocation{1} so a snapshot
+    // is taken. ResourceTable state at snapshot time differs from the fresh
+    // state seen on replay, enabling rep-mismatch on resource-intensive paths.
+    let executor1 = start_with_snapshot_policy(
+        deps,
+        &context,
+        SnapshotPolicy::EveryNInvocation { count: 1 },
+    )
+    .await?;
+    let component = executor1
+        .component_dep(&context.default_environment_id, http_tests)
+        .store()
+        .await?;
+    let agent_id = agent_id!("StreamingClient");
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), port.to_string());
+    let worker_id = executor1
+        .start_agent_with(&component.id, agent_id.clone(), env, Vec::new())
+        .await?;
+
+    executor1
+        .invoke_and_await_agent(&component, &agent_id, "raw_streaming_http_read", data_value!())
+        .await?;
+    executor1.check_oplog_is_queryable(&worker_id).await?;
+    drop(executor1);
+
+    // Phase 2: run a second streaming invocation with snapshot disabled so
+    // the IoPollReady entries land AFTER snapshot-1 with no subsequent snapshot.
+    let executor2 =
+        start_with_snapshot_policy(deps, &context, SnapshotPolicy::Disabled).await?;
+    executor2
+        .invoke_and_await_agent(&component, &agent_id, "raw_streaming_http_read", data_value!())
+        .await?;
+    executor2.check_oplog_is_queryable(&worker_id).await?;
+    drop(executor2);
+
+    // Phase 3: restart and replay from snapshot-1. The fix in poll.rs handles
+    // any IoPollReady entries whose recorded rep differs from the fresh
+    // ResourceTable rep (the exact crash from the production incident).
+    let executor3 = start(deps, &context).await?;
+    let result = executor3
+        .invoke_and_await_agent(&component, &agent_id, "raw_streaming_http_read", data_value!())
+        .await?
+        .into_return_value()
+        .ok_or_else(|| anyhow!("expected return value after snapshot-based replay"))?;
+    assert!(
+        matches!(result, Value::String(_)),
+        "invoke after snapshot-based replay should succeed, got: {:?}",
+        result
+    );
+
+    executor3.check_oplog_is_queryable(&worker_id).await?;
+    server.abort();
+    drop(executor3);
+    Ok(())
+}
+
 /// - Drops the stream and body WITHOUT calling incoming_body.finish()
 ///
 /// This is the exact pattern that the production component uses, which differs

@@ -535,6 +535,35 @@ impl InvocationContextSpan {
         }
     }
 
+    /// Clone this span with `linked_context` set to `None`. Used by
+    /// `InvocationContextStack::without_linked_contexts` to strip recursive span trees that cause
+    /// SQLite TOOBIG when serialized into `AgentStatusRecord`.
+    pub fn without_linked_context(self: &Arc<Self>) -> Arc<Self> {
+        match self.as_ref() {
+            Self::Local {
+                span_id,
+                start,
+                state,
+                inherited,
+            } => {
+                let state = state.read().unwrap();
+                Arc::new(Self::Local {
+                    span_id: span_id.clone(),
+                    start: *start,
+                    state: RwLock::new(LocalInvocationContextSpanState {
+                        parent: state.parent.clone(),
+                        attributes: state.attributes.clone(),
+                        linked_context: None,
+                    }),
+                    inherited: *inherited,
+                })
+            }
+            Self::ExternalParent { span_id } => {
+                Arc::new(Self::ExternalParent { span_id: span_id.clone() })
+            }
+        }
+    }
+
     fn clone_with_parent(&self, parent: Option<Arc<Self>>) -> Arc<Self> {
         match self {
             Self::Local {
@@ -834,6 +863,26 @@ impl InvocationContextStack {
 
     pub fn push(&mut self, span: Arc<InvocationContextSpan>) {
         self.spans.insert(0, span);
+    }
+
+    /// Strip all `linked_context` chains from every span in the stack.
+    ///
+    /// `linked_context` chains embed the full span tree from a previous invocation and can grow
+    /// exponentially across pipeline stages when contexts are inherited via RPC calls
+    /// (`clone_as_inherited_stack`). This method removes them before the context is stored in
+    /// `AgentStatusRecord.pending_invocations`, preventing SQLite TOOBIG errors. The parent chain
+    /// (distributed-tracing span hierarchy) is preserved.
+    pub fn without_linked_contexts(self) -> Self {
+        let stripped: Vec<Arc<InvocationContextSpan>> = self
+            .spans
+            .into_iter()
+            .map(|span| span.without_linked_context())
+            .collect();
+        Self {
+            trace_id: self.trace_id,
+            spans: NEVec::try_from_vec(stripped).unwrap(),
+            trace_states: self.trace_states,
+        }
     }
 
     pub fn limit_depth(self, max_depth: usize) -> Self {

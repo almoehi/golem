@@ -36,6 +36,9 @@ impl From<DurableFunctionType> for PublicDurableFunctionType {
                     WriteRemoteTransactionParameters { index },
                 )
             }
+            DurableFunctionType::ReadLocalPollable(_) => {
+                PublicDurableFunctionType::ReadLocal(Empty {})
+            }
         }
     }
 }

@@ -2742,6 +2742,12 @@ fn durable_function_type_to_proto(
                 oplog_index: idx.map(|i| i.into()),
             }
         }
+        DurableFunctionType::ReadLocalPollable(_) => {
+            golem_api_grpc::proto::golem::worker::WrappedFunctionType {
+                r#type: wrapped_function_type::Type::ReadLocal as i32,
+                oplog_index: None,
+            }
+        }
     }
 }
 

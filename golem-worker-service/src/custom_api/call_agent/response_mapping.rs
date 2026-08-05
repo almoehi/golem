@@ -87,11 +87,17 @@ fn map_single_element_agent_response(
         }),
 
         ElementValue::UnstructuredBinary(UnstructuredBinaryElementValue {
-            value: BinaryReference::Url(_),
+            value: BinaryReference::Url(url),
             ..
-        }) => Err(RequestHandlerError::invariant_violated(
-            "Unexpected unstructured binary URL response",
-        )),
+        }) => {
+            let mut headers = HashMap::new();
+            headers.insert(http::header::LOCATION, url.value.clone());
+            Ok(RouteExecutionResult {
+                status: StatusCode::FOUND,
+                headers,
+                body: ResponseBody::NoBody,
+            })
+        }
 
         ElementValue::UnstructuredText(UnstructuredTextElementValue {
             value: TextReference::Inline(text),
@@ -330,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn url_binary_response_is_invariant_violation() {
+    fn url_binary_response_returns_302_redirect() {
         let schema = binary_schema(None);
         let invoke_result = Some(UntypedDataValue::Tuple(vec![
             UntypedElementValue::UnstructuredBinary(BinaryReferenceValue {
@@ -340,10 +346,14 @@ mod tests {
             }),
         ]));
 
-        let err = interpret_agent_response(invoke_result, &schema).unwrap_err();
+        let result = interpret_agent_response(invoke_result, &schema).unwrap();
 
-        let_assert!(RequestHandlerError::InvariantViolated { msg } = err);
-        assert!(msg.contains("binary"));
+        assert_eq!(result.status, StatusCode::FOUND);
+        assert_eq!(
+            result.headers.get(&http::header::LOCATION).unwrap(),
+            "https://example.com/blob"
+        );
+        let_assert!(ResponseBody::NoBody = result.body);
     }
 
     #[test]

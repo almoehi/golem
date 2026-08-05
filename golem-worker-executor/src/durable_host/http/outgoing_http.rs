@@ -356,6 +356,13 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                 .pending_http_outgoing_body_stream
                 .remove(&body_rep)
         });
+        tracing::debug!(
+            request_rep,
+            ?pending_outgoing_body_rep,
+            ?pending_output_stream_rep,
+            is_live = self.state.is_live(),
+            "handle(): captured pending body/stream before Host::handle()"
+        );
 
         let result = Host::handle(&mut self.as_wasi_http_view(), request, options).await;
 

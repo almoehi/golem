@@ -23,20 +23,22 @@ use crate::durable_host::{
     PendingFilesystemReservation,
 };
 use crate::model::event::InternalWorkerEvent;
+use crate::services::oplog::OplogOps;
+use crate::services::{HasOplog, HasWorker};
 use crate::workerctx::WorkerCtx;
 use golem_common::model::oplog::host_functions::{
-    HttpTypesIncomingBodyStreamBlockingRead, HttpTypesIncomingBodyStreamBlockingSkip,
-    HttpTypesIncomingBodyStreamRead, HttpTypesIncomingBodyStreamSkip,
-    HttpTypesOutgoingBodyStreamBlockingFlush, HttpTypesOutgoingBodyStreamBlockingSplice,
-    HttpTypesOutgoingBodyStreamCheckWrite, HttpTypesOutgoingBodyStreamFlush,
-    HttpTypesOutgoingBodyStreamSplice, HttpTypesOutgoingBodyStreamWrite,
-    HttpTypesOutgoingBodyStreamWriteZeroes,
+    HostFunctionName, HttpTypesIncomingBodyStreamBlockingRead,
+    HttpTypesIncomingBodyStreamBlockingSkip, HttpTypesIncomingBodyStreamRead,
+    HttpTypesIncomingBodyStreamSkip, HttpTypesOutgoingBodyStreamBlockingFlush,
+    HttpTypesOutgoingBodyStreamBlockingSplice, HttpTypesOutgoingBodyStreamCheckWrite,
+    HttpTypesOutgoingBodyStreamFlush, HttpTypesOutgoingBodyStreamSplice,
+    HttpTypesOutgoingBodyStreamWrite, HttpTypesOutgoingBodyStreamWriteZeroes,
 };
 use golem_common::model::oplog::types::SerializableStreamError;
 use golem_common::model::oplog::{
     DurableFunctionType, HostRequestHttpRequest, HostResponseStreamCheckWrite,
     HostResponseStreamChunk, HostResponseStreamSkip, HostResponseStreamWriteResult,
-    HostResponseStreamWriteWithBytes, HostResponseStreamWriteZeroes, OplogIndex,
+    HostResponseStreamWriteWithBytes, HostResponseStreamWriteZeroes, OplogEntry, OplogIndex,
 };
 use golem_service_base::error::worker_executor::WorkerExecutorError;
 use wasmtime_wasi::filesystem::WasiFilesystemView as _;
@@ -312,7 +314,18 @@ impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
 impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
     async fn check_write(&mut self, self_: Resource<OutputStream>) -> Result<u64, StreamError> {
         let rep = self_.rep();
-        if is_outgoing_http_body_stream(self, rep) {
+        let is_http = is_outgoing_http_body_stream(self, rep);
+        let open_reps: Vec<_> = self.state.open_http_requests.iter()
+            .map(|(k, v)| (*k, v.output_stream_rep))
+            .collect();
+        tracing::trace!(
+            rep,
+            is_http,
+            ?open_reps,
+            is_live = self.state.is_live(),
+            "check_write: is_outgoing_http_body_stream={is_http}, open_http_requests={open_reps:?}"
+        );
+        if is_http {
             let state = get_http_output_stream_state(self, rep)?;
             let durability = Durability::<HttpTypesOutgoingBodyStreamCheckWrite>::new(
                 self,
@@ -354,7 +367,54 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
             .map_err(StreamError::from)?;
 
             result.result.map_err(StreamError::from)
+        } else if let Some(batch_begin) = self.state.replaying_http_batch {
+            // Replay inside a completed WriteRemoteBatched(None) HTTP batch.
+            // open_http_requests is empty during replay so is_http was false above, but the
+            // oplog contains a CheckWrite entry tagged WriteRemoteBatched(Some(N)) that must
+            // be consumed to keep the replay cursor in sync with the live execution path.
+            let durability = Durability::<HttpTypesOutgoingBodyStreamCheckWrite>::new(
+                self,
+                DurableFunctionType::WriteRemoteBatched(Some(batch_begin)),
+            )
+            .await
+            .map_err(StreamError::from)?;
+            let result = durability.replay(self).await.map_err(StreamError::from)?;
+            result.result.map_err(StreamError::from)
         } else {
+            // Post-snapshot-restore: open_http_requests is empty (not persisted in snapshots) and
+            // replaying_http_batch is None (runtime state lost on restore). The oplog may contain
+            // a CheckWrite entry from the original HTTP call. Consume it to keep the replay cursor
+            // in sync; without this the cursor stalls and the next poll() reads the wrong entry.
+            if !self.state.is_live() {
+                let snapshot_restore_entry = self
+                    .state
+                    .replay_state
+                    .try_get_oplog_entry(|entry| {
+                        matches!(
+                            entry,
+                            OplogEntry::HostCall {
+                                function_name: HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+                                ..
+                            }
+                        )
+                    })
+                    .await
+                    .map_err(|e| StreamError::Trap(wasmtime::Error::from_anyhow(e.into())))?;
+                if let Some((_, OplogEntry::HostCall { response, .. })) = snapshot_restore_entry {
+                    let host_response = self
+                        .public_state
+                        .worker()
+                        .oplog()
+                        .download_payload(response)
+                        .await
+                        .map_err(|e| StreamError::Trap(wasmtime::Error::msg(e)))?;
+                    let payload: HostResponseStreamCheckWrite = host_response
+                        .try_into()
+                        .map_err(|e: String| StreamError::Trap(wasmtime::Error::msg(e)))?;
+                    return payload.result.map_err(StreamError::from);
+                }
+            }
+
             self.observe_function_call("io::streams::output_stream", "check_write");
             let stream_rep = self_.rep();
             let result = HostOutputStream::check_write(self.table(), self_).await;
@@ -425,6 +485,19 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
             }
             .map_err(StreamError::from)?;
 
+            result.result.map(|_bytes| ()).map_err(StreamError::from)
+        } else if let Some(batch_begin) = self.state.replaying_http_batch {
+            // Replay inside a completed WriteRemoteBatched(None) HTTP batch.
+            // open_http_requests is empty during replay so is_outgoing_http_body_stream was
+            // false above, but the oplog contains a Write entry tagged WriteRemoteBatched(Some(N))
+            // that must be consumed to keep the replay cursor in sync with the live path.
+            let durability = Durability::<HttpTypesOutgoingBodyStreamWrite>::new(
+                self,
+                DurableFunctionType::WriteRemoteBatched(Some(batch_begin)),
+            )
+            .await
+            .map_err(StreamError::from)?;
+            let result = durability.replay(self).await.map_err(StreamError::from)?;
             result.result.map(|_bytes| ()).map_err(StreamError::from)
         } else {
             self.observe_function_call("io::streams::output_stream", "write");
@@ -981,10 +1054,17 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
     async fn drop(&mut self, rep: Resource<OutputStream>) -> wasmtime::Result<()> {
         let handle = rep.rep();
         self.observe_function_call("io::streams::output_stream", "drop");
-        if let Some(request_handle) = self.state.find_request_handle_by_output_stream(handle)
-            && let Some(state) = self.state.open_http_requests.get_mut(&request_handle)
-        {
-            state.output_stream_rep = None;
+        if let Some(request_handle) = self.state.find_request_handle_by_output_stream(handle) {
+            let is_live = self.state.is_live();
+            tracing::trace!(
+                stream_rep = handle,
+                request_handle,
+                is_live,
+                "OutputStream::drop: clearing output_stream_rep for HTTP body stream"
+            );
+            if let Some(state) = self.state.open_http_requests.get_mut(&request_handle) {
+                state.output_stream_rep = None;
+            }
         }
         let result = HostOutputStream::drop(self.table(), rep).await;
         reconcile_pending_filesystem_stream_reservation(self, handle).await;

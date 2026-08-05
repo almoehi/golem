@@ -15,16 +15,18 @@
 use crate::durable_host::durability::InFunctionRetryHost;
 use crate::durable_host::{Durability, DurabilityHost, DurableWorkerCtx, SuspendForSleep};
 use crate::metrics::ephemeral::{dec_promise_waiting, inc_promise_waiting};
+use crate::services::oplog::OplogOps;
+use crate::services::{HasOplog, HasWorker};
 use crate::workerctx::WorkerCtx;
 use chrono::{Duration, Utc};
 use futures::pin_mut;
 use golem_common::model::Timestamp;
 use golem_common::model::agent::AgentMode;
-use golem_common::model::oplog::host_functions::{IoPollPoll, IoPollReady};
+use golem_common::model::oplog::host_functions::{HostFunctionName, IoPollPoll, IoPollReady};
 use golem_common::model::oplog::{AgentError, EphemeralSleepTooLongError};
 use golem_common::model::oplog::{
     DurableFunctionType, HostRequestNoInput, HostRequestPollCount, HostResponsePollReady,
-    HostResponsePollResult,
+    HostResponsePollResult, OplogEntry,
 };
 use golem_service_base::error::worker_executor::{InterruptKind, WorkerExecutorError};
 use tracing::debug;
@@ -35,28 +37,72 @@ use wasmtime_wasi::p2::bindings::io::poll::{Host, HostPollable, Pollable};
 impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
     async fn ready(&mut self, self_: Resource<Pollable>) -> wasmtime::Result<bool> {
         self.observe_function_call("io::poll:pollable", "ready");
-        let durability =
-            Durability::<IoPollReady>::new(self, DurableFunctionType::ReadLocal).await?;
 
-        let result = if durability.is_live() {
+        // Capture rep before self_ is consumed by HostPollable::ready / try_get_oplog_entry.
+        let pollable_rep = self_.rep();
+
+        if self.durable_execution_state().is_live {
             let result = {
                 let mut view = self.as_wasi_view();
                 HostPollable::ready(&mut view.io_data(), self_)
                     .await
                     .map_err(|err| err.to_string())
             };
-            durability
-                .persist(
-                    self,
-                    HostRequestNoInput {},
-                    HostResponsePollReady { result },
-                )
-                .await
+            // ready=false is "not yet, retry" — it carries no replay-essential information
+            // and accounts for ~75% of oplog entries per fetch(). Skip recording it.
+            // Replay synthesizes false for any gap in IoPollReady entries (see else branch).
+            if result == Ok(false) {
+                return Ok(false);
+            }
+            // Record with the pollable's resource rep so replay can match this entry
+            // to the correct pollable (ReadLocalPollable instead of plain ReadLocal).
+            let durability =
+                Durability::<IoPollReady>::new(self, DurableFunctionType::ReadLocalPollable(pollable_rep)).await?;
+            let r = durability
+                .persist(self, HostRequestNoInput {}, HostResponsePollReady { result })
+                .await?;
+            r.result.map_err(wasmtime::Error::msg)
         } else {
-            durability.replay(self).await
-        }?;
-
-        result.result.map_err(wasmtime::Error::msg)
+            // Replay: consume the next IoPollReady entry only if it was recorded for THIS
+            // specific pollable (matched by resource rep). This prevents a timer pollable from
+            // stealing an IoPollReady=true entry that was recorded for an output-stream pollable,
+            // which would cause the WASM to think the timer fired, drop the FutureIncomingResponse
+            // early, and crash with "expected EndRemoteWrite, got CheckWrite".
+            // Legacy ReadLocal entries (no rep tracking) are consumed by any pollable.
+            let peeked = self
+                .state
+                .replay_state
+                .try_get_oplog_entry(|entry| match entry {
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollReady,
+                        durable_function_type: DurableFunctionType::ReadLocalPollable(rep),
+                        ..
+                    } => *rep == pollable_rep,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollReady,
+                        durable_function_type: DurableFunctionType::ReadLocal,
+                        ..
+                    } => true,
+                    _ => false,
+                })
+                .await?;
+            match peeked {
+                Some((_, OplogEntry::HostCall { response, .. })) => {
+                    let host_response = self
+                        .public_state
+                        .worker()
+                        .oplog()
+                        .download_payload(response)
+                        .await
+                        .map_err(wasmtime::Error::msg)?;
+                    let payload: HostResponsePollReady = host_response
+                        .try_into()
+                        .map_err(|e: String| wasmtime::Error::msg(e))?;
+                    payload.result.map_err(wasmtime::Error::msg)
+                }
+                _ => Ok(false),
+            }
+        }
     }
 
     async fn block(&mut self, self_: Resource<Pollable>) -> wasmtime::Result<()> {
@@ -226,7 +272,36 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                     .await?),
             }
         } else {
-            Ok(durability.replay(self).await?)
+            // After snapshot restore, pollable resource reps change (ResourceTable is rebuilt).
+            // ready() fails to match IoPollReady(old_rep) by rep, synthesizes false, and WASM
+            // falls through to poll(). Recover: if the next oplog entry is IoPollReady (not
+            // IoPollPoll), consume it here and return [0] — only ready=true is ever recorded,
+            // so the first-pollable-ready result is always correct in this path.
+            let rep_mismatch_entry = self
+                .state
+                .replay_state
+                .try_get_oplog_entry(|entry| {
+                    matches!(
+                        entry,
+                        OplogEntry::HostCall {
+                            function_name: HostFunctionName::IoPollReady,
+                            ..
+                        }
+                    )
+                })
+                .await?;
+            if rep_mismatch_entry.is_some() {
+                DurabilityHost::end_durable_function(
+                    self,
+                    &DurableFunctionType::ReadLocal,
+                    durability.begin_index(),
+                    false,
+                )
+                .await?;
+                Ok(HostResponsePollResult { result: Ok(vec![0]) })
+            } else {
+                Ok(durability.replay(self).await?)
+            }
         };
 
         match result {

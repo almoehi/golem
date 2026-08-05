@@ -112,6 +112,7 @@ impl OplogEntry {
                         true
                     }
                     DurableFunctionType::ReadLocal => true,
+                    DurableFunctionType::ReadLocalPollable(_) => true,
                     DurableFunctionType::WriteLocal => true,
                     DurableFunctionType::ReadRemote => true,
                     _ => false,

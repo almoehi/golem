@@ -342,6 +342,13 @@ pub enum DurableFunctionType {
 
     #[desert(transparent)]
     WriteRemoteTransaction(Option<OplogIndex>),
+
+    /// Like ReadLocal, but also carries the WASM resource handle (rep) of the pollable.
+    /// Used by io::poll::pollable::ready() to distinguish per-pollable oplog entries during
+    /// replay, preventing the wrong pollable from consuming a ready=true entry recorded for
+    /// a different pollable (see poll.rs ready() implementation).
+    #[desert(transparent)]
+    ReadLocalPollable(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, BinaryCodec, IntoValue, FromValue)]

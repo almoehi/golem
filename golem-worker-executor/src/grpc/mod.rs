@@ -122,12 +122,14 @@ impl<Ctx: WorkerCtx, Svcs: HasAll<Ctx> + UsesAllDeps<Ctx = Ctx> + Send + Sync + 
         &self,
         invocation_context: InvocationContextStack,
     ) -> InvocationContextStack {
-        invocation_context.limit_depth(
-            self.services
-                .config()
-                .limits
-                .max_invocation_context_stack_depth,
-        )
+        invocation_context
+            .limit_depth(
+                self.services
+                    .config()
+                    .limits
+                    .max_invocation_context_stack_depth,
+            )
+            .without_linked_contexts()
     }
 
     pub async fn new(

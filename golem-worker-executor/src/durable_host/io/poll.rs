@@ -100,7 +100,41 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
                         .map_err(|e: String| wasmtime::Error::msg(e))?;
                     payload.result.map_err(wasmtime::Error::msg)
                 }
-                _ => Ok(false),
+                _ => {
+                    // Rep-mismatch recovery for WasmRpc futures: after snapshot restore all
+                    // pollable reps change, so IoPollReady entries can't match by rep. The
+                    // poll()-level fix (Case 1 in poll.rs) consumes IoPollReady entries on
+                    // behalf of poll(), leaving GolemRpcFutureInvokeResultGet as the next
+                    // oplog entry. At that point the WASM's `while (!ready()) { poll() }` loop
+                    // must terminate, but ready() would keep synthesizing false — creating an
+                    // infinite loop — unless we detect this sentinel here.
+                    //
+                    // Safety: guarded to WasmRpc pollables only (tracked in rpc_pollable_to_parent).
+                    // This prevents non-RPC pollables (timers, HTTP streams) from incorrectly
+                    // claiming readiness when an RPC result entry happens to be next in the oplog.
+                    let is_rpc_pollable =
+                        self.state.rpc_pollable_to_parent.contains_key(&pollable_rep);
+                    if is_rpc_pollable {
+                        // Peek without consuming: get() still needs to read this entry.
+                        let rpc_future_done = self
+                            .state
+                            .replay_state
+                            .peek_next_oplog_entry(|entry| {
+                                matches!(
+                                    entry,
+                                    OplogEntry::HostCall {
+                                        function_name:
+                                            HostFunctionName::GolemRpcFutureInvokeResultGet,
+                                        ..
+                                    }
+                                )
+                            })
+                            .await?;
+                        Ok(rpc_future_done)
+                    } else {
+                        Ok(false)
+                    }
+                }
             }
         }
     }

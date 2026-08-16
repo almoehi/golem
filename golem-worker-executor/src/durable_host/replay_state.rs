@@ -276,6 +276,32 @@ impl ReplayState {
         }
     }
 
+    /// Non-consuming peek at the next oplog entry. Returns `true` if the condition matches
+    /// without advancing the replay position. Use when caller needs to branch on the next entry
+    /// type but must not consume it (e.g. `poll()` detecting that `get()` is imminent).
+    pub async fn peek_next_oplog_entry(
+        &mut self,
+        condition: impl FnOnce(&OplogEntry) -> bool,
+    ) -> Result<bool, WorkerExecutorError> {
+        let saved_replay_idx = self.last_replayed_index.get();
+        let saved_next_skipped_region = {
+            let internal = self.internal.read().await;
+            internal.next_skipped_region.clone()
+        };
+
+        let read_idx = self.last_replayed_index.get().next();
+        let entry = self.internal_get_next_oplog_entry().await?;
+        let matched = condition(&entry);
+
+        // Always rewind — we never consume in peek mode.
+        self.rewind_replay_buffer(read_idx, entry);
+        self.last_replayed_index.set(saved_replay_idx);
+        let mut internal = self.internal.write().await;
+        internal.next_skipped_region = saved_next_skipped_region;
+
+        Ok(matched)
+    }
+
     fn rewind_replay_buffer(&mut self, idx: OplogIndex, entry: OplogEntry) {
         if self
             .replay_buffer
@@ -1035,6 +1061,168 @@ mod tests {
         assert!(
             matched.is_none(),
             "predicate must not consume IoPollPoll when looking for IoPollReady"
+        );
+    }
+
+    /// Verifies `peek_next_oplog_entry` does NOT advance the replay position:
+    /// after a peek that matches, a subsequent `try_get_oplog_entry` must still
+    /// see the same entry (i.e. it was not consumed by the peek).
+    #[test]
+    async fn peek_next_oplog_entry_does_not_consume_entry() {
+        use golem_common::model::oplog::{
+            DurableFunctionType, HostRequest, HostRequestNoInput, HostResponse,
+            HostResponsePollReady, OplogPayload,
+        };
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+        let io_poll_ready = OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::IoPollReady,
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
+                HostRequestNoInput {},
+            ))),
+            response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
+                HostResponsePollReady { result: Ok(true) },
+            ))),
+            durable_function_type: DurableFunctionType::ReadLocalPollable(42),
+        };
+        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
+            (
+                OplogIndex::INITIAL,
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                },
+            ),
+            (OplogIndex::INITIAL.next(), io_poll_ready),
+        ])));
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            oplog,
+            DeletedRegions::new(),
+        )
+        .await
+        .unwrap();
+
+        // peek: condition matches but must NOT consume
+        let peeked = state
+            .peek_next_oplog_entry(|e| {
+                matches!(
+                    e,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollReady,
+                        ..
+                    }
+                )
+            })
+            .await
+            .unwrap();
+        assert!(peeked, "peek should report a match");
+
+        // the entry must still be present for a real consume
+        let consumed = state
+            .try_get_oplog_entry(|e| {
+                matches!(
+                    e,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollReady,
+                        ..
+                    }
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            consumed.is_some(),
+            "entry must still be consumable after a non-consuming peek"
+        );
+    }
+
+    /// Simulates the ready() rep-mismatch recovery (Scenario B): after IoPollPoll AND
+    /// IoPollReady have already been consumed by prior poll() iterations, the next
+    /// entry is GolemRpcFutureInvokeResultGet. ready() uses peek_next_oplog_entry to
+    /// detect this sentinel and return true — breaking the `while (!ready()) { poll() }`
+    /// loop — without consuming the entry so that get() can still read it.
+    ///
+    /// We use an IoPollPoll entry as a proxy for any non-IoPollReady HostCall here
+    /// because constructing a full GolemRpcInvoke payload in a unit test would require
+    /// many transitive types. The important properties tested are:
+    /// - peek_next_oplog_entry returns true when the condition matches
+    /// - the entry is NOT consumed (try_get_oplog_entry finds it afterwards)
+    #[test]
+    async fn peek_next_oplog_entry_sees_entry_without_consuming() {
+        use golem_common::model::oplog::{
+            DurableFunctionType, HostRequest, HostRequestPollCount, HostResponse,
+            HostResponsePollResult, OplogPayload,
+        };
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+        // Use IoPollPoll as a representative "non-IoPollReady" HostCall entry.
+        // The test property — peek is non-consuming — is independent of the entry type.
+        let poll_entry = OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::IoPollPoll,
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
+                HostRequestPollCount { count: 1 },
+            ))),
+            response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
+                HostResponsePollResult {
+                    result: Ok(vec![0]),
+                },
+            ))),
+            durable_function_type: DurableFunctionType::ReadLocal,
+        };
+        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
+            (
+                OplogIndex::INITIAL,
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                },
+            ),
+            (OplogIndex::INITIAL.next(), poll_entry),
+        ])));
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            oplog,
+            DeletedRegions::new(),
+        )
+        .await
+        .unwrap();
+
+        // Peek for IoPollPoll — should match without consuming.
+        let peeked = state
+            .peek_next_oplog_entry(|e| {
+                matches!(
+                    e,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollPoll,
+                        ..
+                    }
+                )
+            })
+            .await
+            .unwrap();
+        assert!(peeked, "peek should detect IoPollPoll");
+
+        // Entry must still be present after the non-consuming peek.
+        let still_there = state
+            .try_get_oplog_entry(|e| {
+                matches!(
+                    e,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollPoll,
+                        ..
+                    }
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            still_there.is_some(),
+            "IoPollPoll must remain available for consumption after a peek"
         );
     }
 

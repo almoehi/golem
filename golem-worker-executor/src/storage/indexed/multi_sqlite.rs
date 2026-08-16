@@ -72,8 +72,16 @@ impl MultiSqliteIndexedStorage {
     async fn init_storage(
         max_connections: u32,
         foreign_keys: bool,
+        root_dir: PathBuf,
         database: String,
     ) -> Result<SqliteIndexedStorage, IndexedStorageError> {
+        // Recreate root_dir if it was deleted after startup (e.g. by a concurrent `golem server clean`).
+        tokio::fs::create_dir_all(&root_dir).await.map_err(|e| {
+            IndexedStorageError::Other(format!(
+                "Failed to create indexed-store directory {}: {e}",
+                root_dir.display()
+            ))
+        })?;
         let config = DbSqliteConfig {
             database,
             max_connections,
@@ -98,10 +106,11 @@ impl MultiSqliteIndexedStorage {
     ) -> Result<SqliteIndexedStorage, IndexedStorageError> {
         let max_connections = self.max_connections;
         let foreign_keys = self.foreign_keys;
+        let root_dir = self.root_dir.clone();
         let db_path = self.root_dir.join(db.clone()).to_string_lossy().to_string();
         self.cache
             .get_or_insert_simple(&db, async move || {
-                Self::init_storage(max_connections, foreign_keys, db_path).await
+                Self::init_storage(max_connections, foreign_keys, root_dir, db_path).await
             })
             .await
     }
@@ -209,11 +218,21 @@ impl IndexedStorage for MultiSqliteIndexedStorage {
             }
         };
 
-        // List all .db files matching the namespace prefix, sorted consistently
-        let mut matching_files: Vec<_> = fs::read_dir(&self.root_dir)
-            .map_err(|e| {
-                IndexedStorageError::Other(format!("Failed to read root directory: {:?}", e))
-            })?
+        // List all .db files matching the namespace prefix, sorted consistently.
+        // The root_dir may not exist yet (e.g. after `golem server clean`); treat as empty.
+        let read_dir_iter = match fs::read_dir(&self.root_dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((0, vec![]));
+            }
+            Err(e) => {
+                return Err(IndexedStorageError::Other(format!(
+                    "Failed to read root directory: {:?}",
+                    e
+                )));
+            }
+        };
+        let mut matching_files: Vec<_> = read_dir_iter
             .filter_map(|entry| {
                 entry.ok().and_then(|e| {
                     let path = e.path();

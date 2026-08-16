@@ -70,8 +70,13 @@ impl MultiSqliteKeyValueStorage {
     async fn init_storage(
         max_connections: u32,
         foreign_keys: bool,
+        root_dir: PathBuf,
         database: String,
     ) -> Result<SqliteKeyValueStorage, String> {
+        // Recreate root_dir if it was deleted after startup (e.g. by a concurrent `golem server clean`).
+        tokio::fs::create_dir_all(&root_dir)
+            .await
+            .map_err(|e| format!("Failed to create kv-store directory {}: {e}", root_dir.display()))?;
         let config = DbSqliteConfig {
             database,
             max_connections,
@@ -87,10 +92,11 @@ impl MultiSqliteKeyValueStorage {
         let db = self.namespace_to_db(namespace).await;
         let max_connections = self.max_connections;
         let foreign_keys = self.foreign_keys;
+        let root_dir = self.root_dir.clone();
         let db_path = self.root_dir.join(db.clone()).to_string_lossy().to_string();
         self.cache
             .get_or_insert_simple(&db, async move || {
-                Self::init_storage(max_connections, foreign_keys, db_path).await
+                Self::init_storage(max_connections, foreign_keys, root_dir, db_path).await
             })
             .await
     }

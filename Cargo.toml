@@ -316,10 +316,10 @@ x509-certificate = "0.23.1"
 zstd = "0.13"
 
 [patch.crates-io]
-wasmtime = { git = "https://github.com/almoehi/wasmtime.git", branch = "golem-wasmtime-v45.0.0" }
-wasmtime-wasi = { git = "https://github.com/almoehi/wasmtime.git", branch = "golem-wasmtime-v45.0.0" }
-wasmtime-wasi-http = { git = "https://github.com/almoehi/wasmtime.git", branch = "golem-wasmtime-v45.0.0" }
-wasmtime-wizer = { git = "https://github.com/almoehi/wasmtime.git", branch = "golem-wasmtime-v45.0.0" }
+wasmtime = { git = "https://github.com/golemcloud/wasmtime.git", branch = "golem-wasmtime-v45.0.0" }
+wasmtime-wasi = { git = "https://github.com/golemcloud/wasmtime.git", branch = "golem-wasmtime-v45.0.0" }
+wasmtime-wasi-http = { git = "https://github.com/golemcloud/wasmtime.git", branch = "golem-wasmtime-v45.0.0" }
+wasmtime-wizer = { git = "https://github.com/golemcloud/wasmtime.git", branch = "golem-wasmtime-v45.0.0" }
 
 [profile.dev]
 panic = "abort"

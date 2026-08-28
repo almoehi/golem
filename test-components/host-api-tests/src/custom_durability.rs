@@ -166,6 +166,15 @@ pub trait CustomDurability {
     /// ready, reads and returns the body. Otherwise returns "-" (timer must never legitimately
     /// win — duration is ~317 years). Safe to call repeatedly across a worker restart.
     fn timer_race_http_test(&self) -> String;
+
+    /// One FULLY SELF-CONTAINED timer-vs-HTTP race cycle (create both pollables, poll, read,
+    /// drop both — all within this one call, using only local variables, no struct fields).
+    /// Verifies the wasmtime resource-table rep freed by this cycle's drop() cannot corrupt a
+    /// LATER cycle's pollable_seq assignment if that later cycle's pollables happen to reuse
+    /// the same rep slot — exercising many sequential create/drop cycles (matching production's
+    /// dozen+ sequential LLM fetch() calls within one long invocation), not just one isolated
+    /// race. Call repeatedly with increasing `idx`; each call is independent.
+    fn timer_race_multi_step(&self, idx: u32) -> String;
 }
 
 const CONCURRENT_POLLABLE_COUNT: usize = 4;
@@ -444,6 +453,49 @@ impl CustomDurability for CustomDurabilityImpl {
         self.timer_http_input_stream.replace(None);
         self.timer_http_body.replace(None);
         self.timer_http_response.replace(None);
+        result
+    }
+
+    fn timer_race_multi_step(&self, idx: u32) -> String {
+        const NEAR_INFINITE_NANOS: u64 = 10_000_000_000_000_000_000;
+        let timer_pollable =
+            golem_rust::wasip2::clocks::monotonic_clock::subscribe_duration(NEAR_INFINITE_NANOS);
+
+        let port = std::env::var("PORT").unwrap_or("9999".to_string());
+        let client = Client::new();
+        let mut response = client
+            .request(Method::GET, format!("http://localhost:{port}/fetch?idx={idx}"))
+            .send()
+            .expect("Request failed");
+        let (input_stream, _body) = response.get_raw_input_stream();
+        let http_pollable = input_stream.subscribe();
+
+        let ready_positions =
+            golem_rust::wasip2::io::poll::poll(&[&timer_pollable, &http_pollable]);
+
+        if ready_positions.contains(&0) && !ready_positions.contains(&1) {
+            panic!(
+                "BUG (cycle {idx}): the ~317-year timer pollable (index 0) reported ready before \
+                 the HTTP pollable (index 1) — either a real clock bug or a replay misattribution \
+                 caused by rep reuse from an earlier cycle's dropped pollable."
+            );
+        }
+
+        let result = if ready_positions.contains(&1) {
+            let buf = input_stream.read(4096).unwrap();
+            String::from_utf8(buf).unwrap()
+        } else {
+            "-".to_string()
+        };
+
+        // Drop child before parent (same ordering caveat as timer_race_http_test), then drop
+        // the timer — freeing BOTH reps back to wasmtime's resource-table free list before this
+        // call returns, so the NEXT cycle's timer_race_multi_step call is free to reuse either
+        // slot for its own (logically distinct) timer/http pollables.
+        drop(http_pollable);
+        drop(input_stream);
+        drop(timer_pollable);
+
         result
     }
 }

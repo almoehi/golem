@@ -583,6 +583,122 @@ async fn timer_races_real_http_and_survives_worker_replay(
     Ok(())
 }
 
+/// Rep-reuse regression test for the seq-based pollable-identity fix. Runs MANY sequential,
+/// self-contained timer-vs-HTTP race cycles (`timer_race_multi_step`, each creating AND
+/// dropping its own timer + HTTP pollables within one call) — matching production's dozen+
+/// sequential LLM fetch() calls inside one long, un-decomposed invocation, not just one
+/// isolated race. Forces eviction+replay partway through the sequence (after cycle 4 of 8),
+/// so replay must reconstruct 4 already-completed create/drop cycles — during which wasmtime's
+/// resource-table free list is very likely to have reused reps across cycles — plus the
+/// remaining 4 cycles as fresh live calls on the resumed worker. If a reused rep could ever
+/// corrupt `pollable_seq`'s first-seen assignment (the hypothesis this test exists to falsify),
+/// this would manifest as `timer_race_multi_step`'s internal panic! (a later cycle's real HTTP
+/// pollable losing its race to a stale/misattributed timer identity) on some cycle after the
+/// eviction point.
+#[test]
+#[tracing::instrument]
+async fn timer_race_rep_reuse_across_many_sequential_cycles(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("host_api_tests")] host_api_tests: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    const TOTAL_CYCLES: u32 = 8;
+    const EVICT_AFTER_CYCLE: u32 = 4;
+
+    let context = TestContext::new(last_unique_id);
+    let mut executor = start(deps, &context).await?;
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let host_http_port = listener.local_addr().unwrap().port();
+
+    #[derive(Deserialize)]
+    struct QueryParams {
+        idx: u32,
+    }
+
+    let http_server = tokio::spawn(
+        async move {
+            let route = Router::new().route(
+                "/fetch",
+                get(move |query: Query<QueryParams>| async move {
+                    let idx = query.idx;
+                    tracing::info!("rep-reuse fetch called with: {}", idx);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(axum::body::Body::from(Bytes::from(format!(
+                            "rep-reuse-body-{idx}"
+                        ))))
+                        .unwrap()
+                }),
+            );
+            axum::serve(listener, route).await.unwrap();
+        }
+        .in_current_span(),
+    );
+
+    let component = executor
+        .component_dep(&context.default_environment_id, host_api_tests)
+        .store()
+        .await?;
+    let agent_id = agent_id!("CustomDurability", "timer-race-rep-reuse-1");
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), host_http_port.to_string());
+
+    let worker_id = executor
+        .start_agent_with(&component.id, agent_id.clone(), env, Vec::new())
+        .await?;
+
+    for idx in 0..EVICT_AFTER_CYCLE {
+        let result = executor
+            .invoke_and_await_agent(
+                &component,
+                &agent_id,
+                "timer_race_multi_step",
+                data_value!(idx),
+            )
+            .await?;
+        assert_eq!(
+            result.into_return_value(),
+            Some(Value::String(format!("rep-reuse-body-{idx}"))),
+            "Cycle {idx} (pre-eviction) must resolve to its own real HTTP body"
+        );
+    }
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    // Force eviction partway through the sequence: replay must reconstruct 4 completed
+    // create/drop cycles' worth of timer+HTTP pollable history — the window where a reused
+    // rep, if mishandled, would corrupt a later cycle's identity.
+    drop(executor);
+    executor = start(deps, &context).await?;
+
+    for idx in EVICT_AFTER_CYCLE..TOTAL_CYCLES {
+        let result = executor
+            .invoke_and_await_agent(
+                &component,
+                &agent_id,
+                "timer_race_multi_step",
+                data_value!(idx),
+            )
+            .await?;
+        assert_eq!(
+            result.into_return_value(),
+            Some(Value::String(format!("rep-reuse-body-{idx}"))),
+            "Cycle {idx} (post-eviction, replay-reconstructed history behind it) must resolve \
+             to its own real HTTP body — a wrong value or panic here means a reused wasmtime \
+             rep corrupted pollable_seq's identity tracking across cycles."
+        );
+    }
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    drop(executor);
+    http_server.abort();
+
+    Ok(())
+}
+
 const SNAPSHOT_TEST_INVOCATIONS: usize = 10;
 
 #[test]

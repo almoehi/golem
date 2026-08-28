@@ -9,7 +9,7 @@ use golem_rust::golem_wasm::{NodeBuilder, Pollable, WitValueExtractor};
 use golem_rust::value_and_type::type_builder::TypeNodeBuilder;
 use golem_rust::value_and_type::{FromValueAndType, IntoValue};
 use golem_rust::{
-    PersistenceLevel, agent_definition, agent_implementation, with_persistence_level,
+    PersistenceLevel, agent_definition, agent_implementation, atomically, with_persistence_level,
 };
 use golem_wasi_http::{Client, IncomingBody, InputStream, Method};
 use std::cell::RefCell;
@@ -175,6 +175,22 @@ pub trait CustomDurability {
     /// dozen+ sequential LLM fetch() calls within one long invocation), not just one isolated
     /// race. Call repeatedly with increasing `idx`; each call is independent.
     fn timer_race_multi_step(&self, idx: u32) -> String;
+
+    /// Round-eight reproduction of the production `scene_plates` `03adbf53` trap: `n` SEQUENTIAL
+    /// (never concurrent — each one fully closed via `mark_end_operation` before the next
+    /// begins) `atomically()`-wrapped single-HTTP-call regions, matching the shape of `n`
+    /// sequential `atomicRpcCall()`-wrapped `WorkflowAgent.run()` dispatches in
+    /// `WorkerAgent.workflowToolStart()`. Afterward creates ONE promise (not awaited yet — see
+    /// `sequential_atomic_await`) and returns its id so the test driver can complete it later
+    /// from outside. No persist-nothing wrapping.
+    fn sequential_atomic_calls_then_promise_init(&mut self, n: u32) -> PromiseId;
+    /// Blocks on `promise_id` (as returned by `sequential_atomic_calls_then_promise_init`) via
+    /// `golem_rust::blocking_await_promise` — the same primitive `WorkerAgent.awaitPromise()`
+    /// uses. If the promise is not yet complete this genuinely suspends the invocation (call via
+    /// fire-and-forget `invoke_agent`, not `invoke_and_await_agent`), matching production's bare
+    /// `SUSPEND` oplog entry with no completing `IoPollPoll` recorded. Returns the promise
+    /// payload once resumed and completed.
+    fn sequential_atomic_await(&self, promise_id: PromiseId) -> Vec<u8>;
 }
 
 const CONCURRENT_POLLABLE_COUNT: usize = 4;
@@ -497,6 +513,35 @@ impl CustomDurability for CustomDurabilityImpl {
         drop(timer_pollable);
 
         result
+    }
+
+    fn sequential_atomic_calls_then_promise_init(&mut self, n: u32) -> PromiseId {
+        for i in 0..n {
+            atomically(|| {
+                // Self-contained: real HTTP call wrapped in exactly one atomically() region,
+                // matching one `atomicRpcCall()`-wrapped `WorkflowAgent.run()` dispatch — a
+                // single `io::poll::poll{count:1}` + `io::poll::pollable::ready` pair inside
+                // a BEGIN/END ATOMIC REGION, same shape as the production oplog.
+                let port = std::env::var("PORT").unwrap_or("9999".to_string());
+                let client = Client::new();
+                let mut response = client
+                    .request(Method::GET, format!("http://localhost:{port}/fetch?idx={i}"))
+                    .send()
+                    .expect("Request failed");
+                let (input_stream, _body) = response.get_raw_input_stream();
+                let http_pollable = input_stream.subscribe();
+                http_pollable.block();
+                let _ = input_stream.read(4096);
+                drop(http_pollable);
+                drop(input_stream);
+            });
+        }
+
+        create_promise()
+    }
+
+    fn sequential_atomic_await(&self, promise_id: PromiseId) -> Vec<u8> {
+        golem_rust::blocking_await_promise(&promise_id)
     }
 }
 

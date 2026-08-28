@@ -1,5 +1,8 @@
 use golem_rust::bindings::golem::agent::host::{Datetime, RpcError, WasmRpc};
-use golem_rust::{agent_definition, agent_implementation, PromiseId, Schema, Uuid};
+use golem_rust::{
+    agent_definition, agent_implementation, atomically_async, blocking_await_promise,
+    create_promise, PromiseId, Schema, Uuid,
+};
 use golem_rust::agentic::Schema as SchemaOps;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -324,6 +327,35 @@ pub trait RpcCaller {
 
     /// bug-golem1265: Pass a string through RPC and get Result back
     async fn bug_golem1265(&self, s: String) -> Result<(), String>;
+
+    /// Round-nine reproduction of the production `scene_plates`/`character_sheet` trap: `n`
+    /// SEQUENTIAL `atomically_async()`-wrapped single-RPC-call regions — each constructs a
+    /// FRESH `RpcCounterClient::get(...)` proxy (matching `WorkflowAgent.get(...).run(...)`
+    /// inside `atomicRpcCall()` — a real cross-agent `get_agent_type` + two tracing spans +
+    /// `future-invoke-result::get` sequence, not the plain WASI HTTP fetch round eight's
+    /// `sequential_atomic_calls_then_promise_init` used) and calls exactly one method on it,
+    /// fully closing the atomic region before the next begins. Afterward creates ONE promise
+    /// (not awaited yet — see `sequential_atomic_rpc_await`) and returns its id.
+    async fn sequential_atomic_rpc_calls_then_promise_init(&mut self, n: u32) -> PromiseId;
+    /// Blocks on `promise_id` via `blocking_await_promise` — same primitive as round eight's
+    /// `sequential_atomic_await`, reused here so only the atomic region's content differs
+    /// between the two rounds.
+    fn sequential_atomic_rpc_await(&self, promise_id: PromiseId) -> Vec<u8>;
+
+    /// Round-nine single-invocation variant: `n` sequential atomically_async()-wrapped RPC
+    /// calls (same shape as `sequential_atomic_rpc_calls_then_promise_init`) followed
+    /// IMMEDIATELY by `blocking_await_promise(promise_id)` — all inside ONE external
+    /// invocation, matching production's actual shape (`advanceReasoningLoop`'s one round
+    /// does both the atomic dispatches AND the awaitPromise together), unlike the two-call
+    /// split `sequential_atomic_rpc_calls_then_promise_init` +
+    /// `sequential_atomic_rpc_await` used. `promise_id` must already exist (create it via a
+    /// separate `sequential_atomic_rpc_calls_then_promise_init(0, ...)` call first, which
+    /// does zero atomic calls and just returns a fresh promise id).
+    async fn sequential_atomic_rpc_calls_then_await(
+        &mut self,
+        n: u32,
+        promise_id: PromiseId,
+    ) -> Vec<u8>;
 }
 
 struct RpcCallerImpl {
@@ -425,6 +457,45 @@ impl RpcCaller for RpcCallerImpl {
     async fn bug_golem1265(&self, s: String) -> Result<(), String> {
         let global = RpcGlobalStateClient::get(format!("{}_bug1265", self.name));
         global.bug_golem1265(s).await
+    }
+
+    async fn sequential_atomic_rpc_calls_then_promise_init(&mut self, n: u32) -> PromiseId {
+        for i in 0..n {
+            let counter_name = format!("{}_seq_atomic_rpc_counter{i}", self.name);
+            atomically_async(|| async {
+                // Fresh proxy per call, single method call per atomic region — matches
+                // WorkerAgent.workflowToolStart()'s atomicRpcCall()-wrapped
+                // WorkflowAgent.get(...).run(...) shape exactly: one get_agent_type +
+                // rpc-connection span + rpc-invocation span + future-invoke-result::get
+                // sequence, fully closed before the loop's next iteration begins.
+                let mut counter = RpcCounterClient::get(counter_name.clone());
+                counter.inc_by(1).await;
+            })
+            .await;
+        }
+
+        create_promise()
+    }
+
+    fn sequential_atomic_rpc_await(&self, promise_id: PromiseId) -> Vec<u8> {
+        blocking_await_promise(&promise_id)
+    }
+
+    async fn sequential_atomic_rpc_calls_then_await(
+        &mut self,
+        n: u32,
+        promise_id: PromiseId,
+    ) -> Vec<u8> {
+        for i in 0..n {
+            let counter_name = format!("{}_seq_atomic_rpc_single_inv_counter{i}", self.name);
+            atomically_async(|| async {
+                let mut counter = RpcCounterClient::get(counter_name.clone());
+                counter.inc_by(1).await;
+            })
+            .await;
+        }
+
+        blocking_await_promise(&promise_id)
     }
 }
 

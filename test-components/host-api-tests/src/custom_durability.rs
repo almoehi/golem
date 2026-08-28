@@ -1,3 +1,6 @@
+use golem_rust::bindings::golem::api::host::{
+    GetPromiseResult, PromiseId, complete_promise, create_promise, get_promise,
+};
 use golem_rust::bindings::golem::durability::durability::{
     DurableFunctionType, LazyInitializedPollable,
 };
@@ -134,7 +137,26 @@ pub trait CustomDurability {
 
     fn lazy_pollable_init(&mut self);
     fn lazy_pollable_test(&self, n: u32) -> String;
+
+    /// Creates 4 concurrently-pending promises (matching the production `scene_plates` shape —
+    /// several concurrently in-flight pollables in one worker, backed by the same
+    /// create_promise()/await_promise() primitive `workflowToolStart`/`Finish` uses for render
+    /// waits) and initializes their lazy pollables. No persist-nothing wrapping — exercises the
+    /// real ready()/poll() durability path (unlike lazy_pollable_test, which deliberately skips
+    /// it).
+    fn concurrent_promise_init(&mut self);
+    /// Completes promise `idx` (0..4) with a payload identifying it, from OUTSIDE the poll
+    /// loop — mirrors a different agent completing the promise asynchronously.
+    fn concurrent_promise_complete(&self, idx: u32);
+    /// Does ONE round of batched `poll()` over still-pending promise pollables (blocks until
+    /// >=1 is ready, consumes all that are via `get_promise(..).get()`), returning the current
+    /// state joined by `|` in dispatch order ("-" for still-unresolved slots). Call repeatedly
+    /// (safe across a worker restart between calls — already-resolved slots are skipped) until
+    /// no "-" remain.
+    fn concurrent_promise_test(&self) -> String;
 }
+
+const CONCURRENT_POLLABLE_COUNT: usize = 4;
 
 pub struct CustomDurabilityImpl {
     _name: String,
@@ -143,6 +165,15 @@ pub struct CustomDurabilityImpl {
     response: RefCell<Option<golem_wasi_http::Response>>,
     input_stream: RefCell<Option<InputStream>>,
     body: RefCell<Option<IncomingBody>>,
+
+    concurrent_promise_ids: Vec<PromiseId>,
+    // Kept alive alongside the subscribed pollable below — a subscribed Pollable is a CHILD
+    // resource of its parent GetPromiseResult; dropping the parent while the child is
+    // still alive traps with "resource has children".
+    concurrent_promise_entries: Vec<GetPromiseResult>,
+    concurrent_lazy_pollables: Vec<LazyInitializedPollable>,
+    concurrent_pollables: Vec<Pollable>,
+    concurrent_results: RefCell<Vec<Option<String>>>,
 }
 
 #[agent_implementation]
@@ -155,6 +186,11 @@ impl CustomDurability for CustomDurabilityImpl {
             response: RefCell::new(None),
             input_stream: RefCell::new(None),
             body: RefCell::new(None),
+            concurrent_promise_ids: Vec::new(),
+            concurrent_promise_entries: Vec::new(),
+            concurrent_lazy_pollables: Vec::new(),
+            concurrent_pollables: Vec::new(),
+            concurrent_results: RefCell::new(vec![None; CONCURRENT_POLLABLE_COUNT]),
         }
     }
 
@@ -238,6 +274,78 @@ impl CustomDurability for CustomDurabilityImpl {
         } else {
             durability.replay_infallible::<StructuredResult>().result
         }
+    }
+
+    fn concurrent_promise_init(&mut self) {
+        for _idx in 0..CONCURRENT_POLLABLE_COUNT {
+            let promise_id = create_promise();
+            let lazy_pollable = LazyInitializedPollable::new();
+            let pollable = lazy_pollable.subscribe();
+            self.concurrent_lazy_pollables.push(lazy_pollable);
+            self.concurrent_pollables.push(pollable);
+
+            let promise_entry = get_promise(&promise_id);
+            let promise_pollable = promise_entry.subscribe();
+            self.concurrent_lazy_pollables[_idx]
+                .set(unsafe { std::mem::transmute(promise_pollable) });
+            self.concurrent_promise_entries.push(promise_entry);
+            self.concurrent_promise_ids.push(promise_id);
+        }
+    }
+
+    fn concurrent_promise_complete(&self, idx: u32) {
+        let promise_id = &self.concurrent_promise_ids[idx as usize];
+        let payload = format!("promise-{idx}").into_bytes();
+        complete_promise(promise_id, &payload);
+    }
+
+    fn concurrent_promise_test(&self) -> String {
+        // Real (non-persist-nothing) polling over N concurrently in-flight promise-backed
+        // pollables — the exact shape of the production trap (and the exact primitive
+        // `workflowToolStart`/`Finish` uses for concurrent render waits): several pollables
+        // live at once, only some ready at any given round, no ordering guarantee about which
+        // becomes ready first. Uses the batched wasi:io/poll.poll() free function (blocks
+        // until >=1 ready, returns the ready indices) — this is the `Host::poll` path with
+        // `in_.len() > 1`, not just the single-pollable `block()`/`ready()` path
+        // lazy_pollable_test already covers.
+        //
+        // Does exactly ONE round (one poll() call, consuming everything ready that round) and
+        // returns the current state, unresolved slots shown as "-" — mirroring the production
+        // round-based invocation shape (one bounded unit of work per external call) rather than
+        // looping to completion in-process. The test driver calls this repeatedly, restarting
+        // the executor between rounds to force genuine oplog replay of the partially-resolved
+        // concurrent state.
+        let all_done = self.concurrent_results.borrow().iter().all(|r| r.is_some());
+        if !all_done {
+            let pending_indices: Vec<usize> = self
+                .concurrent_results
+                .borrow()
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.is_none())
+                .map(|(i, _)| i)
+                .collect();
+            let pending_pollables: Vec<&Pollable> = pending_indices
+                .iter()
+                .map(|&i| &self.concurrent_pollables[i])
+                .collect();
+            let ready_positions = golem_rust::wasip2::io::poll::poll(&pending_pollables);
+            for pos in ready_positions {
+                let idx = pending_indices[pos as usize];
+                let promise_id = &self.concurrent_promise_ids[idx];
+                let data = get_promise(promise_id)
+                    .get()
+                    .expect("promise pollable was ready but get() returned None");
+                self.concurrent_results.borrow_mut()[idx] =
+                    Some(String::from_utf8(data).unwrap());
+            }
+        }
+        self.concurrent_results
+            .borrow()
+            .iter()
+            .map(|r| r.clone().unwrap_or_else(|| "-".to_string()))
+            .collect::<Vec<_>>()
+            .join("|")
     }
 }
 

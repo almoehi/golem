@@ -4153,6 +4153,25 @@ struct PrivateDurableWorkerState {
     /// Used to finalize deferred parent deletion when a child pollable is dropped.
     rpc_pollable_to_parent: HashMap<u32, u32>,
 
+    /// Maps a pollable's wasmtime resource `rep` to a logical, call-order-derived sequence
+    /// number, assigned the first time `ready()`/`poll()` observes that rep in the CURRENT
+    /// process lifetime (live or replay). Used instead of the raw `rep` to tag `IoPollReady`
+    /// oplog entries (see `durable_host/io/poll.rs`), because wasmtime's resource-table `rep`
+    /// numbering is an implementation detail that can differ between live and replay even
+    /// under fully deterministic guest code (see GOLEM_IO_POLL_BUG.md "Third Bug"); the
+    /// first-seen-this-session ordinal is stable because it derives purely from the guest's
+    /// own deterministic call order, and it never needs to survive a snapshot-based restore
+    /// (see `snapshot_recovery_skip_region_is_never_replayed` in replay_state.rs) because no
+    /// pollable's poll loop can be in flight when a snapshot is taken — `on_external_invocation_completed`/
+    /// the `Periodic` snapshot check in `invocation_loop.rs` only ever fire between fully
+    /// completed external invocations, with an empty WASM call stack. Cleared on `drop()` so a
+    /// reused rep (wasmtime resource-table slot reuse) gets a fresh sequence number rather than
+    /// wrongly inheriting the dropped pollable's identity.
+    pollable_seq: HashMap<u32, u32>,
+    /// Next value to assign in `pollable_seq`. Reset fresh (starts at 0) on every worker
+    /// resume, live or replay — see `pollable_seq`'s doc comment for why this is safe.
+    next_pollable_seq: u32,
+
     // ResourceIds of all DynPollables that are backed by GetPromiseResultEntries
     promise_backed_pollables: TRwLock<HashMap<u32, GetPromiseResultEntry>>,
     // Map from resource_id to the dyn_pollables that wrap it
@@ -4326,6 +4345,8 @@ impl PrivateDurableWorkerState {
             cached_agent_config_retry_policies: None,
             runtime_retry_policy_mutations: std::collections::BTreeMap::new(),
             rpc_pollable_to_parent: HashMap::new(),
+            pollable_seq: HashMap::new(),
+            next_pollable_seq: 0,
             shard_service,
             promise_backed_pollables: TRwLock::new(HashMap::new()),
             promise_dyn_pollables: TRwLock::new(HashMap::new()),
@@ -4338,6 +4359,28 @@ impl PrivateDurableWorkerState {
             last_snapshot_index,
             resource_limit_entry,
         })
+    }
+
+    /// Returns the logical sequence number for `rep`, assigning a fresh one (via
+    /// `next_pollable_seq`) the first time this rep is observed by `ready()`/`poll()` in the
+    /// current process lifetime — live or replay alike. Deterministic guest execution means
+    /// the Nth distinct pollable observed is the same logical pollable on both live and
+    /// replay, regardless of what wasmtime resource-table rep either side happens to assign
+    /// it. See `pollable_seq`'s field doc comment for why this doesn't need to survive a
+    /// snapshot-based restore.
+    pub fn pollable_seq(&mut self, rep: u32) -> u32 {
+        *self.pollable_seq.entry(rep).or_insert_with(|| {
+            let seq = self.next_pollable_seq;
+            self.next_pollable_seq += 1;
+            seq
+        })
+    }
+
+    /// Clears a pollable's sequence-number assignment when it is dropped, so a wasmtime
+    /// resource-table rep that gets reused for an unrelated pollable is assigned a fresh
+    /// sequence number rather than wrongly inheriting the dropped pollable's identity.
+    pub fn clear_pollable_seq(&mut self, rep: u32) {
+        self.pollable_seq.remove(&rep);
     }
 
     /// Returns the agent-config-derived retry policies (cached, cheap).

@@ -592,6 +592,15 @@ oplog_entry! {
         raw {
             data: payload::OplogPayload<Vec<u8>>,
             mime_type: String,
+            // Engine-internal only, deliberately absent from `public` below: the exact
+            // PrivateDurableWorkerState::next_pollable_seq value at the instant this snapshot
+            // was taken. Resuming from a snapshot skips replaying everything before it by
+            // design, so a freshly-constructed instance can never independently reconstruct
+            // this monotonic counter's true value on its own -- it must be captured here and
+            // read back directly. See recover_next_pollable_seq's doc comment in
+            // durable_host/mod.rs and POLLABLE_SEQ_RECOVERY_DESIGN_OPTIONS.md ("Option 2") for
+            // the full rationale.
+            next_pollable_seq: u32,
         }
         public {
             data: PublicSnapshotData

@@ -21,12 +21,14 @@ use bytes::Bytes;
 use futures::{StreamExt, stream};
 use golem_api_grpc::proto::golem::worker::LogEvent;
 use golem_common::model::AgentEvent;
+use golem_common::model::agent::{ComponentModelElementValue, DataValue, ElementValue, ElementValues};
 use golem_common::model::oplog::{
     MultipartPartData, OplogIndex, PublicOplogEntry, PublicSnapshotData,
 };
+use golem_common::model::PromiseId;
 use golem_common::{agent_id, data_value};
 use golem_test_framework::dsl::TestDsl;
-use golem_wasm::Value;
+use golem_wasm::{IntoValue, Value, ValueAndType};
 use golem_worker_executor::services::golem_config::SnapshotPolicy;
 use golem_worker_executor_test_utils::{
     LastUniqueId, PrecompiledComponent, TestContext, WorkerExecutorTestDependencies, start,
@@ -626,6 +628,139 @@ async fn concurrent_pollables_adversarial_completion_order_survives_replay(
              under an adversarial (non-dispatch-order) completion pattern (Bug #2/#3 class)"
         );
     }
+
+    Ok(())
+}
+
+/// Round-eight reproduction of the production `scene_plates`/`character_sheet` trap
+/// (`WorkerAgent("workspace-example-hitl@1.0", "...@scene_plates")` /
+/// `"...@character_sheet"`), minimal shape per direct oplog tracing: exactly ONE
+/// `atomically()`-wrapped single-HTTP-call region (matching one `atomicRpcCall()`-wrapped
+/// `WorkflowAgent.run()` dispatch inside `WorkerAgent.workflowToolStart()`) that closes
+/// cleanly, followed by creating a promise that is NOT completed yet, followed by a genuine
+/// `SUSPEND` (via `blocking_await_promise` on the still-incomplete promise — the exact
+/// primitive `WorkerAgent.awaitPromise()` uses), followed by a COLD worker eviction + full
+/// oplog replay from scratch on a fresh executor/instance with NO intervening snapshot. None
+/// of the existing six verification rounds (`concurrent_pollables_survive_worker_replay`,
+/// its adversarial-ordering variant, the timer-vs-HTTP races) exercise `atomically()` at all —
+/// they only ever poll bare promise-backed or HTTP pollables, never a `mark_begin_operation`/
+/// `mark_end_operation` region. This is the first test in this file to combine an atomic
+/// region with a cold cross-restart replay.
+#[test]
+#[tracing::instrument]
+async fn sequential_atomic_rpc_region_survives_cold_replay_after_suspend(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("host_api_tests")] host_api_tests: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let host_http_port = listener.local_addr().unwrap().port();
+
+    let http_server = tokio::spawn(
+        async move {
+            let route = Router::new().route("/fetch", get(|| async { "ok" }));
+            axum::serve(listener, route).await.unwrap();
+        }
+        .in_current_span(),
+    );
+
+    let component = executor
+        .component_dep(&context.default_environment_id, host_api_tests)
+        .store()
+        .await?;
+    let agent_id = agent_id!("CustomDurability", "sequential-atomic-1");
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), host_http_port.to_string());
+    let worker_id = executor
+        .start_agent_with(&component.id, agent_id.clone(), env, Vec::new())
+        .await?;
+
+    // ONE atomically()-wrapped HTTP call, then create_promise() (not awaited yet). Matches
+    // production oplog structure through the BEGIN/END ATOMIC REGION pair and the promise
+    // creation, before the SUSPEND.
+    let promise_id_value = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_calls_then_promise_init",
+            data_value!(1u32),
+        )
+        .await?
+        .into_return_value()
+        .ok_or_else(|| anyhow::anyhow!("expected a PromiseId return value"))?;
+    let promise_id_vat = ValueAndType::new(promise_id_value.clone(), PromiseId::get_type());
+
+    // Fire-and-forget: the promise is not complete yet, so this invocation genuinely suspends
+    // (matches production's bare SUSPEND entry with no completing IoPollPoll recorded).
+    executor
+        .invoke_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_await",
+            DataValue::Tuple(ElementValues {
+                elements: vec![ElementValue::ComponentModel(ComponentModelElementValue {
+                    value: promise_id_vat.clone(),
+                })],
+            }),
+        )
+        .await?;
+
+    // Give the suspend a moment to actually land before forcing a cold restart.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Force a genuine worker eviction + full oplog replay on a fresh executor/instance, with
+    // the promise STILL incomplete across the restart — no intervening snapshot exists (this
+    // component has no periodic snapshotting configured), so replay must walk the entire
+    // history including the atomic region from scratch.
+    drop(executor);
+    let executor = start(deps, &context).await?;
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    // Extract oplog_idx from the promise value to complete it from outside the guest.
+    let Value::Record(fields) = &promise_id_value else {
+        panic!("Expected a record for PromiseId");
+    };
+    let Value::U64(oplog_idx) = fields[1] else {
+        panic!("Expected a u64 for oplog_idx");
+    };
+    executor
+        .complete_promise(
+            &PromiseId {
+                agent_id: worker_id.clone(),
+                oplog_idx: OplogIndex::from_u64(oplog_idx),
+            },
+            b"resumed-ok".to_vec(),
+        )
+        .await?;
+
+    let result = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_await",
+            DataValue::Tuple(ElementValues {
+                elements: vec![ElementValue::ComponentModel(ComponentModelElementValue {
+                    value: promise_id_vat,
+                })],
+            }),
+        )
+        .await?
+        .into_return_value();
+
+    http_server.abort();
+
+    assert_eq!(
+        result,
+        Some(Value::List(b"resumed-ok".iter().map(|b| Value::U8(*b)).collect())),
+        "worker must survive the cold replay of the atomic region + suspend and resolve the \
+         promise correctly — a mismatch or a trap during the preceding `start()` call means the \
+         `io::poll::poll`/`pollable::ready` replay divergence reproduced"
+    );
 
     Ok(())
 }
@@ -1905,5 +2040,138 @@ async fn ts_sqlite_multipart_snapshot_recovery(
     executor.check_oplog_is_queryable(&worker_id).await?;
 
     drop(executor);
+    Ok(())
+}
+
+/// Round ten: reproduces the LIVE-instrumented production trace (see
+/// `/Users/hannes/work/golem/oplog-backups/README.md` "Sixth capture" section) — the guest's
+/// real polling loop for the atomic region's pollable is `ready()` (optimistic, non-blocking) →
+/// `poll()` (blocking wait) → a SECOND `ready()` call to CONFIRM before reading, not
+/// `pollable.block()`'s single bare `poll()` call with no `ready()` calls at all (which round
+/// eight's `sequential_atomic_calls_then_promise_init` used and did not reproduce the trap).
+/// Live tracing (commit `3a1c0dc97` on this branch) showed the SECOND `ready()` call is exactly
+/// where replay diverges: `pollable_seq` correctly re-resolves the same rep to the same seq
+/// (`is_new: false`), but `try_get_oplog_entry`'s peek reports "no match" against what should be
+/// the recorded `IoPollReady`/`true` entry, synthesizes `false` instead, and the following
+/// `poll()` call then traps on the un-consumed entry.
+#[test]
+#[tracing::instrument]
+async fn atomic_double_ready_call_survives_cold_replay_after_suspend(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("host_api_tests")] host_api_tests: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let host_http_port = listener.local_addr().unwrap().port();
+
+    let http_server = tokio::spawn(
+        async move {
+            // Deliberate latency: without it, the local server responds fast enough that the
+            // guest's FIRST optimistic ready() check already observes true, so the poll() +
+            // confirming second ready() path (the one under test) never executes at all.
+            let route = Router::new().route(
+                "/fetch",
+                get(|| async {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    "ok"
+                }),
+            );
+            axum::serve(listener, route).await.unwrap();
+        }
+        .in_current_span(),
+    );
+
+    let component = executor
+        .component_dep(&context.default_environment_id, host_api_tests)
+        .store()
+        .await?;
+    let agent_id = agent_id!("CustomDurability", "round10-double-ready-1");
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), host_http_port.to_string());
+    let worker_id = executor
+        .start_agent_with(&component.id, agent_id.clone(), env, Vec::new())
+        .await?;
+
+    // ONE atomically()-wrapped HTTP call driven with the real ready->poll->ready shape, then
+    // create_promise() (not awaited yet).
+    let promise_id_value = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "atomic_double_ready_call_then_promise_init",
+            data_value!(),
+        )
+        .await?
+        .into_return_value()
+        .ok_or_else(|| anyhow::anyhow!("expected a PromiseId return value"))?;
+    let promise_id_vat = ValueAndType::new(promise_id_value.clone(), PromiseId::get_type());
+
+    // Fire-and-forget: the promise is not complete yet, so this invocation genuinely suspends.
+    executor
+        .invoke_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_await",
+            DataValue::Tuple(ElementValues {
+                elements: vec![ElementValue::ComponentModel(ComponentModelElementValue {
+                    value: promise_id_vat.clone(),
+                })],
+            }),
+        )
+        .await?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Force a genuine worker eviction + full oplog replay on a fresh executor/instance, with
+    // the promise STILL incomplete across the restart — no intervening snapshot exists.
+    drop(executor);
+    let executor = start(deps, &context).await?;
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    let Value::Record(fields) = &promise_id_value else {
+        panic!("Expected a record for PromiseId");
+    };
+    let Value::U64(oplog_idx) = fields[1] else {
+        panic!("Expected a u64 for oplog_idx");
+    };
+    executor
+        .complete_promise(
+            &PromiseId {
+                agent_id: worker_id.clone(),
+                oplog_idx: OplogIndex::from_u64(oplog_idx),
+            },
+            b"resumed-ok".to_vec(),
+        )
+        .await?;
+
+    let result = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_await",
+            DataValue::Tuple(ElementValues {
+                elements: vec![ElementValue::ComponentModel(ComponentModelElementValue {
+                    value: promise_id_vat,
+                })],
+            }),
+        )
+        .await?
+        .into_return_value();
+
+    http_server.abort();
+
+    assert_eq!(
+        result,
+        Some(Value::List(b"resumed-ok".iter().map(|b| Value::U8(*b)).collect())),
+        "worker must survive the cold replay of the atomic region + suspend and resolve the \
+         promise correctly — a mismatch or a trap during the preceding double-ready() atomic \
+         call's replay means the io::poll::poll/pollable::ready replay divergence reproduced"
+    );
+
     Ok(())
 }

@@ -1831,6 +1831,7 @@ async fn batch_read_spans_two_archived_snapshot_generations(_tracing: &Tracing) 
         .add(OplogEntry::snapshot(
             OplogPayload::Inline(Box::new(vec![])),
             "application/octet-stream".to_string(),
+            0, // next_pollable_seq: unused by this test, which exercises compaction/archiving
         ))
         .await;
     oplog.commit(CommitLevel::Always).await;
@@ -1872,6 +1873,7 @@ async fn batch_read_spans_two_archived_snapshot_generations(_tracing: &Tracing) 
         .add(OplogEntry::snapshot(
             OplogPayload::Inline(Box::new(vec![])),
             "application/octet-stream".to_string(),
+            0, // next_pollable_seq: unused by this test, which exercises compaction/archiving
         ))
         .await;
     oplog.add(OplogEntry::no_op()).await;

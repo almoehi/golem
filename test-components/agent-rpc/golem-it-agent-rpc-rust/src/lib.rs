@@ -1,6 +1,10 @@
 use golem_rust::bindings::golem::agent::host::{Datetime, RpcError, WasmRpc};
-use golem_rust::{agent_definition, agent_implementation, PromiseId, Schema, Uuid};
+use golem_rust::{
+    agent_definition, agent_implementation, atomically, atomically_async, blocking_await_promise,
+    create_promise, PromiseId, Schema, Uuid,
+};
 use golem_rust::agentic::Schema as SchemaOps;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Schema)]
@@ -218,6 +222,13 @@ impl ScheduledInvocationClient for ScheduledInvocationClientImpl {
 pub trait RpcCounter {
     fn new(name: String) -> Self;
     fn inc_by(&mut self, value: u64);
+    /// Same as `inc_by`, but blocks ~150ms first (a real monotonic-clock timer pollable, not a
+    /// busy loop) before incrementing — deterministic replacement for "real network latency"
+    /// so a caller's optimistic first `ready()` check on this call's future reliably observes
+    /// `false`, matching production's real cross-agent RPC timing (round ten's
+    /// `atomic_double_ready_rpc_call_then_promise_init` needs this; plain `inc_by` completes
+    /// too fast locally for the caller's first ready() check to ever see anything but `true`).
+    fn inc_by_slow(&mut self, value: u64);
     fn get_value(&self) -> u64;
     fn get_args(&self) -> Vec<String>;
     fn get_env(&self) -> Vec<(String, String)>;
@@ -238,6 +249,12 @@ impl RpcCounter for RpcCounterImpl {
     }
 
     fn inc_by(&mut self, value: u64) {
+        self.value += value;
+    }
+
+    fn inc_by_slow(&mut self, value: u64) {
+        let timer = golem_rust::wasip2::clocks::monotonic_clock::subscribe_duration(150_000_000);
+        timer.block();
         self.value += value;
     }
 
@@ -300,7 +317,14 @@ impl RpcGlobalState for RpcGlobalStateImpl {
     }
 }
 
-#[agent_definition]
+// snapshotting = "enabled" + #[derive(Serialize, Deserialize)] on RpcCallerImpl below gives
+// this agent the default JSON snapshot mechanism (see JsonSnapshotCounter in
+// test-components/agent-counters/src/snapshot_test.rs for the same pattern) — needed so
+// SnapshotPolicy::{Periodic,EveryNInvocation} actually produces real Snapshot oplog entries for
+// tests exercising snapshot-then-resume (round twelve/thirteen's pollable_seq recovery
+// regression test; without this attribute periodic/every-N snapshotting silently never fires
+// for this agent at all).
+#[agent_definition(snapshotting = "enabled")]
 pub trait RpcCaller {
     fn new(name: String) -> Self;
 
@@ -324,8 +348,50 @@ pub trait RpcCaller {
 
     /// bug-golem1265: Pass a string through RPC and get Result back
     async fn bug_golem1265(&self, s: String) -> Result<(), String>;
+
+    /// Round-nine reproduction of the production `scene_plates`/`character_sheet` trap: `n`
+    /// SEQUENTIAL `atomically_async()`-wrapped single-RPC-call regions — each constructs a
+    /// FRESH `RpcCounterClient::get(...)` proxy (matching `WorkflowAgent.get(...).run(...)`
+    /// inside `atomicRpcCall()` — a real cross-agent `get_agent_type` + two tracing spans +
+    /// `future-invoke-result::get` sequence, not the plain WASI HTTP fetch round eight's
+    /// `sequential_atomic_calls_then_promise_init` used) and calls exactly one method on it,
+    /// fully closing the atomic region before the next begins. Afterward creates ONE promise
+    /// (not awaited yet — see `sequential_atomic_rpc_await`) and returns its id.
+    async fn sequential_atomic_rpc_calls_then_promise_init(&mut self, n: u32) -> PromiseId;
+    /// Blocks on `promise_id` via `blocking_await_promise` — same primitive as round eight's
+    /// `sequential_atomic_await`, reused here so only the atomic region's content differs
+    /// between the two rounds.
+    fn sequential_atomic_rpc_await(&self, promise_id: PromiseId) -> Vec<u8>;
+
+    /// Round-nine single-invocation variant: `n` sequential atomically_async()-wrapped RPC
+    /// calls (same shape as `sequential_atomic_rpc_calls_then_promise_init`) followed
+    /// IMMEDIATELY by `blocking_await_promise(promise_id)` — all inside ONE external
+    /// invocation, matching production's actual shape (`advanceReasoningLoop`'s one round
+    /// does both the atomic dispatches AND the awaitPromise together), unlike the two-call
+    /// split `sequential_atomic_rpc_calls_then_promise_init` +
+    /// `sequential_atomic_rpc_await` used. `promise_id` must already exist (create it via a
+    /// separate `sequential_atomic_rpc_calls_then_promise_init(0, ...)` call first, which
+    /// does zero atomic calls and just returns a fresh promise id).
+    async fn sequential_atomic_rpc_calls_then_await(
+        &mut self,
+        n: u32,
+        promise_id: PromiseId,
+    ) -> Vec<u8>;
+
+    /// Round-ten reproduction: ONE `atomically()`-wrapped RPC call, driven with the RAW
+    /// `WasmRpc`/`future-invoke-result` API (not the `agent_implementation`-generated
+    /// `RpcCounterClient` proxy `.inc_by(1).await` used by
+    /// `sequential_atomic_rpc_calls_then_promise_init`) so the polling shape is fully manual
+    /// and under test control: `future.subscribe().ready()` (optimistic non-blocking check,
+    /// expected `false`) → `poll()` (blocking wait) → a SECOND `.ready()` call to CONFIRM
+    /// before calling `future.get()` — matching the live-instrumented production trace's
+    /// actual shape (see `/Users/hannes/work/golem/oplog-backups/README.md` "Sixth capture"),
+    /// which round nine's generated-proxy-based RPC test did not exercise. Then
+    /// `create_promise()` (not awaited yet — reuses `sequential_atomic_rpc_await`).
+    fn atomic_double_ready_rpc_call_then_promise_init(&mut self, counter_name: String) -> PromiseId;
 }
 
+#[derive(Serialize, Deserialize)]
 struct RpcCallerImpl {
     name: String,
     counter_name: Option<String>,
@@ -425,6 +491,84 @@ impl RpcCaller for RpcCallerImpl {
     async fn bug_golem1265(&self, s: String) -> Result<(), String> {
         let global = RpcGlobalStateClient::get(format!("{}_bug1265", self.name));
         global.bug_golem1265(s).await
+    }
+
+    async fn sequential_atomic_rpc_calls_then_promise_init(&mut self, n: u32) -> PromiseId {
+        for i in 0..n {
+            let counter_name = format!("{}_seq_atomic_rpc_counter{i}", self.name);
+            atomically_async(|| async {
+                // Fresh proxy per call, single method call per atomic region — matches
+                // WorkerAgent.workflowToolStart()'s atomicRpcCall()-wrapped
+                // WorkflowAgent.get(...).run(...) shape exactly: one get_agent_type +
+                // rpc-connection span + rpc-invocation span + future-invoke-result::get
+                // sequence, fully closed before the loop's next iteration begins.
+                let mut counter = RpcCounterClient::get(counter_name.clone());
+                counter.inc_by(1).await;
+            })
+            .await;
+        }
+
+        create_promise()
+    }
+
+    fn sequential_atomic_rpc_await(&self, promise_id: PromiseId) -> Vec<u8> {
+        blocking_await_promise(&promise_id)
+    }
+
+    async fn sequential_atomic_rpc_calls_then_await(
+        &mut self,
+        n: u32,
+        promise_id: PromiseId,
+    ) -> Vec<u8> {
+        for i in 0..n {
+            let counter_name = format!("{}_seq_atomic_rpc_single_inv_counter{i}", self.name);
+            atomically_async(|| async {
+                let mut counter = RpcCounterClient::get(counter_name.clone());
+                counter.inc_by(1).await;
+            })
+            .await;
+        }
+
+        blocking_await_promise(&promise_id)
+    }
+
+    fn atomic_double_ready_rpc_call_then_promise_init(&mut self, counter_name: String) -> PromiseId {
+        use golem_rust::agentic::Schema;
+
+        atomically(|| {
+            let constructor_data = counter_name
+                .clone()
+                .to_data_value()
+                .expect("Failed to encode constructor");
+            let wasm_rpc = WasmRpc::new("RpcCounter", &constructor_data, None, &[]);
+            let input = 1u64.to_data_value().expect("Failed to encode input");
+            // inc_by_slow (not inc_by): a real ~150ms monotonic-clock block on the callee side,
+            // so this call's future genuinely isn't ready on the first optimistic check —
+            // matching production's real cross-agent RPC latency (a local in-process inc_by
+            // completes too fast for the first ready() check to ever observe false).
+            let future = wasm_rpc.async_invoke_and_await("inc_by_slow", &input);
+            let pollable = future.subscribe();
+
+            // Same manual ready->poll->ready shape as atomic_double_ready_call_then_promise_init
+            // (custom_durability.rs, round ten), but on a REAL future-invoke-result pollable —
+            // the exact resource type the production trace's failing pollable is (`golem::rpc::
+            // future-invoke-result::get`), not an HTTP input-stream pollable.
+            let first_ready = pollable.ready();
+            if !first_ready {
+                let _ = golem_rust::wasip2::io::poll::poll(&[&pollable]);
+                let confirmed = pollable.ready();
+                assert!(
+                    confirmed,
+                    "future-invoke-result pollable must report ready immediately after poll() \
+                     unblocked"
+                );
+            }
+            let _ = future
+                .get()
+                .expect("future-invoke-result must have a result after ready()");
+        });
+
+        create_promise()
     }
 }
 

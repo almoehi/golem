@@ -307,6 +307,170 @@ async fn lazy_pollable(
     Ok(())
 }
 
+/// End-to-end regression test for the seq-based `IoPollReady` replay fix
+/// (`durable_host/io/poll.rs::pollable_seq`). Matches the production `scene_plates` trap: a
+/// worker with 4 concurrently in-flight promise-backed pollables — the same
+/// create_promise()/await_promise() primitive `workflowToolStart`/`Finish` uses for concurrent
+/// render waits, no persist-nothing wrapping — only some resolve before the worker is evicted
+/// and its oplog replayed from scratch on a real wasmtime instance (not a simulated
+/// `DeletedRegions` unit test). Verifies every pollable resolves to its own, correctly-
+/// attributed result after replay reconstructs the partially-resolved concurrent state — no
+/// cross-pollable theft, and no reliance on the removed rep-mismatch fallback (this component
+/// never triggers a snapshot, so if the fallback were still load-bearing for ordinary replay
+/// this test would catch it via a wrong ordering).
+#[test]
+#[tracing::instrument]
+async fn concurrent_pollables_survive_worker_replay(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("host_api_tests")] host_api_tests: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let component = executor
+        .component_dep(&context.default_environment_id, host_api_tests)
+        .store()
+        .await?;
+    let agent_id = agent_id!("CustomDurability", "concurrent-pollables-1");
+
+    let worker_id = executor
+        .start_agent(&component.id, agent_id.clone())
+        .await?;
+
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "concurrent_promise_init",
+            data_value!(),
+        )
+        .await?;
+
+    // Complete exactly 2 of the 4 concurrently-pending promises, each as its OWN separate
+    // invocation — mirroring a different agent (e.g. WorkflowAgent) calling completePromise()
+    // asynchronously, outside the poll loop.
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "concurrent_promise_complete",
+            data_value!(0u32),
+        )
+        .await?;
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "concurrent_promise_complete",
+            data_value!(2u32),
+        )
+        .await?;
+
+    // A single poll() round is only guaranteed to surface AT LEAST one newly-ready pollable,
+    // not necessarily all of them — call repeatedly (bounded) until both completed slots (0, 2)
+    // are resolved. Each call is its own external invocation, so this still exercises separate
+    // rounds of the seq-matching code path, just possibly more than one before both land.
+    let mut round1_parts: Vec<String> = vec!["-".to_string(); 4];
+    for _ in 0..4 {
+        if round1_parts[0] != "-" && round1_parts[2] != "-" {
+            break;
+        }
+        let round = executor
+            .invoke_and_await_agent(
+                &component,
+                &agent_id,
+                "concurrent_promise_test",
+                data_value!(),
+            )
+            .await?;
+        let round_str = match round.into_return_value() {
+            Some(Value::String(s)) => s,
+            other => panic!("Expected string from concurrent_promise_test, got {:?}", other),
+        };
+        round1_parts = round_str.split('|').map(|s| s.to_string()).collect();
+        assert_eq!(round1_parts.len(), 4);
+    }
+    for idx in [0usize, 2] {
+        assert_eq!(
+            round1_parts[idx],
+            format!("promise-{idx}"),
+            "Resolved slot {idx} must contain its OWN promise's payload, not another \
+             pollable's — cross-pollable theft would show a mismatched idx here \
+             (full state: {round1_parts:?})"
+        );
+    }
+    for idx in [1usize, 3] {
+        assert_eq!(
+            round1_parts[idx], "-",
+            "Slot {idx} was never completed and must still be unresolved \
+             (full state: {round1_parts:?})"
+        );
+    }
+
+    // Force a genuine worker eviction + full oplog replay on a fresh executor/instance —
+    // reconstructing promise creation (4x), the 2 completions, and round 1's partial poll()
+    // resolution from raw oplog, exercising the exact ready()/poll() seq-matching code path
+    // this fix changed.
+    drop(executor);
+    let executor = start(deps, &context).await?;
+
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "concurrent_promise_complete",
+            data_value!(1u32),
+        )
+        .await?;
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "concurrent_promise_complete",
+            data_value!(3u32),
+        )
+        .await?;
+
+    let mut round2_parts: Vec<String> = vec!["-".to_string(); 4];
+    for _ in 0..4 {
+        if round2_parts.iter().all(|p| p != "-") {
+            break;
+        }
+        let round = executor
+            .invoke_and_await_agent(
+                &component,
+                &agent_id,
+                "concurrent_promise_test",
+                data_value!(),
+            )
+            .await?;
+        let round_str = match round.into_return_value() {
+            Some(Value::String(s)) => s,
+            other => panic!("Expected string from concurrent_promise_test, got {:?}", other),
+        };
+        round2_parts = round_str.split('|').map(|s| s.to_string()).collect();
+        assert_eq!(round2_parts.len(), 4);
+    }
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    // All 4 must now be resolved, each correctly attributed to its own idx — the core
+    // assertion: no cross-pollable theft survived the eviction + replay + continuation.
+    for (idx, part) in round2_parts.iter().enumerate() {
+        assert_eq!(
+            *part,
+            format!("promise-{idx}"),
+            "Slot {idx} must resolve to its own promise's payload after replay + completion — \
+             a mismatch here means a different pollable's entry was wrongly consumed \
+             (Bug #2/#3 class)"
+        );
+    }
+
+    Ok(())
+}
+
 const SNAPSHOT_TEST_INVOCATIONS: usize = 10;
 
 #[test]

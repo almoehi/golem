@@ -276,32 +276,6 @@ impl ReplayState {
         }
     }
 
-    /// Non-consuming peek at the next oplog entry. Returns `true` if the condition matches
-    /// without advancing the replay position. Use when caller needs to branch on the next entry
-    /// type but must not consume it (e.g. `poll()` detecting that `get()` is imminent).
-    pub async fn peek_next_oplog_entry(
-        &mut self,
-        condition: impl FnOnce(&OplogEntry) -> bool,
-    ) -> Result<bool, WorkerExecutorError> {
-        let saved_replay_idx = self.last_replayed_index.get();
-        let saved_next_skipped_region = {
-            let internal = self.internal.read().await;
-            internal.next_skipped_region.clone()
-        };
-
-        let read_idx = self.last_replayed_index.get().next();
-        let entry = self.internal_get_next_oplog_entry().await?;
-        let matched = condition(&entry);
-
-        // Always rewind — we never consume in peek mode.
-        self.rewind_replay_buffer(read_idx, entry);
-        self.last_replayed_index.set(saved_replay_idx);
-        let mut internal = self.internal.write().await;
-        internal.next_skipped_region = saved_next_skipped_region;
-
-        Ok(matched)
-    }
-
     fn rewind_replay_buffer(&mut self, idx: OplogIndex, entry: OplogEntry) {
         if self
             .replay_buffer
@@ -1064,168 +1038,6 @@ mod tests {
         );
     }
 
-    /// Verifies `peek_next_oplog_entry` does NOT advance the replay position:
-    /// after a peek that matches, a subsequent `try_get_oplog_entry` must still
-    /// see the same entry (i.e. it was not consumed by the peek).
-    #[test]
-    async fn peek_next_oplog_entry_does_not_consume_entry() {
-        use golem_common::model::oplog::{
-            DurableFunctionType, HostRequest, HostRequestNoInput, HostResponse,
-            HostResponsePollReady, OplogPayload,
-        };
-        let agent_id = AgentId {
-            component_id: ComponentId::new(),
-            agent_id: "test".to_string(),
-        };
-        let io_poll_ready = OplogEntry::HostCall {
-            timestamp: Timestamp::now_utc(),
-            function_name: HostFunctionName::IoPollReady,
-            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
-                HostRequestNoInput {},
-            ))),
-            response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
-                HostResponsePollReady { result: Ok(true) },
-            ))),
-            durable_function_type: DurableFunctionType::ReadLocalPollable(42),
-        };
-        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
-            (
-                OplogIndex::INITIAL,
-                OplogEntry::NoOp {
-                    timestamp: Timestamp::now_utc(),
-                },
-            ),
-            (OplogIndex::INITIAL.next(), io_poll_ready),
-        ])));
-        let mut state = ReplayState::new(
-            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
-            oplog,
-            DeletedRegions::new(),
-        )
-        .await
-        .unwrap();
-
-        // peek: condition matches but must NOT consume
-        let peeked = state
-            .peek_next_oplog_entry(|e| {
-                matches!(
-                    e,
-                    OplogEntry::HostCall {
-                        function_name: HostFunctionName::IoPollReady,
-                        ..
-                    }
-                )
-            })
-            .await
-            .unwrap();
-        assert!(peeked, "peek should report a match");
-
-        // the entry must still be present for a real consume
-        let consumed = state
-            .try_get_oplog_entry(|e| {
-                matches!(
-                    e,
-                    OplogEntry::HostCall {
-                        function_name: HostFunctionName::IoPollReady,
-                        ..
-                    }
-                )
-            })
-            .await
-            .unwrap();
-        assert!(
-            consumed.is_some(),
-            "entry must still be consumable after a non-consuming peek"
-        );
-    }
-
-    /// Simulates the ready() rep-mismatch recovery (Scenario B): after IoPollPoll AND
-    /// IoPollReady have already been consumed by prior poll() iterations, the next
-    /// entry is GolemRpcFutureInvokeResultGet. ready() uses peek_next_oplog_entry to
-    /// detect this sentinel and return true — breaking the `while (!ready()) { poll() }`
-    /// loop — without consuming the entry so that get() can still read it.
-    ///
-    /// We use an IoPollPoll entry as a proxy for any non-IoPollReady HostCall here
-    /// because constructing a full GolemRpcInvoke payload in a unit test would require
-    /// many transitive types. The important properties tested are:
-    /// - peek_next_oplog_entry returns true when the condition matches
-    /// - the entry is NOT consumed (try_get_oplog_entry finds it afterwards)
-    #[test]
-    async fn peek_next_oplog_entry_sees_entry_without_consuming() {
-        use golem_common::model::oplog::{
-            DurableFunctionType, HostRequest, HostRequestPollCount, HostResponse,
-            HostResponsePollResult, OplogPayload,
-        };
-        let agent_id = AgentId {
-            component_id: ComponentId::new(),
-            agent_id: "test".to_string(),
-        };
-        // Use IoPollPoll as a representative "non-IoPollReady" HostCall entry.
-        // The test property — peek is non-consuming — is independent of the entry type.
-        let poll_entry = OplogEntry::HostCall {
-            timestamp: Timestamp::now_utc(),
-            function_name: HostFunctionName::IoPollPoll,
-            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
-                HostRequestPollCount { count: 1 },
-            ))),
-            response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
-                HostResponsePollResult {
-                    result: Ok(vec![0]),
-                },
-            ))),
-            durable_function_type: DurableFunctionType::ReadLocal,
-        };
-        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
-            (
-                OplogIndex::INITIAL,
-                OplogEntry::NoOp {
-                    timestamp: Timestamp::now_utc(),
-                },
-            ),
-            (OplogIndex::INITIAL.next(), poll_entry),
-        ])));
-        let mut state = ReplayState::new(
-            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
-            oplog,
-            DeletedRegions::new(),
-        )
-        .await
-        .unwrap();
-
-        // Peek for IoPollPoll — should match without consuming.
-        let peeked = state
-            .peek_next_oplog_entry(|e| {
-                matches!(
-                    e,
-                    OplogEntry::HostCall {
-                        function_name: HostFunctionName::IoPollPoll,
-                        ..
-                    }
-                )
-            })
-            .await
-            .unwrap();
-        assert!(peeked, "peek should detect IoPollPoll");
-
-        // Entry must still be present after the non-consuming peek.
-        let still_there = state
-            .try_get_oplog_entry(|e| {
-                matches!(
-                    e,
-                    OplogEntry::HostCall {
-                        function_name: HostFunctionName::IoPollPoll,
-                        ..
-                    }
-                )
-            })
-            .await
-            .unwrap();
-        assert!(
-            still_there.is_some(),
-            "IoPollPoll must remain available for consumption after a peek"
-        );
-    }
-
     #[test]
     async fn lowering_replay_target_discards_prefetched_future_entries() {
         let agent_id = AgentId {
@@ -1414,5 +1226,492 @@ mod tests {
             matched.is_none(),
             "CheckWrite predicate must not consume IoPollPoll — that would break the poll() replay path"
         );
+    }
+
+    /// Empirical gate for the "remove rep-matching, use wildcard/positional matching"
+    /// proposal (GOLEM_IO_POLL_BUG.md "Third Bug" resolution): reproduces Bug #2
+    /// (cross-pollable IoPollReady theft) to prove wildcard matching is NOT safe given
+    /// `try_get_oplog_entry`'s actual semantics — it only peeks the IMMEDIATE next entry
+    /// and never searches forward, so an entry recorded for pollable B (rep=99) sitting at
+    /// the front of the buffer WILL be wrongly consumed by pollable A (rep=42) under a
+    /// wildcard (type-only) predicate, exactly as it was before the rep-tagging fix.
+    ///
+    /// Scenario: live execution called `P_timer.ready()` (false, unrecorded — Bug #1
+    /// optimization) then `P_stream.ready()` (true, recorded as `ReadLocalPollable(99)`).
+    /// On replay, `P_timer.ready()` (rep=42) is called first, in the same deterministic
+    /// order. The immediate-next oplog entry is `P_stream`'s recorded `true` entry — there
+    /// is nothing else in front of it, because the `false` call was never recorded.
+    #[test]
+    async fn wildcard_matching_would_reproduce_bug2_pollable_theft() {
+        use golem_common::model::oplog::{
+            DurableFunctionType, HostRequest, HostRequestNoInput, HostResponse,
+            HostResponsePollReady, OplogPayload,
+        };
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+        const P_STREAM_REP: u32 = 99;
+        const P_TIMER_REP: u32 = 42;
+
+        // Only P_stream's `true` result was ever recorded — P_timer's `false` was skipped
+        // (Bug #1 optimization), so there is no entry for it at all.
+        let io_poll_ready_for_p_stream = OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::IoPollReady,
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
+                HostRequestNoInput {},
+            ))),
+            response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
+                HostResponsePollReady { result: Ok(true) },
+            ))),
+            durable_function_type: DurableFunctionType::ReadLocalPollable(P_STREAM_REP),
+        };
+        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
+            (
+                OplogIndex::INITIAL,
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                },
+            ),
+            (OplogIndex::INITIAL.next(), io_poll_ready_for_p_stream),
+        ])));
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            oplog,
+            DeletedRegions::new(),
+        )
+        .await
+        .unwrap();
+
+        // P_timer.ready() replays first (deterministic call order matches live). Under a
+        // WILDCARD predicate (type-only, no rep check — the Bug-3-doc proposal), this steals
+        // P_stream's entry.
+        let wildcard_matched = state
+            .try_get_oplog_entry(|entry| {
+                matches!(
+                    entry,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollReady,
+                        ..
+                    }
+                )
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            wildcard_matched.is_some(),
+            "BUG-2 REPRODUCED: wildcard matching consumed P_stream's entry on P_timer's call \
+             (rep={P_TIMER_REP}), even though it was recorded for a different pollable \
+             (rep={P_STREAM_REP}). try_get_oplog_entry only peeks the immediate-next entry \
+             and never searches forward, so positional/wildcard matching is NOT safe once \
+             Bug #1's skip-false optimization means some calls leave no entry at all. \
+             Removing rep-matching (GOLEM_IO_POLL_BUG.md's 'Third Bug' resolution) would \
+             reintroduce this exact bug — do not implement it as literally proposed."
+        );
+    }
+
+    /// Proves the exact mechanism `durable_host/mod.rs` (`PrivateDurableWorkerState::new`,
+    /// ~line 4162) uses for snapshot-based recovery: entries from `INITIAL.next()` through
+    /// `last_snapshot_index` are placed in a `DeletedRegions` override and are NEVER visited
+    /// by replay — reading resumes directly at `last_snapshot_index + 1`.
+    ///
+    /// This is the empirical basis for the seq-based pollable identity design: since entries
+    /// 1..=snapshot_idx (which would include any PRE-snapshot pollable-creation entries) are
+    /// structurally unreachable after a snapshot-based resume, a "first-seen-this-session"
+    /// sequence counter (reset fresh on every resume, live or replay) can never collide with
+    /// or need to continue from a value assigned before the snapshot — there is nothing on
+    /// the other side of the skip to be consistent with, PROVIDED no pollable created before
+    /// the snapshot can still be in-flight after it (verified separately: both snapshot
+    /// triggers — `on_external_invocation_completed` and the `Periodic` policy check in
+    /// `invocation_loop.rs` — only ever fire between fully-completed external invocations,
+    /// i.e. with an empty WASM call stack and therefore no in-flight pollable).
+    #[test]
+    async fn snapshot_recovery_skip_region_is_never_replayed() {
+        use golem_common::model::oplog::{
+            DurableFunctionType, HostRequest, HostRequestNoInput, HostResponse,
+            HostResponsePollReady, OplogPayload,
+        };
+        use golem_common::model::regions::DeletedRegionsBuilder;
+
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+
+        // Entries 1..=3 simulate a completed pre-snapshot invocation (including a pollable
+        // creation + IoPollReady entry that must NEVER be visited post-restore). Entry 4 is
+        // where a snapshot was taken (last_snapshot_index = 4). Entry 5 simulates a fresh
+        // pollable creation entry in the invocation that runs after the restore.
+        let pre_snapshot_ready = OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::IoPollReady,
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
+                HostRequestNoInput {},
+            ))),
+            response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
+                HostResponsePollReady { result: Ok(true) },
+            ))),
+            durable_function_type: DurableFunctionType::ReadLocalPollable(7),
+        };
+        let post_snapshot_ready = OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::IoPollReady,
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
+                HostRequestNoInput {},
+            ))),
+            response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
+                HostResponsePollReady { result: Ok(true) },
+            ))),
+            durable_function_type: DurableFunctionType::ReadLocalPollable(0), // seq=0, first-seen this session
+        };
+        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
+            (
+                OplogIndex::INITIAL,
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                },
+            ),
+            (
+                OplogIndex::from_u64(2),
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                },
+            ),
+            (OplogIndex::from_u64(3), pre_snapshot_ready),
+            (
+                OplogIndex::from_u64(4),
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                }, // stand-in for the Snapshot marker entry itself
+            ),
+            (OplogIndex::from_u64(5), post_snapshot_ready),
+        ])));
+
+        let last_snapshot_index = OplogIndex::from_u64(4);
+        let skipped_regions = DeletedRegionsBuilder::from_regions(vec![
+            OplogRegion::from_index_range(OplogIndex::INITIAL.next()..=last_snapshot_index),
+        ])
+        .build();
+
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            oplog,
+            skipped_regions,
+        )
+        .await
+        .unwrap();
+
+        // First read after construction must land on entry 5 (seq=0 post-snapshot pollable),
+        // NEVER on entry 3 (the pre-snapshot pollable at seq=7, which — if the fresh
+        // this-session counter reassigned seq=0 to some new pollable — must not be
+        // reachable/confusable with it).
+        let (index, entry) = state.get_oplog_entry().await.unwrap();
+        assert_eq!(
+            index,
+            OplogIndex::from_u64(5),
+            "replay after snapshot-based restore must resume at last_snapshot_index + 1, \
+             skipping entries 1..=4 entirely"
+        );
+        assert!(
+            matches!(
+                entry,
+                OplogEntry::HostCall {
+                    durable_function_type: DurableFunctionType::ReadLocalPollable(0),
+                    ..
+                }
+            ),
+            "the post-snapshot entry (seq=0, freshly assigned this session) must be the one \
+             read — the pre-snapshot entry (seq=7) must never be visited, proving a \
+             first-seen-this-session counter cannot collide with pre-snapshot assignments"
+        );
+    }
+
+    /// Mirrors `wildcard_matching_would_reproduce_bug2_pollable_theft`, but exercises the
+    /// ACTUAL fixed predicate shape used in `poll.rs::ready()` post-fix: match on
+    /// `ReadLocalPollable(seq)` with `seq` equality, where `seq` is a call-order-derived
+    /// logical id (as `PrivateDurableWorkerState::pollable_seq` assigns), NOT the raw
+    /// wasmtime rep. Confirms this correctly avoids Bug #2: P_timer's replay call (seq=0,
+    /// assigned first — mirroring live's assignment order) must NOT consume P_stream's
+    /// entry (seq=1), and P_stream's own later call (seq=1) must consume it correctly.
+    #[test]
+    async fn seq_based_matching_resolves_bug2_correctly() {
+        use golem_common::model::oplog::{
+            DurableFunctionType, HostRequest, HostRequestNoInput, HostResponse,
+            HostResponsePollReady, OplogPayload,
+        };
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+        const P_TIMER_SEQ: u32 = 0; // first pollable observed (live and replay alike)
+        const P_STREAM_SEQ: u32 = 1; // second pollable observed
+
+        // Only P_stream's `true` was recorded (seq=1) — P_timer's `false` (seq=0) was skipped.
+        let io_poll_ready_for_p_stream = OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::IoPollReady,
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
+                HostRequestNoInput {},
+            ))),
+            response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
+                HostResponsePollReady { result: Ok(true) },
+            ))),
+            durable_function_type: DurableFunctionType::ReadLocalPollable(P_STREAM_SEQ),
+        };
+        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
+            (
+                OplogIndex::INITIAL,
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                },
+            ),
+            (OplogIndex::INITIAL.next(), io_poll_ready_for_p_stream),
+        ])));
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            oplog,
+            DeletedRegions::new(),
+        )
+        .await
+        .unwrap();
+
+        // P_timer.ready() replays first (seq=0) — the exact predicate shape from poll.rs.
+        let timer_matched = state
+            .try_get_oplog_entry(|entry| match entry {
+                OplogEntry::HostCall {
+                    function_name: HostFunctionName::IoPollReady,
+                    durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
+                    ..
+                } => *seq == P_TIMER_SEQ,
+                _ => false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            timer_matched.is_none(),
+            "seq-based matching must NOT let P_timer (seq=0) steal P_stream's entry (seq=1)"
+        );
+
+        // P_stream.ready() (seq=1) must now correctly consume its own entry.
+        let stream_matched = state
+            .try_get_oplog_entry(|entry| match entry {
+                OplogEntry::HostCall {
+                    function_name: HostFunctionName::IoPollReady,
+                    durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
+                    ..
+                } => *seq == P_STREAM_SEQ,
+                _ => false,
+            })
+            .await
+            .unwrap();
+        assert!(
+            stream_matched.is_some(),
+            "P_stream (seq=1) must correctly consume its own entry once P_timer's (non-matching) \
+             peek has rewound the buffer"
+        );
+    }
+
+    /// N=4 concurrent-pollable scenario matching the production `scene_plates` trap (4
+    /// concurrently-dispatched `wf_krea2_base_realism` renders, each with its own
+    /// createPromise()/awaitPromise()-style poll loop). Only pollables 1 and 3 ever return
+    /// `true` (recorded); pollables 0 and 2 return `false` repeatedly (never recorded) before
+    /// eventually also returning `true`. Verifies seq-based matching resolves every `ready()`
+    /// call to the correct pollable regardless of how many times each is polled first.
+    #[test]
+    async fn seq_based_matching_resolves_four_way_concurrent_pollables() {
+        use golem_common::model::oplog::{
+            DurableFunctionType, HostRequest, HostRequestNoInput, HostResponse,
+            HostResponsePollReady, OplogPayload,
+        };
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+
+        fn ready_entry(seq: u32) -> OplogEntry {
+            OplogEntry::HostCall {
+                timestamp: Timestamp::now_utc(),
+                function_name: HostFunctionName::IoPollReady,
+                request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
+                    HostRequestNoInput {},
+                ))),
+                response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
+                    HostResponsePollReady { result: Ok(true) },
+                ))),
+                durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
+            }
+        }
+
+        // Recording order as it happened live: pollable 1 becomes ready first, then pollable 3.
+        // Pollables 0 and 2 never recorded anything (always false so far).
+        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
+            (
+                OplogIndex::INITIAL,
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                },
+            ),
+            (OplogIndex::INITIAL.next(), ready_entry(1)),
+            (OplogIndex::from_u64(3), ready_entry(3)),
+        ])));
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            oplog,
+            DeletedRegions::new(),
+        )
+        .await
+        .unwrap();
+
+        let matches_seq = |seq: u32| {
+            move |entry: &OplogEntry| match entry {
+                OplogEntry::HostCall {
+                    function_name: HostFunctionName::IoPollReady,
+                    durable_function_type: DurableFunctionType::ReadLocalPollable(s),
+                    ..
+                } => *s == seq,
+                _ => false,
+            }
+        };
+
+        // Replay polls all 4 pollables in round-robin order (0,1,2,3), same as live.
+        assert!(
+            state
+                .try_get_oplog_entry(matches_seq(0))
+                .await
+                .unwrap()
+                .is_none(),
+            "pollable 0 (not yet ready) must not steal pollable 1's entry"
+        );
+        assert!(
+            state
+                .try_get_oplog_entry(matches_seq(1))
+                .await
+                .unwrap()
+                .is_some(),
+            "pollable 1 must consume its own entry"
+        );
+        assert!(
+            state
+                .try_get_oplog_entry(matches_seq(2))
+                .await
+                .unwrap()
+                .is_none(),
+            "pollable 2 (not yet ready) must not steal pollable 3's entry"
+        );
+        assert!(
+            state
+                .try_get_oplog_entry(matches_seq(3))
+                .await
+                .unwrap()
+                .is_some(),
+            "pollable 3 must consume its own entry, now that it's the immediate-next one"
+        );
+    }
+
+    /// Mixed ready()/poll() scenario: an `IoPollReady` entry for one pollable must never be
+    /// wrongly consumed by a `poll()` call expecting `IoPollPoll` (and vice versa), even when
+    /// they're adjacent in the oplog — the type check alone (not just the seq check) must gate
+    /// this, matching poll.rs's post-fix behavior where poll()'s replay path no longer has any
+    /// IoPollReady-consuming fallback.
+    #[test]
+    async fn mixed_ready_and_poll_entries_do_not_cross_match() {
+        use golem_common::model::oplog::{
+            DurableFunctionType, HostRequest, HostRequestNoInput, HostRequestPollCount,
+            HostResponse, HostResponsePollReady, HostResponsePollResult, OplogPayload,
+        };
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+        let io_poll_ready = OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::IoPollReady,
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
+                HostRequestNoInput {},
+            ))),
+            response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
+                HostResponsePollReady { result: Ok(true) },
+            ))),
+            durable_function_type: DurableFunctionType::ReadLocalPollable(0),
+        };
+        let io_poll_poll = OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::IoPollPoll,
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
+                HostRequestPollCount { count: 1 },
+            ))),
+            response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
+                HostResponsePollResult {
+                    result: Ok(vec![0]),
+                },
+            ))),
+            durable_function_type: DurableFunctionType::ReadLocal,
+        };
+        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
+            (
+                OplogIndex::INITIAL,
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                },
+            ),
+            (OplogIndex::INITIAL.next(), io_poll_ready),
+            (OplogIndex::from_u64(3), io_poll_poll),
+        ])));
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            oplog,
+            DeletedRegions::new(),
+        )
+        .await
+        .unwrap();
+
+        // poll()'s predicate (IoPollPoll-only) must not consume the IoPollReady entry in front.
+        let poll_matched = state
+            .try_get_oplog_entry(|e| {
+                matches!(
+                    e,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollPoll,
+                        ..
+                    }
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            poll_matched.is_none(),
+            "poll() must not consume an IoPollReady entry — no fallback exists for this any more"
+        );
+
+        // ready()'s predicate (seq=0) correctly consumes it instead.
+        let ready_matched = state
+            .try_get_oplog_entry(|e| match e {
+                OplogEntry::HostCall {
+                    function_name: HostFunctionName::IoPollReady,
+                    durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
+                    ..
+                } => *seq == 0,
+                _ => false,
+            })
+            .await
+            .unwrap();
+        assert!(ready_matched.is_some());
+
+        // Now poll() correctly finds its own entry, next in line.
+        let poll_matched2 = state
+            .try_get_oplog_entry(|e| {
+                matches!(
+                    e,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollPoll,
+                        ..
+                    }
+                )
+            })
+            .await
+            .unwrap();
+        assert!(poll_matched2.is_some());
     }
 }

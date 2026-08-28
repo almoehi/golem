@@ -4,6 +4,7 @@ use golem_rust::{
     create_promise, PromiseId, Schema, Uuid,
 };
 use golem_rust::agentic::Schema as SchemaOps;
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Schema)]
@@ -316,7 +317,14 @@ impl RpcGlobalState for RpcGlobalStateImpl {
     }
 }
 
-#[agent_definition]
+// snapshotting = "enabled" + #[derive(Serialize, Deserialize)] on RpcCallerImpl below gives
+// this agent the default JSON snapshot mechanism (see JsonSnapshotCounter in
+// test-components/agent-counters/src/snapshot_test.rs for the same pattern) — needed so
+// SnapshotPolicy::{Periodic,EveryNInvocation} actually produces real Snapshot oplog entries for
+// tests exercising snapshot-then-resume (round twelve/thirteen's pollable_seq recovery
+// regression test; without this attribute periodic/every-N snapshotting silently never fires
+// for this agent at all).
+#[agent_definition(snapshotting = "enabled")]
 pub trait RpcCaller {
     fn new(name: String) -> Self;
 
@@ -383,6 +391,7 @@ pub trait RpcCaller {
     fn atomic_double_ready_rpc_call_then_promise_init(&mut self, counter_name: String) -> PromiseId;
 }
 
+#[derive(Serialize, Deserialize)]
 struct RpcCallerImpl {
     name: String,
     counter_name: Option<String>,

@@ -1,10 +1,14 @@
 # The `io::poll::poll` / `io::poll::pollable::ready` replay trap — full investigation summary
 
-**Status as of this writing: unresolved, root cause not yet found. Live reproduction is reliable
-and instrumented; the exact divergence point is pinned down to one host-call pair, but not why it
-diverges.** This document consolidates everything known across the whole investigation — read
-this first if picking the work up cold. Where useful it links out to the per-round detail files,
-but repeats the load-bearing facts so this document is self-sufficient.
+**Status: RESOLVED.** Root cause confirmed (Eighth capture) and fix implemented, empirically
+falsified (reverting the fix reproduces the exact production trap synthetically for the first time
+in this investigation; restoring it passes), and regression-tested. Full root-cause writeup and fix
+detail is in `ROUND_TWELVE_THIRTEEN_FIX.md` — this document is left as-is below (the narrative up to
+and including the open findings that led to the Eighth capture) as the historical record of how the
+investigation got there; read `ROUND_TWELVE_THIRTEEN_FIX.md` first for the resolution itself. This
+document consolidates everything known through Round Eleven — read it for the chronology and the
+falsified hypotheses if picking the work up cold, then read the fix doc for what actually happened
+next.
 
 ## The symptom
 

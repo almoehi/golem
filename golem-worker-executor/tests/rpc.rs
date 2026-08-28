@@ -15,14 +15,16 @@
 use crate::Tracing;
 use golem_common::base_model::agent::{ComponentModelElementValue, ElementValue};
 use golem_common::model::agent::{DataValue, ElementValues};
-use golem_common::model::oplog::OplogIndex;
+use golem_common::model::oplog::{OplogIndex, PublicOplogEntry};
 use golem_common::model::{AgentStatus, PromiseId};
 use golem_common::{agent_id, data_value};
 use golem_test_framework::dsl::TestDsl;
 use golem_wasm::analysis::analysed_type;
 use golem_wasm::{FromValue, IntoValue, IntoValueAndType, UuidRecord, Value, ValueAndType};
+use golem_worker_executor::services::golem_config::SnapshotPolicy;
 use golem_worker_executor_test_utils::{
     LastUniqueId, PrecompiledComponent, TestContext, WorkerExecutorTestDependencies, start,
+    start_with_snapshot_policy,
 };
 use pretty_assertions::assert_eq;
 use std::time::Duration;
@@ -1523,6 +1525,120 @@ async fn atomic_double_ready_rpc_call_survives_cold_replay_after_suspend(
         "worker must survive the cold replay of the atomic RPC region + suspend and resolve the \
          promise correctly — a mismatch or a trap during replay of the preceding double-ready() \
          atomic RPC call means the io::poll::poll/pollable::ready replay divergence reproduced"
+    );
+
+    Ok(())
+}
+
+/// Regression test for the root cause identified in the Eighth capture
+/// (`INVESTIGATION_SUMMARY.md`): `pollable_seq`'s `next_pollable_seq` counter must be recovered
+/// from the durable oplog on snapshot-based resume, not reset to 0 (fixed in
+/// `PrivateDurableWorkerState::new()`/`recover_next_pollable_seq()`,
+/// `golem-worker-executor/src/durable_host/mod.rs`).
+///
+/// Unlike every prior round's reproduction attempts (all of which used `drop(executor);
+/// start()` with NO periodic snapshotting — replay therefore always started from oplog genesis,
+/// where a fresh 0 counter happens to be correct, which is exactly why none of them reproduced
+/// the trap), this test enables real periodic snapshotting so a snapshot genuinely lands BETWEEN
+/// two atomic-region RPC calls: round 1 (before any snapshot) consumes at least one
+/// `pollable_seq` value; a periodic snapshot then fires while the worker is idle; round 2 (after
+/// the snapshot) consumes another, persisting a `ReadLocalPollable(N)` entry with N > 0 baked in
+/// from the live session's uninterrupted count. A cold restart then forces resume from that
+/// snapshot (not genesis) — the exact shape the fix targets.
+#[test]
+#[tracing::instrument]
+async fn atomic_rpc_call_across_periodic_snapshot_survives_cold_replay(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("agent_rpc_rust")] agent_rpc_rust: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start_with_snapshot_policy(
+        deps,
+        &context,
+        SnapshotPolicy::EveryNInvocation { count: 2 },
+    )
+    .await?;
+
+    let component = executor
+        .component_dep(&context.default_environment_id, agent_rpc_rust)
+        .store()
+        .await?;
+    let agent_id = agent_id!("RpcCaller", "round13-snapshot-then-resume");
+    let worker_id = executor.start_agent(&component.id, agent_id.clone()).await?;
+
+    // Round 1, before any snapshot: several separate invocations (EveryNInvocation{count: 2} is
+    // deterministic — no wall-clock timing dependency like SnapshotPolicy::Periodic — so a
+    // snapshot is guaranteed after the 2nd). Each also consumes a pollable_seq value, matching
+    // production's accumulated-seq-before-the-crash-region shape. Each completes cleanly (no
+    // promise await needed for this test — the bug is about REPLAYING a past completed round's
+    // ReadLocalPollable entry, not about suspension).
+    for _ in 0..3 {
+        executor
+            .invoke_and_await_agent(
+                &component,
+                &agent_id,
+                "sequential_atomic_rpc_calls_then_promise_init",
+                data_value!(1u32),
+            )
+            .await?;
+    }
+
+    let oplog_before_restart = executor.get_oplog(&worker_id, OplogIndex::INITIAL).await?;
+    let snapshot_count = oplog_before_restart
+        .iter()
+        .filter(|entry| matches!(&entry.entry, PublicOplogEntry::Snapshot(_)))
+        .count();
+    assert!(
+        snapshot_count >= 1,
+        "test setup invalid: expected at least one periodic snapshot before round 2, found {snapshot_count}"
+    );
+
+    // Round 2, after the snapshot: consumes another pollable_seq value, persisted as
+    // ReadLocalPollable(N) with N baked in from the live session's uninterrupted count (i.e.
+    // N > 0, since round 1 already consumed at least one value) — recorded AFTER the snapshot,
+    // so it is exactly the entry a naive reset-to-0 replay counter fails to match.
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_calls_then_promise_init",
+            data_value!(1u32),
+        )
+        .await?;
+
+    // Cold restart: forces resume from the snapshot recorded above (not from genesis) on the
+    // next invocation — replaying round 2's atomic region is exactly where the bug traps.
+    drop(executor);
+    let executor = start_with_snapshot_policy(
+        deps,
+        &context,
+        SnapshotPolicy::EveryNInvocation { count: 2 },
+    )
+    .await?;
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    // Round 3: forces replay of the full snapshot-to-tail history (rounds 1 and 2) to
+    // reconstruct state, then does one more atomic RPC call live — if replay traps, this
+    // invocation fails or times out instead of completing normally.
+    let promise_id_value = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_calls_then_promise_init",
+            data_value!(1u32),
+        )
+        .await?
+        .into_return_value();
+
+    assert!(
+        promise_id_value.is_some(),
+        "worker must survive replaying its snapshot-to-tail history (including the \
+         post-snapshot atomic RPC region) after a cold restart and complete a further \
+         invocation normally — a trap here means the pollable_seq counter recovery fix \
+         (recover_next_pollable_seq) did not resolve the Eighth capture's root cause"
     );
 
     Ok(())

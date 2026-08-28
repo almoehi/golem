@@ -103,6 +103,7 @@ use golem_common::model::oplog::{
     AgentError, AgentResourceId, DurableFunctionType, HostRequestHttpRequest, LogLevel, OplogEntry,
     OplogIndex, PersistenceLevel, RawSnapshotData, TimestampedUpdateDescription, UpdateDescription,
 };
+use golem_common::model::oplog::host_functions::HostFunctionName;
 use golem_common::model::regions::{DeletedRegions, DeletedRegionsBuilder, OplogRegion};
 use golem_common::model::retry_policy::NamedRetryPolicy;
 use golem_common::model::worker::TypedAgentConfigEntry;
@@ -4094,16 +4095,35 @@ struct PrivateDurableWorkerState {
     /// numbering is an implementation detail that can differ between live and replay even
     /// under fully deterministic guest code (see GOLEM_IO_POLL_BUG.md "Third Bug"); the
     /// first-seen-this-session ordinal is stable because it derives purely from the guest's
-    /// own deterministic call order, and it never needs to survive a snapshot-based restore
-    /// (see `snapshot_recovery_skip_region_is_never_replayed` in replay_state.rs) because no
-    /// pollable's poll loop can be in flight when a snapshot is taken — `on_external_invocation_completed`/
-    /// the `Periodic` snapshot check in `invocation_loop.rs` only ever fire between fully
-    /// completed external invocations, with an empty WASM call stack. Cleared on `drop()` so a
-    /// reused rep (wasmtime resource-table slot reuse) gets a fresh sequence number rather than
-    /// wrongly inheriting the dropped pollable's identity.
+    /// own deterministic call order, and no pollable's poll loop can be in flight *at the
+    /// instant* a snapshot is taken — `on_external_invocation_completed`/the `Periodic` snapshot
+    /// check in `invocation_loop.rs` only ever fire between fully completed external
+    /// invocations, with an empty WASM call stack.
+    ///
+    /// That in-flight-identity safety does NOT mean the map or its counter can simply reset to
+    /// empty on every resume, though — see `next_pollable_seq`'s doc comment for the correctness
+    /// bug that assumption caused (`INVESTIGATION_SUMMARY.md`'s "Eighth capture") and the fix
+    /// (`PrivateDurableWorkerState::new()`/`recover_next_pollable_seq()`). This map itself
+    /// legitimately starts empty on every construction — it is a `rep`-keyed cache rebuilt
+    /// lazily as `ready()` observes each pollable again after resume, not something that needs
+    /// pre-seeding — only `next_pollable_seq`, the counter that generates NEW values into it,
+    /// needs to start from the correct baseline. Cleared per-entry on `drop()` so a reused rep
+    /// (wasmtime resource-table slot reuse) gets a fresh sequence number rather than wrongly
+    /// inheriting the dropped pollable's identity.
     pollable_seq: HashMap<u32, u32>,
-    /// Next value to assign in `pollable_seq`. Reset fresh (starts at 0) on every worker
-    /// resume, live or replay — see `pollable_seq`'s doc comment for why this is safe.
+    /// Next value to assign in `pollable_seq`. Semantically: "how many distinct pollables has
+    /// this WORKER (not this in-memory instance) observed via `ready()` since the very first
+    /// time it ever ran" — a value that must stay consistent with what's already been persisted,
+    /// not one scoped to the current process's lifetime. Reset to 0 is correct ONLY when
+    /// constructing an instance that will replay from oplog genesis (nothing could have been
+    /// observed yet). When constructing an instance that instead resumes from a snapshot
+    /// (`last_snapshot_index: Some(_)`), 0 is very often wrong — the worker's live, uninterrupted
+    /// session prior to that snapshot could have observed any number of pollables, and each one
+    /// is baked into a persisted `ReadLocalPollable(N)` entry after the snapshot that replay must
+    /// still match by exact value. `new()` calls `recover_next_pollable_seq()` to derive the
+    /// correct baseline for that case by scanning the durably-persisted oplog rather than
+    /// resetting to 0 unconditionally — see that function's doc comment for the full mechanism
+    /// and its own scan-cost tradeoff.
     next_pollable_seq: u32,
 
     // ResourceIds of all DynPollables that are backed by GetPromiseResultEntries
@@ -4201,6 +4221,19 @@ impl PrivateDurableWorkerState {
         } else {
             deleted_regions
         };
+        // See the `pollable_seq`/`next_pollable_seq` field doc comments for the full rationale.
+        // `next_pollable_seq` counts distinct pollables observed since this in-memory instance
+        // was constructed — correct only if reset to 0 exactly when the "true" live counter was
+        // also 0, which holds for a worker's very first load but NOT for a snapshot-based resume:
+        // periodic snapshotting can fire after the counter has already climbed, and resuming from
+        // that snapshot skips replaying everything before it (the entire point of snapshotting),
+        // so a naive reset-to-0 silently diverges from the value already baked into every
+        // `ReadLocalPollable(N)` entry persisted after the snapshot. Recover the correct starting
+        // value by scanning for the highest such `N` at or before the snapshot boundary.
+        let next_pollable_seq = match last_snapshot_index {
+            Some(snapshot_idx) => Self::recover_next_pollable_seq(&oplog, snapshot_idx).await,
+            None => 0,
+        };
         let replay_state =
             ReplayState::new(owned_agent_id.clone(), oplog.clone(), deleted_regions).await?;
         let invocation_context = InvocationContext::new(None);
@@ -4261,7 +4294,7 @@ impl PrivateDurableWorkerState {
             runtime_retry_policy_mutations: std::collections::BTreeMap::new(),
             rpc_pollable_to_parent: HashMap::new(),
             pollable_seq: HashMap::new(),
-            next_pollable_seq: 0,
+            next_pollable_seq,
             shard_service,
             promise_backed_pollables: TRwLock::new(HashMap::new()),
             promise_dyn_pollables: TRwLock::new(HashMap::new()),
@@ -4274,13 +4307,58 @@ impl PrivateDurableWorkerState {
         })
     }
 
+    /// Recovers the correct starting value for `next_pollable_seq` when constructing an instance
+    /// that will resume from `snapshot_idx` rather than from oplog genesis (see the call site in
+    /// `new()` and the `pollable_seq`/`next_pollable_seq` field doc comments for the full
+    /// rationale). Scans the oplog from genesis through `snapshot_idx` inclusive — the exact
+    /// range that snapshot-based resume otherwise never re-reads — for `io::poll::pollable::ready`
+    /// `HostCall` entries tagged `ReadLocalPollable(N)`, and returns one past the highest `N`
+    /// found (or `0` if none — a worker whose history before the snapshot never recorded a
+    /// tagged pollable genuinely does start fresh).
+    ///
+    /// Deliberately does NOT scan only since the second-most-recent snapshot and add to a cached
+    /// prior count: no such checkpoint is persisted anywhere (that omission is the root cause
+    /// this recovers from), so reconstructing the true value requires the full range regardless
+    /// of how many snapshot generations lie within it. This is a bounded, one-time cost paid only
+    /// when a worker actually resumes from a snapshot (not on every invocation), using the same
+    /// chunked-read pattern `ReplayState`'s own oplog scans use elsewhere in this file; a worker
+    /// so long-lived and snapshot-heavy that this scan becomes a practical bottleneck would need
+    /// an engine-level fix that persists the counter as part of the snapshot itself (see
+    /// `INVESTIGATION_SUMMARY.md`'s "Eighth capture" fix direction (a)) rather than deriving it.
+    async fn recover_next_pollable_seq(oplog: &Arc<dyn Oplog>, snapshot_idx: OplogIndex) -> u32 {
+        const CHUNK_SIZE: u64 = 1024;
+        let mut max_seq: Option<u32> = None;
+        let mut idx = OplogIndex::INITIAL;
+        while idx.as_u64() <= snapshot_idx.as_u64() {
+            let remaining = snapshot_idx.as_u64() - idx.as_u64() + 1;
+            let n = remaining.min(CHUNK_SIZE);
+            let entries = oplog.read_many(idx, n).await;
+            if entries.is_empty() {
+                break;
+            }
+            for entry in entries.values() {
+                if let OplogEntry::HostCall {
+                    function_name: HostFunctionName::IoPollReady,
+                    durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
+                    ..
+                } = entry
+                {
+                    max_seq = Some(max_seq.map_or(*seq, |m| m.max(*seq)));
+                }
+            }
+            idx = idx.range_end(n).next();
+        }
+        max_seq.map_or(0, |m| m + 1)
+    }
+
     /// Returns the logical sequence number for `rep`, assigning a fresh one (via
     /// `next_pollable_seq`) the first time this rep is observed by `ready()`/`poll()` in the
     /// current process lifetime — live or replay alike. Deterministic guest execution means
-    /// the Nth distinct pollable observed is the same logical pollable on both live and
-    /// replay, regardless of what wasmtime resource-table rep either side happens to assign
-    /// it. See `pollable_seq`'s field doc comment for why this doesn't need to survive a
-    /// snapshot-based restore.
+    /// the Nth distinct pollable observed since the WORKER's genesis is the same logical
+    /// pollable on both live and replay, regardless of what wasmtime resource-table rep either
+    /// side happens to assign it — but only because `next_pollable_seq` is seeded correctly at
+    /// construction time (via `recover_next_pollable_seq()` when resuming from a snapshot); see
+    /// `next_pollable_seq`'s field doc comment for why a naive per-instance reset to 0 is wrong.
     pub fn pollable_seq(&mut self, rep: u32) -> u32 {
         let is_new = !self.pollable_seq.contains_key(&rep);
         let seq = *self.pollable_seq.entry(rep).or_insert_with(|| {

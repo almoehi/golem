@@ -154,6 +154,18 @@ pub trait CustomDurability {
     /// (safe across a worker restart between calls — already-resolved slots are skipped) until
     /// no "-" remain.
     fn concurrent_promise_test(&self) -> String;
+
+    /// Reproduces the literal "Bug 2" scenario from GOLEM_IO_POLL_BUG.md: a near-infinite
+    /// monotonic-clock timer pollable racing a real wasi:http response-body pollable in the
+    /// SAME batched poll() call, matching production's `monotonic_clock::subscribe_duration`
+    /// (~317-year duration) + HTTP stream pollable pattern seen right before the
+    /// character_sheet trap. No persist-nothing wrapping. Starts the HTTP request and the
+    /// timer subscription; does NOT read the body yet.
+    fn timer_race_http_init(&mut self);
+    /// One round: poll() over [timer_pollable, http_pollable] together. If the HTTP one is
+    /// ready, reads and returns the body. Otherwise returns "-" (timer must never legitimately
+    /// win — duration is ~317 years). Safe to call repeatedly across a worker restart.
+    fn timer_race_http_test(&self) -> String;
 }
 
 const CONCURRENT_POLLABLE_COUNT: usize = 4;
@@ -174,6 +186,12 @@ pub struct CustomDurabilityImpl {
     concurrent_lazy_pollables: Vec<LazyInitializedPollable>,
     concurrent_pollables: Vec<Pollable>,
     concurrent_results: RefCell<Vec<Option<String>>>,
+
+    timer_pollable: Option<Pollable>,
+    timer_http_response: RefCell<Option<golem_wasi_http::Response>>,
+    timer_http_input_stream: RefCell<Option<InputStream>>,
+    timer_http_body: RefCell<Option<IncomingBody>>,
+    timer_http_pollable: RefCell<Option<Pollable>>,
 }
 
 #[agent_implementation]
@@ -191,6 +209,12 @@ impl CustomDurability for CustomDurabilityImpl {
             concurrent_lazy_pollables: Vec::new(),
             concurrent_pollables: Vec::new(),
             concurrent_results: RefCell::new(vec![None; CONCURRENT_POLLABLE_COUNT]),
+
+            timer_pollable: None,
+            timer_http_response: RefCell::new(None),
+            timer_http_input_stream: RefCell::new(None),
+            timer_http_body: RefCell::new(None),
+            timer_http_pollable: RefCell::new(None),
         }
     }
 
@@ -346,6 +370,81 @@ impl CustomDurability for CustomDurabilityImpl {
             .map(|r| r.clone().unwrap_or_else(|| "-".to_string()))
             .collect::<Vec<_>>()
             .join("|")
+    }
+
+    fn timer_race_http_init(&mut self) {
+        // ~317-year duration, matching the production monotonic_clock::subscribe_duration
+        // pattern seen immediately before the character_sheet trap (an effectively-infinite
+        // timeout pollable created alongside a real HTTP fetch's response-stream pollable).
+        const NEAR_INFINITE_NANOS: u64 = 10_000_000_000_000_000_000;
+        let timer_pollable = golem_rust::wasip2::clocks::monotonic_clock::subscribe_duration(
+            NEAR_INFINITE_NANOS,
+        );
+        self.timer_pollable = Some(unsafe { std::mem::transmute(timer_pollable) });
+
+        let port = std::env::var("PORT").unwrap_or("9999".to_string());
+        let client = Client::new();
+        let mut response = client
+            .request(Method::GET, format!("http://localhost:{port}/fetch?idx=0"))
+            .send()
+            .expect("Request failed");
+        let (input_stream, body) = response.get_raw_input_stream();
+        let http_pollable = input_stream.subscribe();
+        self.timer_http_pollable
+            .replace(Some(unsafe { std::mem::transmute(http_pollable) }));
+        self.timer_http_response.replace(Some(response));
+        self.timer_http_body.replace(Some(body));
+        self.timer_http_input_stream.replace(Some(input_stream));
+    }
+
+    fn timer_race_http_test(&self) -> String {
+        let already_done = {
+            let stream = self.timer_http_input_stream.borrow();
+            stream.is_none()
+        };
+        if already_done {
+            return "already-consumed".to_string();
+        }
+
+        let timer = self
+            .timer_pollable
+            .as_ref()
+            .expect("timer_race_http_init must be called first");
+        let ready_positions = {
+            let http_pollable_ref = self.timer_http_pollable.borrow();
+            let http = http_pollable_ref
+                .as_ref()
+                .expect("timer_race_http_init must be called first");
+            // Batched poll() over BOTH pollables together — the literal Bug 2 shape: a real
+            // I/O pollable racing a near-infinite timer pollable in the same poll() call.
+            golem_rust::wasip2::io::poll::poll(&[timer, http])
+        };
+
+        if ready_positions.contains(&0) && !ready_positions.contains(&1) {
+            panic!(
+                "BUG: the ~317-year timer pollable (index 0) reported ready before the HTTP pollable (index 1) — either a real clock bug or a replay misattribution"
+            );
+        }
+        if !ready_positions.contains(&1) {
+            return "-".to_string();
+        }
+
+        let buf = self
+            .timer_http_input_stream
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .read(4096)
+            .unwrap();
+        let result = String::from_utf8(buf).unwrap();
+        // Drop the child (subscribed pollable) BEFORE its parent (input stream) — dropping
+        // the parent while the child is still alive traps with "resource has children" (see
+        // the concurrent_promise_entries field's doc comment for the same caveat).
+        self.timer_http_pollable.replace(None);
+        self.timer_http_input_stream.replace(None);
+        self.timer_http_body.replace(None);
+        self.timer_http_response.replace(None);
+        result
     }
 }
 

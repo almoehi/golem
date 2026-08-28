@@ -471,6 +471,118 @@ async fn concurrent_pollables_survive_worker_replay(
     Ok(())
 }
 
+/// Reproduces the LITERAL "Bug 2" scenario from GOLEM_IO_POLL_BUG.md on a real wasmtime
+/// instance: a near-infinite `monotonic_clock::subscribe_duration` timer pollable racing a
+/// real `wasi:http` response-stream pollable in the SAME batched `poll()` call — the exact
+/// production pattern seen immediately before the character_sheet trap (`CALL
+/// monotonic_clock::subscribe_duration` with a ~317-year duration, immediately followed by
+/// `io::poll::poll`/`io::poll::pollable::ready` entries for an HTTP fetch). Neither
+/// `concurrent_pollables_survive_worker_replay` (promise-backed pollables only) nor
+/// `lazy_pollable` (single HTTP pollable, `PersistNothing`-wrapped, no timer) exercises this
+/// exact timer-vs-real-I/O race under the seq-based replay fix — this test closes that gap.
+#[test]
+#[tracing::instrument]
+async fn timer_races_real_http_and_survives_worker_replay(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("host_api_tests")] host_api_tests: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let host_http_port = listener.local_addr().unwrap().port();
+
+    #[derive(Deserialize)]
+    struct QueryParams {
+        idx: u32,
+    }
+
+    let http_server = tokio::spawn(
+        async move {
+            let route = Router::new().route(
+                "/fetch",
+                get(move |query: Query<QueryParams>| async move {
+                    let idx = query.idx;
+                    tracing::info!("timer-race fetch called with: {}", idx);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(axum::body::Body::from(Bytes::from(format!(
+                            "timer-race-body-{idx}"
+                        ))))
+                        .unwrap()
+                }),
+            );
+            axum::serve(listener, route).await.unwrap();
+        }
+        .in_current_span(),
+    );
+
+    let component = executor
+        .component_dep(&context.default_environment_id, host_api_tests)
+        .store()
+        .await?;
+    let agent_id = agent_id!("CustomDurability", "timer-race-http-1");
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), host_http_port.to_string());
+
+    let worker_id = executor
+        .start_agent_with(&component.id, agent_id.clone(), env, Vec::new())
+        .await?;
+
+    // Starts the real HTTP fetch AND subscribes the near-infinite timer pollable — both live
+    // at once, matching the exact production entry sequence
+    // (subscribe_duration → io::poll::poll → io::poll::pollable::ready).
+    executor
+        .invoke_and_await_agent(&component, &agent_id, "timer_race_http_init", data_value!())
+        .await?;
+
+    // One round: poll() over [timer_pollable, http_pollable] together. The server responds
+    // immediately (no artificial gating needed — unlike `lazy_pollable`, this test's focus is
+    // the timer/HTTP pollable-identity race itself, not controlling exact I/O timing), so this
+    // resolves the HTTP side in this same invocation — timer_race_http_test's internal panic!
+    // would already catch a timer-wins misattribution even within one live round.
+    let round1 = executor
+        .invoke_and_await_agent(&component, &agent_id, "timer_race_http_test", data_value!())
+        .await?;
+    assert_eq!(
+        round1.into_return_value(),
+        Some(Value::String("timer-race-body-0".to_string())),
+        "First round must resolve to the real HTTP body, not the timer pollable"
+    );
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    // Force a genuine worker eviction + full oplog replay on a fresh executor/instance —
+    // reconstructing the timer subscription, the HTTP fetch dispatch, and the poll() round
+    // that resolved it, exercising the exact seq-matching path for a REAL timer-vs-I/O race
+    // (not just the promise-backed pollables `concurrent_pollables_survive_worker_replay`
+    // covers).
+    drop(executor);
+    let executor = start(deps, &context).await?;
+
+    // Replay must reconstruct round 1 (timer created + resolved-by-HTTP poll()) without
+    // trapping and without the timer pollable stealing the HTTP entry — then this call
+    // observes the already-cleared state.
+    let round2 = executor
+        .invoke_and_await_agent(&component, &agent_id, "timer_race_http_test", data_value!())
+        .await?;
+    assert_eq!(
+        round2.into_return_value(),
+        Some(Value::String("already-consumed".to_string())),
+        "Replay must reconstruct round 1's resolution correctly — a wrong value here means \
+         the timer pollable's (never-firing) state was misattributed during replay"
+    );
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    drop(executor);
+    http_server.abort();
+
+    Ok(())
+}
+
 const SNAPSHOT_TEST_INVOCATIONS: usize = 10;
 
 #[test]

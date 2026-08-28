@@ -29,7 +29,7 @@ use golem_common::model::oplog::{
     HostResponsePollResult, OplogEntry,
 };
 use golem_service_base::error::worker_executor::{InterruptKind, WorkerExecutorError};
-use tracing::debug;
+use tracing::{debug, trace};
 use wasmtime::component::Resource;
 use wasmtime_wasi::IoView as _;
 use wasmtime_wasi::p2::bindings::io::poll::{Host, HostPollable, Pollable};
@@ -52,6 +52,12 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
                     .await
                     .map_err(|err| err.to_string())
             };
+            trace!(
+                rep = pollable_rep,
+                seq = pollable_seq,
+                result = ?result,
+                "POLLREADY_TRACE ready() LIVE"
+            );
             // ready=false is "not yet, retry" — it carries no replay-essential information
             // and accounts for ~75% of oplog entries per fetch(). Skip recording it.
             // Replay synthesizes false for any gap in IoPollReady entries (see else branch).
@@ -96,7 +102,13 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
                 })
                 .await?;
             match peeked {
-                Some((_, OplogEntry::HostCall { response, .. })) => {
+                Some((idx, OplogEntry::HostCall { response, .. })) => {
+                    trace!(
+                        rep = pollable_rep,
+                        seq = pollable_seq,
+                        matched_oplog_index = %idx,
+                        "POLLREADY_TRACE ready() REPLAY matched entry"
+                    );
                     let host_response = self
                         .public_state
                         .worker()
@@ -116,7 +128,14 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
                 // is needed here any more (see the corresponding removal in poll()'s replay path,
                 // with a regression test covering the original "rpc pollable infinite replay loop
                 // after snapshot restore" scenario this fallback used to guard against).
-                _ => Ok(false),
+                _ => {
+                    trace!(
+                        rep = pollable_rep,
+                        seq = pollable_seq,
+                        "POLLREADY_TRACE ready() REPLAY no match, synthesizing false"
+                    );
+                    Ok(false)
+                }
             }
         }
     }
@@ -178,6 +197,11 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
 
 impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
     async fn poll(&mut self, in_: Vec<Resource<Pollable>>) -> wasmtime::Result<Vec<u32>> {
+        trace!(
+            is_live = self.durable_execution_state().is_live,
+            reps = ?in_.iter().map(|r| r.rep()).collect::<Vec<_>>(),
+            "POLLCALL_TRACE poll() enter"
+        );
         // check if all pollables are promise backed. In this case we can suspend immediately
         // This check only needs to be done in live mode, as we will never even persist the oplog entry for polling
         // if we suspended in the last pass. Doing it this way also prevents us from initializing the promises until we are actually in live mode.
@@ -200,6 +224,10 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
 
             if all_blocked {
                 debug!("Suspending worker until a promise gets completed");
+                trace!(
+                    reps = ?in_.iter().map(|r| r.rep()).collect::<Vec<_>>(),
+                    "POLLCALL_TRACE poll() LIVE early-suspend (no IoPollPoll entry persisted)"
+                );
                 return Err(wasmtime::Error::from_anyhow(
                     InterruptKind::Suspend(Timestamp::now_utc()).into(),
                 ));
@@ -208,6 +236,10 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
 
         let durability =
             Durability::<IoPollPoll>::new(self, DurableFunctionType::ReadLocal).await?;
+        trace!(
+            durability_is_live = durability.is_live(),
+            "POLLCALL_TRACE poll() Durability<IoPollPoll> constructed"
+        );
 
         let result: Result<HostResponsePollResult, Duration> = if durability.is_live() {
             let interrupt_signal = self

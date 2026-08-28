@@ -2614,8 +2614,17 @@ impl<Ctx: WorkerCtx> InvocationHooks for DurableWorkerCtx<Ctx> {
 
     async fn get_current_retry_point(&self) -> OplogIndex {
         if let Some(region) = self.state.active_atomic_regions.last() {
+            debug!(
+                begin_index = %region.begin_index,
+                active_regions = self.state.active_atomic_regions.len(),
+                "RETRY_TRACE get_current_retry_point: innermost active atomic region"
+            );
             region.begin_index
         } else {
+            debug!(
+                current_retry_point = %self.state.current_retry_point,
+                "RETRY_TRACE get_current_retry_point: no active atomic regions"
+            );
             self.state.current_retry_point
         }
     }
@@ -4271,18 +4280,22 @@ impl PrivateDurableWorkerState {
     /// it. See `pollable_seq`'s field doc comment for why this doesn't need to survive a
     /// snapshot-based restore.
     pub fn pollable_seq(&mut self, rep: u32) -> u32 {
-        *self.pollable_seq.entry(rep).or_insert_with(|| {
+        let is_new = !self.pollable_seq.contains_key(&rep);
+        let seq = *self.pollable_seq.entry(rep).or_insert_with(|| {
             let seq = self.next_pollable_seq;
             self.next_pollable_seq += 1;
             seq
-        })
+        });
+        debug!(rep, seq, is_new, "POLLSEQ_TRACE pollable_seq resolved");
+        seq
     }
 
     /// Clears a pollable's sequence-number assignment when it is dropped, so a wasmtime
     /// resource-table rep that gets reused for an unrelated pollable is assigned a fresh
     /// sequence number rather than wrongly inheriting the dropped pollable's identity.
     pub fn clear_pollable_seq(&mut self, rep: u32) {
-        self.pollable_seq.remove(&rep);
+        let removed_seq = self.pollable_seq.remove(&rep);
+        debug!(rep, ?removed_seq, "POLLSEQ_TRACE clear_pollable_seq");
     }
 
     /// Returns the agent-config-derived retry policies (cached, cheap).

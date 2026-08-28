@@ -66,11 +66,14 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
             }
             // Record with the pollable's logical seq so replay can match this entry to the
             // correct pollable (ReadLocalPollable instead of plain ReadLocal).
-            let durability = Durability::<IoPollReady>::new(
-                self,
-                DurableFunctionType::ReadLocalPollable(pollable_seq),
-            )
-            .await?;
+            let durable_function_type = DurableFunctionType::ReadLocalPollable(pollable_seq);
+            trace!(
+                rep = pollable_rep,
+                seq = pollable_seq,
+                durable_function_type = ?durable_function_type,
+                "POLLREADY_TRACE ready() LIVE about to persist with this exact tag"
+            );
+            let durability = Durability::<IoPollReady>::new(self, durable_function_type).await?;
             let r = durability
                 .persist(self, HostRequestNoInput {}, HostResponsePollReady { result })
                 .await?;

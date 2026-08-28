@@ -471,6 +471,393 @@ async fn concurrent_pollables_survive_worker_replay(
     Ok(())
 }
 
+/// Adversarial-completion-order variant of `concurrent_pollables_survive_worker_replay`,
+/// motivated by direct production oplog tracing of the `scene_plates` trap: the recorded
+/// live sequence shows `io::poll::poll {count: 4} -> ok([3])` — the LAST-dispatched (index 3)
+/// pollable becomes ready FIRST, while indices 0-2 are still pending in the same batch — the
+/// opposite of the existing test's completion order (0, 2 before eviction; 1, 3 after), which
+/// always resolves from the front and never exercises a late index resolving while earlier
+/// ones remain live. Also mirrors the trace's later re-polls of the shrinking remaining set
+/// (`{count: 3} -> ok([0])`, `{count: 2} -> ok([1])`, `{count: 2} -> ok([0])`), i.e. resolution
+/// order genuinely uncorrelated with dispatch order across multiple shrinking batches.
+#[test]
+#[tracing::instrument]
+async fn concurrent_pollables_adversarial_completion_order_survives_replay(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("host_api_tests")] host_api_tests: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let component = executor
+        .component_dep(&context.default_environment_id, host_api_tests)
+        .store()
+        .await?;
+    let agent_id = agent_id!("CustomDurability", "concurrent-pollables-adversarial-1");
+
+    let worker_id = executor
+        .start_agent(&component.id, agent_id.clone())
+        .await?;
+
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "concurrent_promise_init",
+            data_value!(),
+        )
+        .await?;
+
+    // Adversarial: complete index 3 (last-dispatched) FIRST, then index 1 — leaving 0 and 2
+    // (including the FIRST-dispatched pollable) still pending in the same live batch.
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "concurrent_promise_complete",
+            data_value!(3u32),
+        )
+        .await?;
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "concurrent_promise_complete",
+            data_value!(1u32),
+        )
+        .await?;
+
+    let mut round1_parts: Vec<String> = vec!["-".to_string(); 4];
+    for _ in 0..4 {
+        if round1_parts[3] != "-" && round1_parts[1] != "-" {
+            break;
+        }
+        let round = executor
+            .invoke_and_await_agent(
+                &component,
+                &agent_id,
+                "concurrent_promise_test",
+                data_value!(),
+            )
+            .await?;
+        let round_str = match round.into_return_value() {
+            Some(Value::String(s)) => s,
+            other => panic!("Expected string from concurrent_promise_test, got {:?}", other),
+        };
+        round1_parts = round_str.split('|').map(|s| s.to_string()).collect();
+        assert_eq!(round1_parts.len(), 4);
+    }
+    for idx in [3usize, 1] {
+        assert_eq!(
+            round1_parts[idx],
+            format!("promise-{idx}"),
+            "Resolved slot {idx} must contain its OWN promise's payload, not another \
+             pollable's — cross-pollable theft would show a mismatched idx here \
+             (full state: {round1_parts:?})"
+        );
+    }
+    for idx in [0usize, 2] {
+        assert_eq!(
+            round1_parts[idx], "-",
+            "Slot {idx} (still pending, including the FIRST-dispatched pollable) must remain \
+             unresolved while a LATER-dispatched pollable already resolved \
+             (full state: {round1_parts:?})"
+        );
+    }
+
+    // Force a genuine worker eviction + full oplog replay mid-adversarial-sequence — the
+    // in-flight batch at this point has the LAST-dispatched pollable already resolved while
+    // the FIRST-dispatched one is still pending, the exact inversion the production trace
+    // shows and the scenario the existing (front-to-back) test never exercises.
+    drop(executor);
+    let executor = start(deps, &context).await?;
+
+    // Complete the remaining two, again out of dispatch order (2 before 0).
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "concurrent_promise_complete",
+            data_value!(2u32),
+        )
+        .await?;
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "concurrent_promise_complete",
+            data_value!(0u32),
+        )
+        .await?;
+
+    let mut round2_parts: Vec<String> = vec!["-".to_string(); 4];
+    for _ in 0..4 {
+        if round2_parts.iter().all(|p| p != "-") {
+            break;
+        }
+        let round = executor
+            .invoke_and_await_agent(
+                &component,
+                &agent_id,
+                "concurrent_promise_test",
+                data_value!(),
+            )
+            .await?;
+        let round_str = match round.into_return_value() {
+            Some(Value::String(s)) => s,
+            other => panic!("Expected string from concurrent_promise_test, got {:?}", other),
+        };
+        round2_parts = round_str.split('|').map(|s| s.to_string()).collect();
+        assert_eq!(round2_parts.len(), 4);
+    }
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    // All 4 must now be resolved, each correctly attributed to its own idx, regardless of the
+    // fully-adversarial (3, 1, [evict], 2, 0) completion order.
+    for (idx, part) in round2_parts.iter().enumerate() {
+        assert_eq!(
+            *part,
+            format!("promise-{idx}"),
+            "Slot {idx} must resolve to its own promise's payload after replay + completion — \
+             a mismatch here means a different pollable's entry was wrongly consumed \
+             under an adversarial (non-dispatch-order) completion pattern (Bug #2/#3 class)"
+        );
+    }
+
+    Ok(())
+}
+
+/// Reproduces the LITERAL "Bug 2" scenario from GOLEM_IO_POLL_BUG.md on a real wasmtime
+/// instance: a near-infinite `monotonic_clock::subscribe_duration` timer pollable racing a
+/// real `wasi:http` response-stream pollable in the SAME batched `poll()` call — the exact
+/// production pattern seen immediately before the character_sheet trap (`CALL
+/// monotonic_clock::subscribe_duration` with a ~317-year duration, immediately followed by
+/// `io::poll::poll`/`io::poll::pollable::ready` entries for an HTTP fetch). Neither
+/// `concurrent_pollables_survive_worker_replay` (promise-backed pollables only) nor
+/// `lazy_pollable` (single HTTP pollable, `PersistNothing`-wrapped, no timer) exercises this
+/// exact timer-vs-real-I/O race under the seq-based replay fix — this test closes that gap.
+#[test]
+#[tracing::instrument]
+async fn timer_races_real_http_and_survives_worker_replay(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("host_api_tests")] host_api_tests: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let host_http_port = listener.local_addr().unwrap().port();
+
+    #[derive(Deserialize)]
+    struct QueryParams {
+        idx: u32,
+    }
+
+    let http_server = tokio::spawn(
+        async move {
+            let route = Router::new().route(
+                "/fetch",
+                get(move |query: Query<QueryParams>| async move {
+                    let idx = query.idx;
+                    tracing::info!("timer-race fetch called with: {}", idx);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(axum::body::Body::from(Bytes::from(format!(
+                            "timer-race-body-{idx}"
+                        ))))
+                        .unwrap()
+                }),
+            );
+            axum::serve(listener, route).await.unwrap();
+        }
+        .in_current_span(),
+    );
+
+    let component = executor
+        .component_dep(&context.default_environment_id, host_api_tests)
+        .store()
+        .await?;
+    let agent_id = agent_id!("CustomDurability", "timer-race-http-1");
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), host_http_port.to_string());
+
+    let worker_id = executor
+        .start_agent_with(&component.id, agent_id.clone(), env, Vec::new())
+        .await?;
+
+    // Starts the real HTTP fetch AND subscribes the near-infinite timer pollable — both live
+    // at once, matching the exact production entry sequence
+    // (subscribe_duration → io::poll::poll → io::poll::pollable::ready).
+    executor
+        .invoke_and_await_agent(&component, &agent_id, "timer_race_http_init", data_value!())
+        .await?;
+
+    // One round: poll() over [timer_pollable, http_pollable] together. The server responds
+    // immediately (no artificial gating needed — unlike `lazy_pollable`, this test's focus is
+    // the timer/HTTP pollable-identity race itself, not controlling exact I/O timing), so this
+    // resolves the HTTP side in this same invocation — timer_race_http_test's internal panic!
+    // would already catch a timer-wins misattribution even within one live round.
+    let round1 = executor
+        .invoke_and_await_agent(&component, &agent_id, "timer_race_http_test", data_value!())
+        .await?;
+    assert_eq!(
+        round1.into_return_value(),
+        Some(Value::String("timer-race-body-0".to_string())),
+        "First round must resolve to the real HTTP body, not the timer pollable"
+    );
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    // Force a genuine worker eviction + full oplog replay on a fresh executor/instance —
+    // reconstructing the timer subscription, the HTTP fetch dispatch, and the poll() round
+    // that resolved it, exercising the exact seq-matching path for a REAL timer-vs-I/O race
+    // (not just the promise-backed pollables `concurrent_pollables_survive_worker_replay`
+    // covers).
+    drop(executor);
+    let executor = start(deps, &context).await?;
+
+    // Replay must reconstruct round 1 (timer created + resolved-by-HTTP poll()) without
+    // trapping and without the timer pollable stealing the HTTP entry — then this call
+    // observes the already-cleared state.
+    let round2 = executor
+        .invoke_and_await_agent(&component, &agent_id, "timer_race_http_test", data_value!())
+        .await?;
+    assert_eq!(
+        round2.into_return_value(),
+        Some(Value::String("already-consumed".to_string())),
+        "Replay must reconstruct round 1's resolution correctly — a wrong value here means \
+         the timer pollable's (never-firing) state was misattributed during replay"
+    );
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    drop(executor);
+    http_server.abort();
+
+    Ok(())
+}
+
+/// Rep-reuse regression test for the seq-based pollable-identity fix. Runs MANY sequential,
+/// self-contained timer-vs-HTTP race cycles (`timer_race_multi_step`, each creating AND
+/// dropping its own timer + HTTP pollables within one call) — matching production's dozen+
+/// sequential LLM fetch() calls inside one long, un-decomposed invocation, not just one
+/// isolated race. Forces eviction+replay partway through the sequence (after cycle 4 of 8),
+/// so replay must reconstruct 4 already-completed create/drop cycles — during which wasmtime's
+/// resource-table free list is very likely to have reused reps across cycles — plus the
+/// remaining 4 cycles as fresh live calls on the resumed worker. If a reused rep could ever
+/// corrupt `pollable_seq`'s first-seen assignment (the hypothesis this test exists to falsify),
+/// this would manifest as `timer_race_multi_step`'s internal panic! (a later cycle's real HTTP
+/// pollable losing its race to a stale/misattributed timer identity) on some cycle after the
+/// eviction point.
+#[test]
+#[tracing::instrument]
+async fn timer_race_rep_reuse_across_many_sequential_cycles(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("host_api_tests")] host_api_tests: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    const TOTAL_CYCLES: u32 = 8;
+    const EVICT_AFTER_CYCLE: u32 = 4;
+
+    let context = TestContext::new(last_unique_id);
+    let mut executor = start(deps, &context).await?;
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let host_http_port = listener.local_addr().unwrap().port();
+
+    #[derive(Deserialize)]
+    struct QueryParams {
+        idx: u32,
+    }
+
+    let http_server = tokio::spawn(
+        async move {
+            let route = Router::new().route(
+                "/fetch",
+                get(move |query: Query<QueryParams>| async move {
+                    let idx = query.idx;
+                    tracing::info!("rep-reuse fetch called with: {}", idx);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(axum::body::Body::from(Bytes::from(format!(
+                            "rep-reuse-body-{idx}"
+                        ))))
+                        .unwrap()
+                }),
+            );
+            axum::serve(listener, route).await.unwrap();
+        }
+        .in_current_span(),
+    );
+
+    let component = executor
+        .component_dep(&context.default_environment_id, host_api_tests)
+        .store()
+        .await?;
+    let agent_id = agent_id!("CustomDurability", "timer-race-rep-reuse-1");
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), host_http_port.to_string());
+
+    let worker_id = executor
+        .start_agent_with(&component.id, agent_id.clone(), env, Vec::new())
+        .await?;
+
+    for idx in 0..EVICT_AFTER_CYCLE {
+        let result = executor
+            .invoke_and_await_agent(
+                &component,
+                &agent_id,
+                "timer_race_multi_step",
+                data_value!(idx),
+            )
+            .await?;
+        assert_eq!(
+            result.into_return_value(),
+            Some(Value::String(format!("rep-reuse-body-{idx}"))),
+            "Cycle {idx} (pre-eviction) must resolve to its own real HTTP body"
+        );
+    }
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    // Force eviction partway through the sequence: replay must reconstruct 4 completed
+    // create/drop cycles' worth of timer+HTTP pollable history — the window where a reused
+    // rep, if mishandled, would corrupt a later cycle's identity.
+    drop(executor);
+    executor = start(deps, &context).await?;
+
+    for idx in EVICT_AFTER_CYCLE..TOTAL_CYCLES {
+        let result = executor
+            .invoke_and_await_agent(
+                &component,
+                &agent_id,
+                "timer_race_multi_step",
+                data_value!(idx),
+            )
+            .await?;
+        assert_eq!(
+            result.into_return_value(),
+            Some(Value::String(format!("rep-reuse-body-{idx}"))),
+            "Cycle {idx} (post-eviction, replay-reconstructed history behind it) must resolve \
+             to its own real HTTP body — a wrong value or panic here means a reused wasmtime \
+             rep corrupted pollable_seq's identity tracking across cycles."
+        );
+    }
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    drop(executor);
+    http_server.abort();
+
+    Ok(())
+}
+
 const SNAPSHOT_TEST_INVOCATIONS: usize = 10;
 
 #[test]

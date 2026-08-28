@@ -40,6 +40,10 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
 
         // Capture rep before self_ is consumed by HostPollable::ready / try_get_oplog_entry.
         let pollable_rep = self_.rep();
+        // Logical, call-order-derived identity for this pollable — stable across live/replay
+        // and across a snapshot-based restore, unlike the raw wasmtime rep (see
+        // `pollable_seq`'s doc comment on PrivateDurableWorkerState for the full rationale).
+        let pollable_seq = self.state.pollable_seq(pollable_rep);
 
         if self.durable_execution_state().is_live {
             let result = {
@@ -54,30 +58,35 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
             if result == Ok(false) {
                 return Ok(false);
             }
-            // Record with the pollable's resource rep so replay can match this entry
-            // to the correct pollable (ReadLocalPollable instead of plain ReadLocal).
-            let durability =
-                Durability::<IoPollReady>::new(self, DurableFunctionType::ReadLocalPollable(pollable_rep)).await?;
+            // Record with the pollable's logical seq so replay can match this entry to the
+            // correct pollable (ReadLocalPollable instead of plain ReadLocal).
+            let durability = Durability::<IoPollReady>::new(
+                self,
+                DurableFunctionType::ReadLocalPollable(pollable_seq),
+            )
+            .await?;
             let r = durability
                 .persist(self, HostRequestNoInput {}, HostResponsePollReady { result })
                 .await?;
             r.result.map_err(wasmtime::Error::msg)
         } else {
             // Replay: consume the next IoPollReady entry only if it was recorded for THIS
-            // specific pollable (matched by resource rep). This prevents a timer pollable from
-            // stealing an IoPollReady=true entry that was recorded for an output-stream pollable,
-            // which would cause the WASM to think the timer fired, drop the FutureIncomingResponse
-            // early, and crash with "expected EndRemoteWrite, got CheckWrite".
-            // Legacy ReadLocal entries (no rep tracking) are consumed by any pollable.
+            // specific pollable (matched by logical seq — see pollable_seq's doc comment).
+            // This prevents a timer pollable from stealing an IoPollReady=true entry that was
+            // recorded for an output-stream pollable, which would cause the WASM to think the
+            // timer fired, drop the FutureIncomingResponse early, and crash with "expected
+            // EndRemoteWrite, got CheckWrite".
+            // Legacy ReadLocal entries (pre-dating per-pollable tagging) are consumed by any
+            // pollable, matching the original (pre-Bug-2-fix) behavior for old oplogs.
             let peeked = self
                 .state
                 .replay_state
                 .try_get_oplog_entry(|entry| match entry {
                     OplogEntry::HostCall {
                         function_name: HostFunctionName::IoPollReady,
-                        durable_function_type: DurableFunctionType::ReadLocalPollable(rep),
+                        durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
                         ..
-                    } => *rep == pollable_rep,
+                    } => *seq == pollable_seq,
                     OplogEntry::HostCall {
                         function_name: HostFunctionName::IoPollReady,
                         durable_function_type: DurableFunctionType::ReadLocal,
@@ -100,41 +109,14 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
                         .map_err(|e: String| wasmtime::Error::msg(e))?;
                     payload.result.map_err(wasmtime::Error::msg)
                 }
-                _ => {
-                    // Rep-mismatch recovery for WasmRpc futures: after snapshot restore all
-                    // pollable reps change, so IoPollReady entries can't match by rep. The
-                    // poll()-level fix (Case 1 in poll.rs) consumes IoPollReady entries on
-                    // behalf of poll(), leaving GolemRpcFutureInvokeResultGet as the next
-                    // oplog entry. At that point the WASM's `while (!ready()) { poll() }` loop
-                    // must terminate, but ready() would keep synthesizing false — creating an
-                    // infinite loop — unless we detect this sentinel here.
-                    //
-                    // Safety: guarded to WasmRpc pollables only (tracked in rpc_pollable_to_parent).
-                    // This prevents non-RPC pollables (timers, HTTP streams) from incorrectly
-                    // claiming readiness when an RPC result entry happens to be next in the oplog.
-                    let is_rpc_pollable =
-                        self.state.rpc_pollable_to_parent.contains_key(&pollable_rep);
-                    if is_rpc_pollable {
-                        // Peek without consuming: get() still needs to read this entry.
-                        let rpc_future_done = self
-                            .state
-                            .replay_state
-                            .peek_next_oplog_entry(|entry| {
-                                matches!(
-                                    entry,
-                                    OplogEntry::HostCall {
-                                        function_name:
-                                            HostFunctionName::GolemRpcFutureInvokeResultGet,
-                                        ..
-                                    }
-                                )
-                            })
-                            .await?;
-                        Ok(rpc_future_done)
-                    } else {
-                        Ok(false)
-                    }
-                }
+                // No entry matched this pollable's seq — it genuinely hasn't become ready yet.
+                // Unlike the old rep-based scheme, this can no longer be a false negative caused
+                // by rep drift across a restore (seq is call-order-derived, not resource-table-
+                // derived — see pollable_seq's doc comment), so no RPC-specific recovery fallback
+                // is needed here any more (see the corresponding removal in poll()'s replay path,
+                // with a regression test covering the original "rpc pollable infinite replay loop
+                // after snapshot restore" scenario this fallback used to guard against).
+                _ => Ok(false),
             }
         }
     }
@@ -150,6 +132,11 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
     fn drop(&mut self, rep: Resource<Pollable>) -> wasmtime::Result<()> {
         self.observe_function_call("io::poll:pollable", "drop");
         let child_rep = rep.rep();
+
+        // A dropped rep can be reused by wasmtime's resource table for an unrelated future
+        // pollable — clear its seq assignment so that pollable gets a fresh one instead of
+        // wrongly inheriting this one's identity (see pollable_seq's doc comment).
+        self.state.clear_pollable_seq(child_rep);
 
         // Check if this pollable is a child of a FutureInvokeResult
         let parent_rep = self.state.rpc_pollable_to_parent.get(&child_rep).copied();
@@ -306,36 +293,18 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                     .await?),
             }
         } else {
-            // After snapshot restore, pollable resource reps change (ResourceTable is rebuilt).
-            // ready() fails to match IoPollReady(old_rep) by rep, synthesizes false, and WASM
-            // falls through to poll(). Recover: if the next oplog entry is IoPollReady (not
-            // IoPollPoll), consume it here and return [0] — only ready=true is ever recorded,
-            // so the first-pollable-ready result is always correct in this path.
-            let rep_mismatch_entry = self
-                .state
-                .replay_state
-                .try_get_oplog_entry(|entry| {
-                    matches!(
-                        entry,
-                        OplogEntry::HostCall {
-                            function_name: HostFunctionName::IoPollReady,
-                            ..
-                        }
-                    )
-                })
-                .await?;
-            if rep_mismatch_entry.is_some() {
-                DurabilityHost::end_durable_function(
-                    self,
-                    &DurableFunctionType::ReadLocal,
-                    durability.begin_index(),
-                    false,
-                )
-                .await?;
-                Ok(HostResponsePollResult { result: Ok(vec![0]) })
-            } else {
-                Ok(durability.replay(self).await?)
-            }
+            // Previously this branch contained a recovery path for "ready() fails to match
+            // IoPollReady(old_rep) by rep after snapshot restore, leaving an orphaned entry for
+            // poll() to clean up". That recovery is no longer needed: ready() now tags entries
+            // with a call-order-derived logical seq (see pollable_seq's doc comment on
+            // PrivateDurableWorkerState) instead of the raw wasmtime resource-table rep, and a
+            // pollable can never have a poll loop in flight across a snapshot-based restore in
+            // the first place (snapshots only ever fire between fully completed external
+            // invocations — see `on_external_invocation_completed`/the `Periodic` check above in
+            // `invocation_loop.rs`). So ready() no longer produces spurious mismatches for a
+            // pollable that legitimately owns an upcoming entry, and poll() can rely on the
+            // normal replay path unconditionally.
+            Ok(durability.replay(self).await?)
         };
 
         match result {

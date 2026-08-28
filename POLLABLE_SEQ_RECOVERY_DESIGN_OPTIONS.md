@@ -1,14 +1,17 @@
 # Design exploration: alternatives to the O(N) `next_pollable_seq` recovery scan
 
-**Status: design review, nothing implemented.** The user raised a real concern about
-`recover_next_pollable_seq()`'s O(N) oplog scan (committed in `c21259436`, see
-`ROUND_TWELVE_THIRTEEN_FIX.md`) — it re-reads the entire oplog from genesis through the snapshot
-index on every snapshot-based resume, which reintroduces exactly the cost snapshotting exists to
-avoid, for long-lived, snapshot-heavy workers. This document explores alternatives from first
+**Status: Option 2 IMPLEMENTED, approved and committed.** The user raised a real concern about
+`recover_next_pollable_seq()`'s original O(N) oplog scan (committed in `c21259436`, see
+`ROUND_TWELVE_THIRTEEN_FIX.md`) — it re-read the entire oplog from genesis through the snapshot
+index on every snapshot-based resume, which reintroduced exactly the cost snapshotting exists to
+avoid, for long-lived, snapshot-heavy workers. This document explored alternatives from first
 principles, given the explicit relaxed constraint that **backward compatibility with
 already-persisted state is not required** — a genuine clean-slate redesign, not just a patch on
-top of the existing scan. The scan stays in place as documented baseline; nothing here is
-implemented yet.
+top of the existing scan. Option 2 (embed the counter in the snapshot entry, O(1) read on resume)
+was approved and is now implemented, replacing the O(N) scan entirely (not left in place as a
+fallback — see "Implementation notes" at the end of this document for what actually shipped and
+where it differs from the original proposal below, which is otherwise left as written for the
+historical record of the design reasoning).
 
 ## Why the O(N) scan is a real concern, not a theoretical one
 
@@ -173,3 +176,53 @@ generations (verifying only the latest is ever consulted, matching
 scenario for the app-level payload).
 
 Not implementing any of this without your go-ahead, per the ask.
+
+## Implementation notes (Option 2, as actually shipped)
+
+Followed the suggested sequencing above almost exactly, with two differences worth recording:
+
+- **The O(N) scan was fully replaced, not kept as a fallback.** `recover_next_pollable_seq()` keeps
+  its name and signature (so the call site in `new()` didn't need to change at all) but its body is
+  now a single `oplog.read(snapshot_idx)` plus a match on `OplogEntry::Snapshot { next_pollable_seq,
+  .. }`, with a `warn!`-and-fall-back-to-`0` branch for the (should-be-unreachable) case where the
+  index doesn't actually name a `Snapshot` entry — mirroring `try_load_snapshot()`'s own existing
+  fallback behavior for the same situation, not a new failure mode.
+- **The change touched more files than the two originally called out** (`raw`/`public` DSL
+  declaration + write site + read site), because Rust's exhaustiveness checking surfaces every
+  place a struct-literal or non-`..` pattern match needs to account for a new field — which turned
+  out to include two additional conversion paths not mentioned in the original proposal:
+  - `golem-common/src/model/oplog/protobuf.rs` (2 sites: the gRPC `Entry::Snapshot` proto message
+    conversions, both directions) — confirmed these are for the external gRPC API surface, not
+    golem-worker-executor's own oplog storage read path (checked: none of
+    `services/oplog/{primary,multilayer,rate_limited,ephemeral,plugin}.rs`'s `Oplog`/
+    `OplogService` implementations are gRPC-client-backed), so a `next_pollable_seq: 0` default at
+    both conversion sites is inert for the actual fix, not a correctness gap — documented as such
+    inline.
+  - `golem-worker-executor/src/model/public_oplog/wit.rs` — the WIT-facing `raw-snapshot-parameters`
+    type is a separately-defined `.wit` interface, not auto-derived from the Rust DSL's `raw{}`
+    block, so it doesn't gain new fields automatically. Extending it would mean editing a `.wit`
+    file and regenerating cross-language bindings — a larger, cross-cutting change for a field
+    that's deliberately engine-internal-only. Same `0`-default treatment, same reasoning: this
+    conversion is for WIT/API interop, never on the engine's own snapshot-take/resume path.
+  - Also needed: a small `pub fn next_pollable_seq(&self) -> u32` read-only getter on
+    `DurableWorkerCtx` (`durable_host/mod.rs`, alongside the existing `created_by()`/
+    `parsed_agent_id()` getters) so `worker/invocation_loop.rs`'s snapshot-save flow — which lives
+    outside the `durable_host` module — can read the live counter value to embed at write time.
+  - Two test-only `OplogEntry::Snapshot` construction sites (`services/oplog/tests.rs`,
+    `worker/status.rs`'s mock-oplog test builder) needed a placeholder `0`, unrelated to
+    pollable-seq recovery in either test.
+
+**Falsification, both directions, both halves independently** (matching the same bar as the first
+fix): temporarily hardcoded the write site (`invocation_loop.rs`) to embed `0` regardless of the
+true counter value, and separately (restoring the write site first) hardcoded the read side
+(`recover_next_pollable_seq`) to return `0` unconditionally — both reproduce the exact production
+trap (`expected io::poll::poll, got io::poll::pollable::ready`) in
+`atomic_rpc_call_across_periodic_snapshot_survives_cold_replay`, confirming both halves are
+independently load-bearing, not just plausibly connected. Restoring both passes.
+
+**Regression sweep**: identical set to `ROUND_TWELVE_THIRTEEN_FIX.md`'s (459 `--lib` tests, all six
+original verification-round tests, existing snapshot-recovery tests including
+`periodic_snapshot_recovery_survives_a_second_snapshot_generation` — confirming multi-generation
+resumes still correctly consult only the latest snapshot under the new mechanism — every round 8-10
+synthetic test, RPC counter tests) — all pass, no regressions. `cargo build --release
+-p golem-worker-executor` clean.

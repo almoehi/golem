@@ -4,6 +4,16 @@ Continuation of `INVESTIGATION_SUMMARY.md`. This document records the confirmed 
 "Eighth capture" in `/Users/hannes/work/golem/oplog-backups/README.md`), the fix, its empirical
 falsification, and the regression sweep — the entries `INVESTIGATION_SUMMARY.md` predates.
 
+**Superseded mechanism, root cause and diagnosis still accurate.** The fix direction (b)/O(N) scan
+described below was the first implementation and is exactly what got falsified and regression-tested
+here. It was subsequently replaced by direction (a) (embedding the counter directly in the snapshot
+entry, O(1) read on resume) after a follow-up design review — see
+`POLLABLE_SEQ_RECOVERY_DESIGN_OPTIONS.md` for the full comparison and "Implementation notes" for
+what actually shipped. The root cause analysis, the falsification methodology, and the regression
+test (`atomic_rpc_call_across_periodic_snapshot_survives_cold_replay`) below are all still accurate
+and still the operative regression guard — only the *mechanism* `recover_next_pollable_seq()` uses
+internally changed, not what it's proven to fix.
+
 ## Root cause
 
 `pollable_seq`/`next_pollable_seq` (`PrivateDurableWorkerState`, `durable_host/mod.rs`) is a

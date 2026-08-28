@@ -53,6 +53,7 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
                     .map_err(|err| err.to_string())
             };
             trace!(
+                agent_id = %self.owned_agent_id,
                 rep = pollable_rep,
                 seq = pollable_seq,
                 result = ?result,
@@ -68,6 +69,7 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
             // correct pollable (ReadLocalPollable instead of plain ReadLocal).
             let durable_function_type = DurableFunctionType::ReadLocalPollable(pollable_seq);
             trace!(
+                agent_id = %self.owned_agent_id,
                 rep = pollable_rep,
                 seq = pollable_seq,
                 durable_function_type = ?durable_function_type,
@@ -107,6 +109,7 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
             match peeked {
                 Some((idx, OplogEntry::HostCall { response, .. })) => {
                     trace!(
+                        agent_id = %self.owned_agent_id,
                         rep = pollable_rep,
                         seq = pollable_seq,
                         matched_oplog_index = %idx,
@@ -133,6 +136,7 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
                 // after snapshot restore" scenario this fallback used to guard against).
                 _ => {
                     trace!(
+                        agent_id = %self.owned_agent_id,
                         rep = pollable_rep,
                         seq = pollable_seq,
                         "POLLREADY_TRACE ready() REPLAY no match, synthesizing false"
@@ -201,6 +205,7 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
 impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
     async fn poll(&mut self, in_: Vec<Resource<Pollable>>) -> wasmtime::Result<Vec<u32>> {
         trace!(
+            agent_id = %self.owned_agent_id,
             is_live = self.durable_execution_state().is_live,
             reps = ?in_.iter().map(|r| r.rep()).collect::<Vec<_>>(),
             "POLLCALL_TRACE poll() enter"
@@ -228,6 +233,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
             if all_blocked {
                 debug!("Suspending worker until a promise gets completed");
                 trace!(
+                    agent_id = %self.owned_agent_id,
                     reps = ?in_.iter().map(|r| r.rep()).collect::<Vec<_>>(),
                     "POLLCALL_TRACE poll() LIVE early-suspend (no IoPollPoll entry persisted)"
                 );
@@ -240,6 +246,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
         let durability =
             Durability::<IoPollPoll>::new(self, DurableFunctionType::ReadLocal).await?;
         trace!(
+            agent_id = %self.owned_agent_id,
             durability_is_live = durability.is_live(),
             "POLLCALL_TRACE poll() Durability<IoPollPoll> constructed"
         );

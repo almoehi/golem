@@ -331,6 +331,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
     async fn mark_begin_operation(&mut self) -> anyhow::Result<golem_api_1_x::host::OplogIndex> {
         self.observe_function_call("golem::api", "mark_begin_operation");
         debug!(
+            agent_id = %self.owned_agent_id,
             is_live = self.state.is_live(),
             active_regions_before = self.state.active_atomic_regions.len(),
             "ATOMIC_TRACE mark_begin_operation enter"
@@ -353,6 +354,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                 has_side_effects: false,
             });
             debug!(
+                agent_id = %self.owned_agent_id,
                 begin_index = %begin_index,
                 active_regions_after = self.state.active_atomic_regions.len(),
                 "ATOMIC_TRACE mark_begin_operation LIVE pushed region"
@@ -407,6 +409,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                 has_side_effects: false,
             });
             debug!(
+                agent_id = %self.owned_agent_id,
                 begin_index = %begin_index,
                 active_regions_after = self.state.active_atomic_regions.len(),
                 "ATOMIC_TRACE mark_begin_operation REPLAY pushed region"
@@ -422,6 +425,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
         self.observe_function_call("golem::api", "mark_end_operation");
         let is_live = self.state.is_live();
         debug!(
+            agent_id = %self.owned_agent_id,
             is_live,
             begin,
             active_regions_before = self.state.active_atomic_regions.len(),
@@ -442,6 +446,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
             .retain(|region| region.begin_index != OplogIndex::from_u64(begin));
         let after_len = self.state.active_atomic_regions.len();
         debug!(
+            agent_id = %self.owned_agent_id,
             begin,
             is_live,
             before_len,

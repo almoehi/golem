@@ -2615,6 +2615,7 @@ impl<Ctx: WorkerCtx> InvocationHooks for DurableWorkerCtx<Ctx> {
     async fn get_current_retry_point(&self) -> OplogIndex {
         if let Some(region) = self.state.active_atomic_regions.last() {
             debug!(
+                agent_id = %self.owned_agent_id,
                 begin_index = %region.begin_index,
                 active_regions = self.state.active_atomic_regions.len(),
                 "RETRY_TRACE get_current_retry_point: innermost active atomic region"
@@ -2622,6 +2623,7 @@ impl<Ctx: WorkerCtx> InvocationHooks for DurableWorkerCtx<Ctx> {
             region.begin_index
         } else {
             debug!(
+                agent_id = %self.owned_agent_id,
                 current_retry_point = %self.state.current_retry_point,
                 "RETRY_TRACE get_current_retry_point: no active atomic regions"
             );
@@ -4286,7 +4288,13 @@ impl PrivateDurableWorkerState {
             self.next_pollable_seq += 1;
             seq
         });
-        debug!(rep, seq, is_new, "POLLSEQ_TRACE pollable_seq resolved");
+        debug!(
+            agent_id = %self.owned_agent_id,
+            rep,
+            seq,
+            is_new,
+            "POLLSEQ_TRACE pollable_seq resolved"
+        );
         seq
     }
 
@@ -4295,7 +4303,12 @@ impl PrivateDurableWorkerState {
     /// sequence number rather than wrongly inheriting the dropped pollable's identity.
     pub fn clear_pollable_seq(&mut self, rep: u32) {
         let removed_seq = self.pollable_seq.remove(&rep);
-        debug!(rep, ?removed_seq, "POLLSEQ_TRACE clear_pollable_seq");
+        debug!(
+            agent_id = %self.owned_agent_id,
+            rep,
+            ?removed_seq,
+            "POLLSEQ_TRACE clear_pollable_seq"
+        );
     }
 
     /// Returns the agent-config-derived retry policies (cached, cheap).

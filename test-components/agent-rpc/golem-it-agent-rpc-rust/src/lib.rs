@@ -1,6 +1,6 @@
 use golem_rust::bindings::golem::agent::host::{Datetime, RpcError, WasmRpc};
 use golem_rust::{
-    agent_definition, agent_implementation, atomically_async, blocking_await_promise,
+    agent_definition, agent_implementation, atomically, atomically_async, blocking_await_promise,
     create_promise, PromiseId, Schema, Uuid,
 };
 use golem_rust::agentic::Schema as SchemaOps;
@@ -221,6 +221,13 @@ impl ScheduledInvocationClient for ScheduledInvocationClientImpl {
 pub trait RpcCounter {
     fn new(name: String) -> Self;
     fn inc_by(&mut self, value: u64);
+    /// Same as `inc_by`, but blocks ~150ms first (a real monotonic-clock timer pollable, not a
+    /// busy loop) before incrementing — deterministic replacement for "real network latency"
+    /// so a caller's optimistic first `ready()` check on this call's future reliably observes
+    /// `false`, matching production's real cross-agent RPC timing (round ten's
+    /// `atomic_double_ready_rpc_call_then_promise_init` needs this; plain `inc_by` completes
+    /// too fast locally for the caller's first ready() check to ever see anything but `true`).
+    fn inc_by_slow(&mut self, value: u64);
     fn get_value(&self) -> u64;
     fn get_args(&self) -> Vec<String>;
     fn get_env(&self) -> Vec<(String, String)>;
@@ -241,6 +248,12 @@ impl RpcCounter for RpcCounterImpl {
     }
 
     fn inc_by(&mut self, value: u64) {
+        self.value += value;
+    }
+
+    fn inc_by_slow(&mut self, value: u64) {
+        let timer = golem_rust::wasip2::clocks::monotonic_clock::subscribe_duration(150_000_000);
+        timer.block();
         self.value += value;
     }
 
@@ -356,6 +369,18 @@ pub trait RpcCaller {
         n: u32,
         promise_id: PromiseId,
     ) -> Vec<u8>;
+
+    /// Round-ten reproduction: ONE `atomically()`-wrapped RPC call, driven with the RAW
+    /// `WasmRpc`/`future-invoke-result` API (not the `agent_implementation`-generated
+    /// `RpcCounterClient` proxy `.inc_by(1).await` used by
+    /// `sequential_atomic_rpc_calls_then_promise_init`) so the polling shape is fully manual
+    /// and under test control: `future.subscribe().ready()` (optimistic non-blocking check,
+    /// expected `false`) → `poll()` (blocking wait) → a SECOND `.ready()` call to CONFIRM
+    /// before calling `future.get()` — matching the live-instrumented production trace's
+    /// actual shape (see `/Users/hannes/work/golem/oplog-backups/README.md` "Sixth capture"),
+    /// which round nine's generated-proxy-based RPC test did not exercise. Then
+    /// `create_promise()` (not awaited yet — reuses `sequential_atomic_rpc_await`).
+    fn atomic_double_ready_rpc_call_then_promise_init(&mut self, counter_name: String) -> PromiseId;
 }
 
 struct RpcCallerImpl {
@@ -496,6 +521,45 @@ impl RpcCaller for RpcCallerImpl {
         }
 
         blocking_await_promise(&promise_id)
+    }
+
+    fn atomic_double_ready_rpc_call_then_promise_init(&mut self, counter_name: String) -> PromiseId {
+        use golem_rust::agentic::Schema;
+
+        atomically(|| {
+            let constructor_data = counter_name
+                .clone()
+                .to_data_value()
+                .expect("Failed to encode constructor");
+            let wasm_rpc = WasmRpc::new("RpcCounter", &constructor_data, None, &[]);
+            let input = 1u64.to_data_value().expect("Failed to encode input");
+            // inc_by_slow (not inc_by): a real ~150ms monotonic-clock block on the callee side,
+            // so this call's future genuinely isn't ready on the first optimistic check —
+            // matching production's real cross-agent RPC latency (a local in-process inc_by
+            // completes too fast for the first ready() check to ever observe false).
+            let future = wasm_rpc.async_invoke_and_await("inc_by_slow", &input);
+            let pollable = future.subscribe();
+
+            // Same manual ready->poll->ready shape as atomic_double_ready_call_then_promise_init
+            // (custom_durability.rs, round ten), but on a REAL future-invoke-result pollable —
+            // the exact resource type the production trace's failing pollable is (`golem::rpc::
+            // future-invoke-result::get`), not an HTTP input-stream pollable.
+            let first_ready = pollable.ready();
+            if !first_ready {
+                let _ = golem_rust::wasip2::io::poll::poll(&[&pollable]);
+                let confirmed = pollable.ready();
+                assert!(
+                    confirmed,
+                    "future-invoke-result pollable must report ready immediately after poll() \
+                     unblocked"
+                );
+            }
+            let _ = future
+                .get()
+                .expect("future-invoke-result must have a result after ready()");
+        });
+
+        create_promise()
     }
 }
 

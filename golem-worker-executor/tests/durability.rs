@@ -471,6 +471,165 @@ async fn concurrent_pollables_survive_worker_replay(
     Ok(())
 }
 
+/// Adversarial-completion-order variant of `concurrent_pollables_survive_worker_replay`,
+/// motivated by direct production oplog tracing of the `scene_plates` trap: the recorded
+/// live sequence shows `io::poll::poll {count: 4} -> ok([3])` — the LAST-dispatched (index 3)
+/// pollable becomes ready FIRST, while indices 0-2 are still pending in the same batch — the
+/// opposite of the existing test's completion order (0, 2 before eviction; 1, 3 after), which
+/// always resolves from the front and never exercises a late index resolving while earlier
+/// ones remain live. Also mirrors the trace's later re-polls of the shrinking remaining set
+/// (`{count: 3} -> ok([0])`, `{count: 2} -> ok([1])`, `{count: 2} -> ok([0])`), i.e. resolution
+/// order genuinely uncorrelated with dispatch order across multiple shrinking batches.
+#[test]
+#[tracing::instrument]
+async fn concurrent_pollables_adversarial_completion_order_survives_replay(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("host_api_tests")] host_api_tests: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let component = executor
+        .component_dep(&context.default_environment_id, host_api_tests)
+        .store()
+        .await?;
+    let agent_id = agent_id!("CustomDurability", "concurrent-pollables-adversarial-1");
+
+    let worker_id = executor
+        .start_agent(&component.id, agent_id.clone())
+        .await?;
+
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "concurrent_promise_init",
+            data_value!(),
+        )
+        .await?;
+
+    // Adversarial: complete index 3 (last-dispatched) FIRST, then index 1 — leaving 0 and 2
+    // (including the FIRST-dispatched pollable) still pending in the same live batch.
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "concurrent_promise_complete",
+            data_value!(3u32),
+        )
+        .await?;
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "concurrent_promise_complete",
+            data_value!(1u32),
+        )
+        .await?;
+
+    let mut round1_parts: Vec<String> = vec!["-".to_string(); 4];
+    for _ in 0..4 {
+        if round1_parts[3] != "-" && round1_parts[1] != "-" {
+            break;
+        }
+        let round = executor
+            .invoke_and_await_agent(
+                &component,
+                &agent_id,
+                "concurrent_promise_test",
+                data_value!(),
+            )
+            .await?;
+        let round_str = match round.into_return_value() {
+            Some(Value::String(s)) => s,
+            other => panic!("Expected string from concurrent_promise_test, got {:?}", other),
+        };
+        round1_parts = round_str.split('|').map(|s| s.to_string()).collect();
+        assert_eq!(round1_parts.len(), 4);
+    }
+    for idx in [3usize, 1] {
+        assert_eq!(
+            round1_parts[idx],
+            format!("promise-{idx}"),
+            "Resolved slot {idx} must contain its OWN promise's payload, not another \
+             pollable's — cross-pollable theft would show a mismatched idx here \
+             (full state: {round1_parts:?})"
+        );
+    }
+    for idx in [0usize, 2] {
+        assert_eq!(
+            round1_parts[idx], "-",
+            "Slot {idx} (still pending, including the FIRST-dispatched pollable) must remain \
+             unresolved while a LATER-dispatched pollable already resolved \
+             (full state: {round1_parts:?})"
+        );
+    }
+
+    // Force a genuine worker eviction + full oplog replay mid-adversarial-sequence — the
+    // in-flight batch at this point has the LAST-dispatched pollable already resolved while
+    // the FIRST-dispatched one is still pending, the exact inversion the production trace
+    // shows and the scenario the existing (front-to-back) test never exercises.
+    drop(executor);
+    let executor = start(deps, &context).await?;
+
+    // Complete the remaining two, again out of dispatch order (2 before 0).
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "concurrent_promise_complete",
+            data_value!(2u32),
+        )
+        .await?;
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "concurrent_promise_complete",
+            data_value!(0u32),
+        )
+        .await?;
+
+    let mut round2_parts: Vec<String> = vec!["-".to_string(); 4];
+    for _ in 0..4 {
+        if round2_parts.iter().all(|p| p != "-") {
+            break;
+        }
+        let round = executor
+            .invoke_and_await_agent(
+                &component,
+                &agent_id,
+                "concurrent_promise_test",
+                data_value!(),
+            )
+            .await?;
+        let round_str = match round.into_return_value() {
+            Some(Value::String(s)) => s,
+            other => panic!("Expected string from concurrent_promise_test, got {:?}", other),
+        };
+        round2_parts = round_str.split('|').map(|s| s.to_string()).collect();
+        assert_eq!(round2_parts.len(), 4);
+    }
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    // All 4 must now be resolved, each correctly attributed to its own idx, regardless of the
+    // fully-adversarial (3, 1, [evict], 2, 0) completion order.
+    for (idx, part) in round2_parts.iter().enumerate() {
+        assert_eq!(
+            *part,
+            format!("promise-{idx}"),
+            "Slot {idx} must resolve to its own promise's payload after replay + completion — \
+             a mismatch here means a different pollable's entry was wrongly consumed \
+             under an adversarial (non-dispatch-order) completion pattern (Bug #2/#3 class)"
+        );
+    }
+
+    Ok(())
+}
+
 /// Reproduces the LITERAL "Bug 2" scenario from GOLEM_IO_POLL_BUG.md on a real wasmtime
 /// instance: a near-infinite `monotonic_clock::subscribe_duration` timer pollable racing a
 /// real `wasi:http` response-stream pollable in the SAME batched `poll()` call — the exact

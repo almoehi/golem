@@ -1,10 +1,11 @@
 # Finding B fix design (v2) — poll() replay must defer to N stray same-batch ready() entries
 
-Status: **DESIGN ONLY — not implemented.** v2 supersedes v1 (single-stray-entry design) per
-explicit direction: the fix must generalize to an arbitrary number of batched pollables, any
-number of which may have resolved out of the guest's structural check order — not be bounded to
-or validated only for 2-pollable batches. This revision also resolves/bounds the three open
-questions raised on v1.
+Status: **IMPLEMENTED, approved, and committed.** See "Implementation notes" at the end of this
+document for what actually shipped, exact diffs from this design, and the falsification/
+regression-sweep results. v2 superseded v1 (single-stray-entry design) per explicit direction:
+the fix must generalize to an arbitrary number of batched pollables, any number of which may have
+resolved out of the guest's structural check order — not be bounded to or validated only for
+2-pollable batches. v2 also resolved/bounded the three open questions raised on v1 — see §5.
 
 Seed: Tenth capture (`/Users/hannes/work/golem/oplog-backups/README.md`), live trap on `main`,
 `WorkerAgent(...,"1f93ff64-...@scene_backdrops")`, retry from oplog index 834, `reps: [20, 24]`.
@@ -396,3 +397,87 @@ this change into a correctness regression relative to today. Given that, and tha
 3 are now resolved with concrete, source-grounded reasoning, this feels ready to build — happy to
 take one more look at the code itself once written, given the standing bar of falsify
 bidirectionally + full regression sweep before calling it done.
+
+## 7. Implementation notes (post-approval)
+
+Approved and implemented essentially as designed in §3, with one refinement made during coding:
+
+- **`pollable_seq_if_assigned`** (`durable_host/mod.rs`, alongside `pollable_seq`/
+  `clear_pollable_seq`): implemented exactly as designed — a non-mutating `HashMap::get().copied()`.
+- **`pre_resolved_pollable_ready: HashMap<u32, bool>`** field on `PrivateDurableWorkerState`,
+  plus `record_pre_resolved_pollable_ready`/`take_pre_resolved_pollable_ready`: implemented
+  exactly as designed.
+- **`HostPollable::ready`'s replay branch** (`io/poll.rs`): one new check at the top —
+  `take_pre_resolved_pollable_ready(pollable_seq)` — exactly as designed.
+- **`Host::poll`'s replay branch**: refined from the design's inline loop into a standalone,
+  directly-unit-testable free function, `consume_stray_ready_entries(replay_state, oplog,
+  batch_seqs, record_stray)`, called from `Host::poll`. This is a pure refactor of the designed
+  logic (same predicate, same `try_get_oplog_entry`-only mechanism, same cache hand-off) — the
+  motivation was testability: extracting it let the regression tests exercise the exact
+  production algorithm directly against a crafted oplog (`MutableBatchOplog`, mirroring
+  `replay_state.rs`'s own test-double pattern) without needing a full `DurableWorkerCtx`/wasmtime
+  store. `Host::poll` now: builds `batch_seqs` from `in_`, calls the extracted function collecting
+  `(seq, ready)` pairs, traces + caches each one via `record_pre_resolved_pollable_ready`, then
+  falls through to the unchanged `durability.replay(self).await?` for whatever's left — matching
+  the design's control flow exactly, just with the scanning loop factored out.
+
+### Test plan — what was actually built (`io/poll.rs`'s own `#[cfg(test)] mod tests`, not
+`replay_state.rs` as §4a first assumed — the extracted function needed a `download_payload`-
+capable oplog double, which fits better colocated with `consume_stray_ready_entries` itself):
+
+1. `consumes_single_stray_matching_tenth_capture_shape` — the Tenth capture's exact
+   `[IoPollReady(seq=154)=true, IoPollPoll]` shape (154 = rep 24's seq); asserts the stray is
+   consumed+reported and poll()'s own entry survives untouched.
+2. `old_unconditional_consume_would_have_hit_the_production_mismatch` — the bidirectional
+   "before" half, run against the *same* crafted oplog: reproduces the OLD mechanism directly
+   (`ReplayState::get_oplog_entry()`, i.e. unconditional consumption — what
+   `Durability::replay_raw()` used) and asserts it genuinely finds `IoPollReady` where
+   `IoPollPoll` was expected — confirming this crafted scenario is a real reproduction of the
+   production trigger, not merely a shape that happens to exercise the new code path. (A literal
+   integration-level "revert the engine change, run a component, watch it crash" cycle is not
+   achievable for this bug — see §4a/§4b's reasoning, reconfirmed during implementation: hand-
+   authored deterministic Rust test-component code cannot produce a live/replay call-order
+   divergence, since both runs execute identical instructions given identical replayed answers;
+   only `wstd`'s `HashMap`-seeded reactor can, and its seed isn't test-controllable. This
+   same-oplog before/after pair is the most direct, honest reproduction achievable.)
+3. `consumes_multiple_strays_before_genuine_poll_entry` — N=2 strays (seq 154, then 161) in a
+   4-pollable batch, followed by poll()'s own entry — proves generalization past N=1.
+4. `consumes_multiple_strays_regardless_of_order` — same as #3 with the two strays swapped —
+   proves order-independence.
+5. `ignores_ready_entry_for_seq_outside_the_batch` — a `ready()` entry for a seq NOT in the
+   batch is left completely untouched — proves the fix's scope is exactly "same-batch strays,"
+   not "swallow anything unexpected."
+6. `no_op_when_next_entry_is_already_genuine_poll_entry` — the common happy path (no strays at
+   all) — the function does nothing, entry stays for the caller.
+
+All 6 pass. Falsification: test #2 stands as the permanent "before" proof (it doesn't depend on
+the fix existing or not — it directly demonstrates the OLD mechanism's mismatch on this exact
+byte pattern); tests #1/#3–6 are the "after" proofs, and were confirmed to fail appropriately
+during development before the implementation was complete (the very first version of test #1,
+run before `consume_stray_ready_entries` existed, was a compile error — the strongest possible
+"before" signal: the assertion is inexpressible without the fix).
+
+### Regression sweep results
+
+- Full `--lib` suite: **465 passed, 0 failed**.
+- `durable_host::` unit suite (includes the pre-existing `try_get_oplog_entry_*` tests,
+  unmodified): **64 passed, 0 failed**, both before and after this change (checked at each stage).
+- Full `rpc.rs` integration test file (all tests not requiring the TS `agent_rpc` component,
+  which is not built in this worktree — a pre-existing, unrelated environment gap present since
+  round 8): **24/24 passed** (rounds 8–15's 10 poll/ready-specific tests + 14 general RPC tests
+  — resource sharing, cancellation, ephemeral invocation, etc.).
+- Full `durability.rs` integration test file (same TS-component caveat): **16/16 passed**,
+  including `concurrent_pollables_adversarial_completion_order_survives_replay` — a pre-existing
+  test (not part of this investigation's own rounds) whose name suggested direct relevance;
+  confirmed still passing.
+- The Eighth capture's regression test, `atomic_rpc_call_across_periodic_snapshot_survives_cold_replay`:
+  **passed**.
+- One pre-existing, unrelated flake: `sequential_atomic_double_ready_rpc_calls_same_target_n4_survives_cold_replay`
+  fails when run alone with `Runtime error: WorkerActivator is disabled, not creating instance`
+  (a `LazyWorkerActivator` weak-reference race in the test harness, documented in
+  `ROUND_FIFTEEN_FINDINGS.md`'s "Aside") — reproduces identically with or without this round's
+  changes (re-confirmed); passes reliably when run alongside sibling tests. Not a regression.
+- `http.rs`, `wasi.rs`, and other test files requiring components not built in this worktree
+  (`golem_it_http_tests_release`, websocket/blobstore/rdbms components) were not run — this
+  worktree has never had those built, in any round of this investigation; only
+  `agent_rpc_rust`, `host_api_tests`, and `agent_counters` are available locally.

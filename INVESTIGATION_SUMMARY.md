@@ -1,14 +1,19 @@
 # The `io::poll::poll` / `io::poll::pollable::ready` replay trap — full investigation summary
 
-**Status: RESOLVED.** Root cause confirmed (Eighth capture) and fix implemented, empirically
-falsified (reverting the fix reproduces the exact production trap synthetically for the first time
-in this investigation; restoring it passes), and regression-tested. Full root-cause writeup and fix
-detail is in `ROUND_TWELVE_THIRTEEN_FIX.md` — this document is left as-is below (the narrative up to
-and including the open findings that led to the Eighth capture) as the historical record of how the
-investigation got there; read `ROUND_TWELVE_THIRTEEN_FIX.md` first for the resolution itself. This
-document consolidates everything known through Round Eleven — read it for the chronology and the
-falsified hypotheses if picking the work up cold, then read the fix doc for what actually happened
-next.
+**Status: RESOLVED (two structural fixes).** Root cause #1 (Eighth capture — `pollable_seq`
+counter scope mismatch across snapshot boundaries) confirmed and fixed; full detail in
+`ROUND_TWELVE_THIRTEEN_FIX.md`. Root cause #2 (Finding B below — a batched `poll()` call's replay
+crashing on a stray same-batch `ready()` entry recorded out of the guest's replayed structural
+check order) confirmed via the Tenth capture and fixed; full detail in
+`FINDING_B_FIX_DESIGN.md` (root cause, fix design, and implementation notes) and
+`ROUND_FIFTEEN_FINDINGS.md`/`ROUND_FOURTEEN_FINDINGS.md` (the synthetic-reproduction rounds that
+preceded it). Both fixes are empirically falsified (reverting each reproduces its exact trigger
+condition; restoring passes) and regression-tested. This document is left as-is below (the
+narrative up to and including the open findings that led to the Eighth capture, plus Finding B's
+own section further down) as the historical record of how the investigation got there; read the
+two fix docs above first for the resolutions themselves. This document consolidates everything
+known through Round Eleven — read it for the chronology and the falsified hypotheses if picking
+the work up cold, then read the fix docs for what actually happened next.
 
 ## The symptom
 

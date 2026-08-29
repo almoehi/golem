@@ -31,7 +31,7 @@ use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -261,7 +261,22 @@ impl ReplayState {
         let read_idx = self.last_replayed_index.get().next();
         let entry = self.internal_get_next_oplog_entry().await?;
 
-        if condition(&entry) {
+        // Generic peek trace: every try_get_oplog_entry caller (poll/RPC/HTTP/etc replay
+        // matching) goes through here, so this is the single point to see what entry was
+        // actually sitting at the replay cursor and whether the caller's predicate accepted
+        // it — without needing per-call-site tracing to reconstruct a mismatch. `entry`'s
+        // Debug impl is bounded (OplogPayload only prints bytes_len, not raw bytes; see
+        // payload::mod.rs), so this is safe to leave at trace level unconditionally.
+        let matched = condition(&entry);
+        trace!(
+            agent_id = %self.owned_agent_id,
+            oplog_index = %read_idx,
+            entry = ?entry,
+            matched,
+            "TRYGET_TRACE try_get_oplog_entry peeked entry"
+        );
+
+        if matched {
             self.skip_forward().await?;
             self.last_replayed_non_hint_index.set(read_idx);
 

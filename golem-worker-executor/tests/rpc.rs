@@ -1530,6 +1530,216 @@ async fn atomic_double_ready_rpc_call_survives_cold_replay_after_suspend(
     Ok(())
 }
 
+/// Round fourteen: closes the one combination no prior round tested — round ten's manual
+/// `ready()`->`poll()`->`ready()` shape (the exact production polling pattern on a real
+/// `future-invoke-result` pollable) combined with round nine's N=4-sequential-regions/
+/// single-invocation structure, but with every iteration targeting the SAME `RpcCounter`
+/// instance — matching production exactly (all 4 `scene_plates` dispatches go to the SAME
+/// `WorkflowAgent(krea2_base_realism@main,...)`, not 4 distinct agents as round nine's
+/// `sequential_atomic_rpc_calls_then_await` used). No snapshot policy is configured — replay
+/// resumes from genesis, exactly like production's `scene_plates` capture (a single SNAPSHOT at
+/// construction, none since), not from a later snapshot like the round-13 regression test.
+#[test]
+#[tracing::instrument]
+async fn sequential_atomic_double_ready_rpc_calls_same_target_n4_survives_cold_replay(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("agent_rpc_rust")] agent_rpc_rust: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let component = executor
+        .component_dep(&context.default_environment_id, agent_rpc_rust)
+        .store()
+        .await?;
+
+    let agent_id = agent_id!("RpcCaller", "round14-same-target-double-ready-n4");
+    let worker_id = executor
+        .start_agent(&component.id, agent_id.clone())
+        .await?;
+
+    let promise_id_value = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_calls_then_promise_init",
+            data_value!(0u32),
+        )
+        .await?
+        .into_return_value()
+        .ok_or_else(|| anyhow::anyhow!("expected a PromiseId return value"))?;
+
+    let Value::Record(fields) = &promise_id_value else {
+        panic!("Expected a record for PromiseId");
+    };
+    let Value::U64(oplog_idx) = fields[1] else {
+        panic!("Expected a u64 for oplog_idx");
+    };
+    let promise_id = PromiseId {
+        agent_id: worker_id.clone(),
+        oplog_idx: OplogIndex::from_u64(oplog_idx),
+    };
+    let promise_id_vat = ValueAndType::new(promise_id_value, PromiseId::get_type());
+
+    // ONE invocation: 4 sequential atomic double-ready RPC calls, all targeting the SAME
+    // RpcCounter agent instance, then blocking_await_promise — matches production's
+    // scene_plates shape exactly (single invocation, same target agent across all 4
+    // dispatches, real ready->poll->ready polling). Fire-and-forget since it will suspend.
+    executor
+        .invoke_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_double_ready_rpc_calls_then_await",
+            DataValue::Tuple(ElementValues {
+                elements: vec![
+                    ElementValue::ComponentModel(ComponentModelElementValue {
+                        value: 4u32.into_value_and_type(),
+                    }),
+                    ElementValue::ComponentModel(ComponentModelElementValue {
+                        value: "round14_same_target_counter".to_string().into_value_and_type(),
+                    }),
+                    ElementValue::ComponentModel(ComponentModelElementValue {
+                        value: promise_id_vat,
+                    }),
+                ],
+            }),
+        )
+        .await?;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Force a genuine worker eviction + full oplog replay from genesis on a fresh
+    // executor/instance — no snapshot policy configured, matching production's actual shape
+    // (scene_plates' only SNAPSHOT is at construction; everything since replays continuously).
+    drop(executor);
+    let executor = start(deps, &context).await?;
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    executor
+        .complete_promise(&promise_id, b"resumed-ok".to_vec())
+        .await?;
+
+    executor
+        .wait_for_status(&worker_id, AgentStatus::Idle, Duration::from_secs(20))
+        .await?;
+
+    let followup = executor
+        .invoke_and_await_agent(&component, &agent_id, "test3", data_value!())
+        .await?
+        .into_return_value();
+    assert_eq!(
+        followup,
+        Some(Value::U64(1)),
+        "worker must remain genuinely functional after the cold replay of 4 sequential \
+         double-ready RPC regions targeting the SAME remote agent instance — a trap during \
+         replay here would reproduce the still-open Finding B (INVESTIGATION_SUMMARY.md, Round \
+         12): genuine concurrent multi-pollable polling never exercised by rounds 8-11's \
+         distinct-target reproductions"
+    );
+
+    Ok(())
+}
+
+/// Round fourteen-b: genuine concurrent multi-pollable `poll()` — two real
+/// `future-invoke-result` pollables (same target `RpcCounter` instance) registered and polled
+/// TOGETHER in one `poll(&[a, b])` call, not sequentially. This is the literal dimension Finding
+/// B (INVESTIGATION_SUMMARY.md, Round 12) flagged as untested by every prior round: "every
+/// synthetic ready->poll->ready reproduction so far polled exactly one pollable at a time."
+#[test]
+#[tracing::instrument]
+async fn concurrent_double_ready_rpc_calls_survives_cold_replay_after_suspend(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("agent_rpc_rust")] agent_rpc_rust: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let component = executor
+        .component_dep(&context.default_environment_id, agent_rpc_rust)
+        .store()
+        .await?;
+
+    let agent_id = agent_id!("RpcCaller", "round14b-concurrent-double-ready");
+    let worker_id = executor
+        .start_agent(&component.id, agent_id.clone())
+        .await?;
+
+    let promise_id_value = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_calls_then_promise_init",
+            data_value!(0u32),
+        )
+        .await?
+        .into_return_value()
+        .ok_or_else(|| anyhow::anyhow!("expected a PromiseId return value"))?;
+
+    let Value::Record(fields) = &promise_id_value else {
+        panic!("Expected a record for PromiseId");
+    };
+    let Value::U64(oplog_idx) = fields[1] else {
+        panic!("Expected a u64 for oplog_idx");
+    };
+    let promise_id = PromiseId {
+        agent_id: worker_id.clone(),
+        oplog_idx: OplogIndex::from_u64(oplog_idx),
+    };
+    let promise_id_vat = ValueAndType::new(promise_id_value, PromiseId::get_type());
+
+    executor
+        .invoke_agent(
+            &component,
+            &agent_id,
+            "concurrent_double_ready_rpc_calls_then_await",
+            DataValue::Tuple(ElementValues {
+                elements: vec![
+                    ElementValue::ComponentModel(ComponentModelElementValue {
+                        value: "round14b_concurrent_counter".to_string().into_value_and_type(),
+                    }),
+                    ElementValue::ComponentModel(ComponentModelElementValue {
+                        value: promise_id_vat,
+                    }),
+                ],
+            }),
+        )
+        .await?;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    drop(executor);
+    let executor = start(deps, &context).await?;
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    executor
+        .complete_promise(&promise_id, b"resumed-ok".to_vec())
+        .await?;
+
+    executor
+        .wait_for_status(&worker_id, AgentStatus::Idle, Duration::from_secs(20))
+        .await?;
+
+    let followup = executor
+        .invoke_and_await_agent(&component, &agent_id, "test3", data_value!())
+        .await?
+        .into_return_value();
+    assert_eq!(
+        followup,
+        Some(Value::U64(1)),
+        "worker must remain genuinely functional after the cold replay of a GENUINE concurrent \
+         two-pollable poll() region — a trap here would confirm Finding B as the real, \
+         previously untested missing ingredient"
+    );
+
+    Ok(())
+}
+
 /// Regression test for the root cause identified in the Eighth capture
 /// (`INVESTIGATION_SUMMARY.md`): `pollable_seq`'s `next_pollable_seq` counter must be recovered
 /// from the durable oplog on snapshot-based resume, not reset to 0 (fixed in

@@ -1,7 +1,7 @@
 use golem_rust::bindings::golem::agent::host::{Datetime, RpcError, WasmRpc};
 use golem_rust::{
     agent_definition, agent_implementation, atomically, atomically_async, blocking_await_promise,
-    create_promise, PromiseId, Schema, Uuid,
+    complete_promise, create_promise, PromiseId, Schema, Uuid,
 };
 use golem_rust::agentic::Schema as SchemaOps;
 use serde::{Deserialize, Serialize};
@@ -389,6 +389,34 @@ pub trait RpcCaller {
     /// which round nine's generated-proxy-based RPC test did not exercise. Then
     /// `create_promise()` (not awaited yet — reuses `sequential_atomic_rpc_await`).
     fn atomic_double_ready_rpc_call_then_promise_init(&mut self, counter_name: String) -> PromiseId;
+
+    /// Round fourteen: combines round ten's manual `ready()`->`poll()`->`ready()` shape (the
+    /// exact production polling pattern, on a real `future-invoke-result` pollable) with round
+    /// nine's N-sequential-atomic-regions-in-one-invocation structure — but unlike round nine's
+    /// `sequential_atomic_rpc_calls_then_await` (which used a FRESH, per-iteration-unique
+    /// `RpcCounter` name), every iteration here targets the SAME `counter_name`, matching
+    /// production's real shape exactly: all 4 `scene_plates` dispatches go to the SAME
+    /// `WorkflowAgent(krea2_base_realism@main,...)` instance, not 4 distinct agents. This
+    /// specific combination (same target + double-ready shape + N sequential calls + single
+    /// invocation, no snapshot) has not been tested by any prior round.
+    fn sequential_atomic_double_ready_rpc_calls_then_await(
+        &mut self,
+        n: u32,
+        counter_name: String,
+        promise_id: PromiseId,
+    ) -> Vec<u8>;
+
+    /// Round fourteen-b: the ONE dimension Finding B (INVESTIGATION_SUMMARY.md, Round 12)
+    /// explicitly calls out as untested by every prior round (8-14a): a GENUINE multi-pollable
+    /// `poll()` call — two real `future-invoke-result` pollables registered and polled TOGETHER
+    /// in one `poll(&[a, b])` call, not two pollables polled one-at-a-time in separate calls.
+    /// Both RPC calls target the SAME `RpcCounter` instance (matching production). Everything
+    /// still happens inside ONE `atomically()` region, single invocation, no snapshot.
+    fn concurrent_double_ready_rpc_calls_then_await(
+        &mut self,
+        counter_name: String,
+        promise_id: PromiseId,
+    ) -> Vec<u8>;
 }
 
 #[derive(Serialize, Deserialize)]
@@ -569,6 +597,117 @@ impl RpcCaller for RpcCallerImpl {
         });
 
         create_promise()
+    }
+
+    fn sequential_atomic_double_ready_rpc_calls_then_await(
+        &mut self,
+        n: u32,
+        counter_name: String,
+        promise_id: PromiseId,
+    ) -> Vec<u8> {
+        use golem_rust::agentic::Schema;
+
+        for _ in 0..n {
+            atomically(|| {
+                let constructor_data = counter_name
+                    .clone()
+                    .to_data_value()
+                    .expect("Failed to encode constructor");
+                // Fresh WasmRpc proxy per call (matches WorkflowAgent.get(...) being
+                // constructed fresh on every atomicRpcCall() call site) — but `counter_name`
+                // is the SAME string on every iteration, so every call targets the same
+                // remote RpcCounter agent instance, unlike sequential_atomic_rpc_calls_then_await.
+                let wasm_rpc = WasmRpc::new("RpcCounter", &constructor_data, None, &[]);
+                let input = 1u64.to_data_value().expect("Failed to encode input");
+                let future = wasm_rpc.async_invoke_and_await("inc_by_slow", &input);
+                let pollable = future.subscribe();
+
+                let first_ready = pollable.ready();
+                if !first_ready {
+                    let _ = golem_rust::wasip2::io::poll::poll(&[&pollable]);
+                    let confirmed = pollable.ready();
+                    assert!(
+                        confirmed,
+                        "future-invoke-result pollable must report ready immediately after \
+                         poll() unblocked"
+                    );
+                }
+                let _ = future
+                    .get()
+                    .expect("future-invoke-result must have a result after ready()");
+            });
+
+            // Mirrors video-harness's `yieldForSnapshot()` (video-harness/src/util/golem.ts):
+            // a self-completing promise round-trip called immediately after EVERY atomically()
+            // region closes — production's `atomicRpcCall()` does `atomically(fn); await
+            // yieldForSnapshot();` per dispatch, not once at the end of the loop. This is the
+            // one structural piece missing from the plain N-sequential-calls loop: a
+            // promise-backed `poll()`/pollable cycle interleaved between every RPC-future
+            // pollable cycle, exactly matching production's own oplog shape (BEGIN ATOMIC
+            // REGION.../END ATOMIC REGION, create_promise/complete_promise/poll/ready/
+            // get_promise_result, repeated once per render dispatch).
+            let yield_promise_id = create_promise();
+            complete_promise(&yield_promise_id, b"1");
+            blocking_await_promise(&yield_promise_id);
+        }
+
+        blocking_await_promise(&promise_id)
+    }
+
+    fn concurrent_double_ready_rpc_calls_then_await(
+        &mut self,
+        counter_name: String,
+        promise_id: PromiseId,
+    ) -> Vec<u8> {
+        use golem_rust::agentic::Schema;
+
+        atomically(|| {
+            let constructor_data = counter_name
+                .clone()
+                .to_data_value()
+                .expect("Failed to encode constructor");
+            let input = 1u64.to_data_value().expect("Failed to encode input");
+
+            // Two independent WasmRpc proxies, both targeting the SAME RpcCounter instance —
+            // fired back-to-back with NO await between them, so both futures are genuinely
+            // in flight simultaneously (unlike every prior round, which always fully resolved
+            // one pollable before creating the next).
+            let rpc_a = WasmRpc::new("RpcCounter", &constructor_data, None, &[]);
+            let future_a = rpc_a.async_invoke_and_await("inc_by_slow", &input);
+            let rpc_b = WasmRpc::new("RpcCounter", &constructor_data, None, &[]);
+            let future_b = rpc_b.async_invoke_and_await("inc_by_slow", &input);
+
+            let pollable_a = future_a.subscribe();
+            let pollable_b = future_b.subscribe();
+
+            let mut a_ready = pollable_a.ready();
+            let mut b_ready = pollable_b.ready();
+
+            // The genuine multi-pollable shape: BOTH pollables registered in ONE poll() call,
+            // not two separate single-pollable poll() calls — this is the exact dimension
+            // Finding B (INVESTIGATION_SUMMARY.md, Round 12) flagged as untested: production's
+            // `io::poll::poll` observed `count: 2` / multiple `reps` in a single call.
+            while !a_ready || !b_ready {
+                let ready_indices =
+                    golem_rust::wasip2::io::poll::poll(&[&pollable_a, &pollable_b]);
+                for idx in ready_indices {
+                    match idx {
+                        0 => a_ready = pollable_a.ready(),
+                        1 => b_ready = pollable_b.ready(),
+                        other => panic!("unexpected poll() index {other}"),
+                    }
+                }
+            }
+
+            let _ = future_a
+                .get()
+                .expect("future-invoke-result A must have a result after ready()");
+            let _ = future_b
+                .get()
+                .expect("future-invoke-result B must have a result after ready()");
+        });
+
+        blocking_await_promise(&promise_id)
     }
 }
 

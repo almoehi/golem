@@ -1,282 +1,398 @@
-# Finding B fix design — poll() replay must defer to a stray same-batch ready() entry
+# Finding B fix design (v2) — poll() replay must defer to N stray same-batch ready() entries
 
-Status: **DESIGN ONLY — not implemented.** Per the coordinator's explicit request, this is
-presented for review before any code changes, given real ambiguity (flagged in "Open questions"
-below) and higher correctness risk than the Eighth capture's fix.
+Status: **DESIGN ONLY — not implemented.** v2 supersedes v1 (single-stray-entry design) per
+explicit direction: the fix must generalize to an arbitrary number of batched pollables, any
+number of which may have resolved out of the guest's structural check order — not be bounded to
+or validated only for 2-pollable batches. This revision also resolves/bounds the three open
+questions raised on v1.
 
 Seed: Tenth capture (`/Users/hannes/work/golem/oplog-backups/README.md`), live trap on `main`,
 `WorkerAgent(...,"1f93ff64-...@scene_backdrops")`, retry from oplog index 834, `reps: [20, 24]`.
 
-## 1. Restating the root cause precisely
+## 1. Root cause (unchanged from v1, restated)
 
-The decoded sequence (rep 20 = long-lived pollable, `seq: 150`; rep 24 = fresh RPC pollable,
-`seq: 154`):
+`ready()`'s replay (`try_get_oplog_entry`, seq-predicate) correctly rejects an entry that doesn't
+belong to the pollable being asked about (seq mismatch) and synthesizes `false`, leaving the
+entry un-consumed. `poll()`'s replay path (`Durability::replay()` → strict, positional,
+unconditional `HostCall` consumption) has no equivalent identity check — it treats whatever
+`HostCall` entry is next as if it must be its own `IoPollPoll` entry. When a batch member's
+confirmed-`true` entry gets recorded (live) before the guest's replayed structural check order
+reaches it, this crashes: `expected io::poll::poll, got io::poll::pollable::ready`.
 
-```
-poll([20,24]) enter  → peek(840)=IoPollPoll(ReadLocal)              matched: true  → consumed
-ready(rep=20,seq=150) → peek(841)=IoPollReady(ReadLocalPollable(154)) matched: false → synthesize false
-poll([20,24]) enter AGAIN → peek(841)=IoPollReady(ReadLocalPollable(154))  <- crash here
-CRASH: expected io::poll::poll, got io::poll::pollable::ready (begin_index: 834)
-```
+## 2. Question 3 resolved: the guest-level trigger, with source-level confirmation
 
-Entry 841 (the recorded `true` confirmation) was recorded, on LIVE, for rep 24 — not rep 20.
-`ready()`'s replay (`try_get_oplog_entry`, seq-predicate) **correctly** rejects it when asked
-about rep 20 (`150 != 154`) and synthesizes `false`, exactly as designed since the Eighth
-capture's fix. The bug is downstream: the guest's replayed control flow then calls `poll()`
-again, and `poll()`'s replay path (`Durability::replay()` → `read_persisted_durable_function_
-invocation()` → `get_oplog_entry!(HostCall)`) consumes **whatever HostCall entry is next**,
-unconditionally and positionally, with no per-pollable identity check at all. It finds entry 841
-(still sitting there, correctly un-consumed by the rejected `ready(rep=20)` check) and treats it
-as if it must be poll()'s own `IoPollPoll` entry, because that's the only shape `poll()`'s replay
-knows how to consume. Type mismatch → hard crash.
+**Finding, with high confidence, grounded in actual source (not speculation):** the mechanism is
+`std::collections::HashMap`'s per-process-randomized iteration order, inside the WASI async
+reactor that bridges "await a promise representing an in-flight WASI operation" to real
+`poll()`/`ready()` host calls.
 
-**On the guest-level "why" this happens** (why does replay's call order supply an "extra" poll()
-call that live's own recording implies didn't happen at that exact position): this investigation
-does not have visibility into the compiled QuickJS/TS-SDK bytecode driving the real `WorkerAgent`,
-so a fully mechanistic explanation isn't available (this matches round 14's open item #1: no
-round 8–15 synthetic reproduction has driven the real TS-SDK/QuickJS async runtime — every
-attempt used raw Rust `WasmRpc`/`io::poll` directly). The coordinator's live capture already
-establishes this empirically and reproducibly at the engine level, which is sufficient to design
-against: **whatever the guest-level cause, the engine-level contract "poll()'s replay always
-finds a genuine `IoPollPoll` entry positionally next" is not actually guaranteed once a batch
-has more than one pollable** — a stray, already-recorded-true `IoPollReady` entry for one of the
-batch's OTHER members can legitimately sit at the cursor when `poll()` is asked to replay. The fix
-targets this contract directly, independent of why the guest ended up calling poll() again.
-
-## 2. Proposed fix (Tier 1 — recommended)
-
-Reuse the identity-matching primitive `ready()` already trusts (`pollable_seq`), applied
-symmetrically to `poll()`'s replay path. Two new primitives, both additive and read-only (zero
-effect on existing behavior):
-
-**`ReplayState::peek_oplog_entry`** (`replay_state.rs`, alongside `try_get_oplog_entry`) — a pure,
-non-consuming peek. Unlike `try_get_oplog_entry` (consumes on predicate match), this always
-rewinds — calling it twice in a row returns the same entry, cursor untouched:
+Confirmed directly from `wstd` 0.6.5's reactor (vendored at
+`~/.cargo/registry/src/.../wstd-0.6.5/src/runtime/reactor.rs`) — and confirmed that `wstd` is the
+actual runtime in use, via a real WASM backtrace from this investigation's own round-15 test
+failure (`<wstd[...]::runtime::reactor::Reactor>::spawn_unchecked` appears in the trap backtrace):
 
 ```rust
-pub async fn peek_oplog_entry(&mut self) -> Result<(OplogIndex, OplogEntry), WorkerExecutorError> {
-    let saved_replay_idx = self.last_replayed_index.get();
-    let saved_next_skipped_region = {
-        let internal = self.internal.read().await;
-        internal.next_skipped_region.clone()
-    };
-    let read_idx = self.last_replayed_index.get().next();
-    let entry = self.internal_get_next_oplog_entry().await?;
+struct InnerReactor {
+    pollables: Mutex<Slab<Pollable>>,
+    wakers: Mutex<HashMap<Waitee, Waker>>,   // <-- std HashMap, default (randomized) hasher
+    ready_list: Mutex<VecDeque<Runnable>>,
+}
 
-    self.rewind_replay_buffer(read_idx, entry.clone()); // OplogEntry: Clone (derived)
-    self.last_replayed_index.set(saved_replay_idx);
-    let mut internal = self.internal.write().await;
-    internal.next_skipped_region = saved_next_skipped_region;
-
-    Ok((read_idx, entry))
+fn check_pollables<F>(&self, check_ready: F) {
+    let wakers = self.inner.wakers.lock().unwrap();
+    ...
+    for (waitee, waker) in wakers.iter() {           // <-- iteration order is NOT insertion order,
+        indexed_wakers.push(waker);                  //     not dispatch order, not deterministic
+        targets.push(&pollables[pollable_index.0]);  //     across process instances
+    }
+    let ready_indexes = check_ready(&targets);        // -> wasip2::io::poll::poll(targets)
+    let ready_wakers = ready_indexes.into_iter().map(|index| indexed_wakers[index as usize]);
+    for waker in ready_wakers {
+        waker.wake_by_ref()                           // <-- wake ORDER is hashmap-order-dependent
+    }
 }
 ```
 
-**`PrivateDurableWorkerState::pollable_seq_if_assigned`** (`durable_host/mod.rs`, alongside
-`pollable_seq`) — a non-mutating lookup:
+Each pollable an async task is waiting on registers a `(Waitee, Waker)` pair into this `HashMap`
+(`Reactor::ready()`, called from each task's own `WaitFor::poll()` the first time it's polled and
+finds itself not-yet-ready). When multiple tasks are simultaneously pending and the reactor blocks
+(`block_on_pollables` → `check_pollables`), **all currently-pending pollables get batched into one
+`wasip2::io::poll::poll()` call together** — this is the direct, textbook mechanism producing a
+batched multi-pollable `poll()` from what the JS/Rust-level code expresses as several independent
+`await`s. Critically: `wakers.iter()`'s order depends on `HashMap`'s default `RandomState` hasher,
+which is seeded from OS entropy fresh per process — the LIVE process instance and any REPLAY
+process instance (a fresh wasmtime component instantiation, confirmed as the shape of both the
+Ninth and Tenth captures) get **independently randomized seeds**, so the SAME set of pending
+`(Waitee, Waker)` pairs iterates in a **different order** across the two runs. This directly drives:
+(a) the order of `targets` fed into the shared `poll()` call, and (b) — the part that matters most
+— the order `waker.wake_by_ref()` is called for however many pollables `poll()` found ready at
+once, which determines the order those tasks get re-queued into the FIFO `ready_list` and
+subsequently re-polled, i.e. the order their own individual `ready()` host calls fire. This is a
+genuine, real, per-process source of non-determinism in the guest's structural check order,
+entirely independent of WASM bytecode determinism (the bytecode IS deterministic; the *value fed
+into it* — HashMap iteration order — is not, because it depends on process-local entropy that
+Golem's replay model has no mechanism to reproduce).
+
+**Confidence level:** this is confirmed with certainty for `golem-rust` (the Rust SDK used by this
+investigation's own test components — the backtrace proves it). It is not directly confirmed for
+`@golemcloud/golem-ts-sdk`'s compiled WASM shim (no vendored Rust source was found in
+`node_modules/@golemcloud/golem-ts-sdk` — only a prebuilt `wasm/` artifact) — but `wstd` is the
+Golem ecosystem's standard "bridge an async Rust runtime to raw WASI 0.2" crate, used for
+precisely this problem, and it would be surprising for the TS SDK's own shim to solve the
+identical problem differently. Treat this as a strong, checkable, well-reasoned hypothesis, not
+100%-certain bytecode-level proof.
+
+**This also explains why rounds 8–15 never reproduced Finding B**: every synthetic round drove
+`golem_rust::wasip2::io::poll::poll`/`ready` **directly**, by hand, in fixed Rust structural order
+— entirely bypassing `wstd`'s `Reactor`/`HashMap`-keyed waker registry. None of those tests ever
+went through an actual Task/Waker-based executor with a HashMap-backed pending set, so there was
+no source of reordering for them to hit, no matter how faithfully they reproduced batch shape,
+timing, or prior history. A synthetic reproduction that *does* route through `wstd`'s real
+`block_on`/`Reactor` (e.g. using `agent_implementation`'s generated async dispatch, or `futures_lite`
+combinators like round 15's own `futures_concurrency::future::FutureGroup`, rather than manual
+`WasmRpc`/raw `io::poll` calls) is the one remaining, plausible way to get an integration-level
+repro — noted as a follow-up in the test plan (§5b), not attempted in this design.
+
+**Confirmed app-level trigger, video-harness source:** `LlmClient.runOneRound()`'s Phase A
+(`video-harness/src/llm/client.ts:1293-1312`) fires every `allowBatch`-marked tool call's dispatch
+**without awaiting between them** — `this.executeCall(call, dispatch).then((r) => {...})`, no
+`await` before the loop's next iteration — genuinely N-way concurrent, N bounded only by how many
+`allowBatch` calls the LLM's `tool_calls` response contains in one turn (no fixed cap in the code).
+`add_artifact_file` is confirmed `allowBatch: true`
+(`video-harness/src/worker/worker-agent.ts:1772`), and its own doc comment
+(`worker-agent.ts:1750-1751`) gives a concrete example matching production's naming almost
+exactly: *"a single `wfOutputPort` has been produced by more than one `wf_xxx` call... e.g. 4 scene
+plates through the same workflow/port"* — i.e. the LLM can legitimately register 3-4+ output files
+in one turn, each potentially involving its own cross-agent RPC/lookup. Phase B
+(`client.ts:1317-1344`) then collects results via `for (const call of calls) { ... await
+batchPending.get(callSig) ... }` — **fixed original-call-order**, not real-completion-order. This
+is exactly the app-level shape that feeds N independently-dispatched, concurrently-outstanding
+WASI-backed promises into `wstd`'s shared reactor at once, with no guarantee their real completion
+order matches the array order Phase B awaits them in — precisely the condition the `HashMap`
+mechanism above turns into a live/replay divergence.
+
+**Scope note (not addressed by this fix, flagged for follow-up):** the same `wstd` reactor
+mechanism is generic — it isn't specific to `io::poll`/RPC futures, it's used for *any* WASI
+pollable-based wait, including HTTP fetch()'s input/output stream pollables. video-harness has at
+least one other confirmed N-way-concurrent-fetch pattern:
+`download-manager.ts:138` (`Promise.all(batch.map((item) => this.fetchBytes(item.url)))`,
+inside one `atomically()` region). The comment there (`download-manager.ts:122-124`) claims this is
+safe because *"Golem replays concurrent WASI calls within one atomically() region correctly
+(positional IoPollReady matching)"* — that justification predates this investigation's own
+seq-tagging fix and may itself be describing the now-superseded pre-Bug-2-fix model; whether
+HTTP's own replay path (`HttpTypesOutgoingBodyStreamCheckWrite`/similar) has an equivalent
+per-resource identity check or is vulnerable to the same class of divergence as `poll()` was is
+**not evaluated here** — flagging as a candidate follow-up investigation, out of scope for this
+fix (which is scoped to `io::poll::poll`/`io::poll::pollable::ready` specifically, matching the
+Tenth capture).
+
+## 3. Questions 1 & 2 resolved: general-N design, no batch-size assumption
+
+The v1 design (single non-consuming peek, defer to the guest's natural retry) does not extend
+cleanly to N>1 simultaneous strays — you cannot "peek ahead" past an already-peeked entry without
+either a new peek-at-offset primitive (risky: this investigation does not have full certainty
+about `last_replayed_index`'s exact bookkeeping outside the already-proven `try_get_oplog_entry`
+path, and hand-rolling new buffer arithmetic risks a subtle, hard-to-verify bug in exactly the
+class of code this fix needs to get right) or actually consuming entries as they're found.
+
+**v2 design: consume strays for real, cache their answer, let `ready()` consult the cache.**
+Reuses `try_get_oplog_entry` — the existing, proven primitive — as the *only* oplog-manipulation
+building block; no new peek/offset primitive.
+
+**New replay-only state** (`PrivateDurableWorkerState`, `durable_host/mod.rs`):
 
 ```rust
-/// Returns `rep`'s already-assigned seq, if any, WITHOUT assigning a fresh one. Unlike
-/// `pollable_seq()`, this must never mutate `next_pollable_seq` — poll()'s replay uses this
-/// to check whether a peeked entry belongs to one of its own batch members without changing
-/// seq assignment order/values relative to what LIVE recorded (LIVE only ever assigns seqs
-/// from ready(), never from poll() — see pollable_seq's doc comment). Perturbing that order
-/// would itself be a new live/replay divergence and would risk breaking replay of already-
-/// persisted oplogs recorded under the current (ready()-only) assignment order.
-pub fn pollable_seq_if_assigned(&self, rep: u32) -> Option<u32> {
-    self.pollable_seq.get(&rep).copied()
+/// REPLAY-ONLY cache of pollable seqs whose IoPollReady(seq)=<result> entry was consumed by a
+/// DIFFERENT poll() call's replay logic, because it appeared in the oplog before the guest's
+/// replayed structural check order reached that pollable's own ready() call (see Tenth capture /
+/// FINDING_B_FIX_DESIGN.md §2 for why this ordering divergence is real: wstd's Reactor batches
+/// concurrently-pending pollables via a HashMap-keyed waker set whose iteration order is
+/// per-process-randomized, not reproducible across live vs. a fresh replay instance). Always
+/// empty on the live path — only poll()'s replay branch ever populates it.
+pre_resolved_pollable_ready: HashMap<u32, bool>,
+```
+
+```rust
+/// Records that `seq`'s IoPollReady confirmation was consumed early, by a poll() call's replay,
+/// on behalf of a pollable whose own ready() call hasn't replayed yet.
+pub fn record_pre_resolved_pollable_ready(&mut self, seq: u32, ready: bool) {
+    self.pre_resolved_pollable_ready.insert(seq, ready);
+}
+
+/// Takes (removes) a pre-resolved answer for `seq`, if poll()'s replay already consumed its
+/// entry on this pollable's behalf. Consulted by ready()'s replay BEFORE its own
+/// try_get_oplog_entry lookup — if present, the oplog has nothing left to find for this seq
+/// (already consumed), so this is the only remaining source of the answer.
+pub fn take_pre_resolved_pollable_ready(&mut self, seq: u32) -> Option<bool> {
+    self.pre_resolved_pollable_ready.remove(&seq)
 }
 ```
 
-**`Host::poll`'s replay branch** (`io/poll.rs`) — peek before consuming:
+(`pollable_seq_if_assigned` from v1 is retained unchanged — still needed to build the batch's seq
+set without perturbing assignment order.)
+
+**`Host::poll`'s replay branch** — loop instead of single peek, using ONLY `try_get_oplog_entry`:
 
 ```rust
 } else {
-    // REPLAY. Peek without consuming first, to distinguish poll()'s own entry from a stray
-    // same-batch ready() confirmation recorded out of the guest's replayed structural check
-    // order (Tenth capture, FINDING_B_FIX_DESIGN.md). Zero effect on the happy path: a
-    // genuine IoPollPoll entry falls through to the unchanged `durability.replay(self)` call
-    // below exactly as before.
-    let (_, peeked_entry) = self.state.replay_state.peek_oplog_entry().await?;
+    // REPLAY. batch_seqs: only reps that already have an assigned seq can possibly own a
+    // stray entry — pollable_seq is assigned unconditionally at the top of every ready() call
+    // (live or replay), and per wstd's Reactor (Reactor::ready(), called from every task's
+    // first WaitFor::poll()), a pollable cannot become part of a batched poll() at all until
+    // its own ready() has been called at least once (registering it in `wakers`) — so by
+    // construction every batch member here should already have a seq. (This is also the
+    // resolution to "what if a batch member was never ready()-checked yet": per this
+    // reactor architecture it's very likely unreachable — see §3 discussion below. If it DOES
+    // happen, pollable_seq_if_assigned returns None, the member can't match any stray-entry
+    // predicate below, and replay falls through to the existing crash path — no worse than
+    // today, just not specifically fixed for that sub-case.)
+    let batch_seqs: HashSet<u32> = in_
+        .iter()
+        .filter_map(|r| self.state.pollable_seq_if_assigned(r.rep()))
+        .collect();
 
-    let stray_batch_index = match &peeked_entry {
-        OplogEntry::HostCall {
-            function_name: HostFunctionName::IoPollReady,
-            durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
-            ..
-        } => in_.iter().enumerate().find_map(|(idx, r)| {
-            (self.state.pollable_seq_if_assigned(r.rep()) == Some(*seq)).then_some(idx)
-        }),
-        _ => None,
-    };
+    loop {
+        let peeked = self
+            .state
+            .replay_state
+            .try_get_oplog_entry(|entry| {
+                matches!(
+                    entry,
+                    OplogEntry::HostCall { function_name: HostFunctionName::IoPollPoll, .. }
+                ) || matches!(
+                    entry,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollReady,
+                        durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
+                        ..
+                    } if batch_seqs.contains(seq)
+                )
+            })
+            .await?;
 
-    match stray_batch_index {
-        Some(idx) => {
-            trace!(
-                agent_id = %self.owned_agent_id,
-                reps = ?in_.iter().map(|r| r.rep()).collect::<Vec<_>>(),
-                stray_index = idx,
-                "POLLCALL_TRACE poll() REPLAY deferring to stray same-batch ready() entry"
-            );
-            // Do NOT consume — leave it for that pollable's own subsequent ready() call.
-            // Synthesize poll()'s hint result (WASI's poll() contract is "may be ready, go
-            // check": the guest's existing ready()-after-poll() confirmation pattern, already
-            // established since round ten, means returning a hint here is safe under the
-            // contract the guest already relies on).
-            Ok(HostResponsePollResult { result: Ok(vec![idx as u32]) })
+        match peeked {
+            // Genuine poll() entry — decode + return its response. Identical semantics to
+            // today's durability.replay(self) happy path (same entry shape, same decode).
+            Some((_idx, entry @ OplogEntry::HostCall {
+                function_name: HostFunctionName::IoPollPoll, ..
+            })) => break Ok(decode_poll_response(entry)?),
+
+            // A stray same-batch ready() confirmation, consumed for real (try_get_oplog_entry
+            // has now durably advanced past it — this is NOT recoverable from the oplog a
+            // second time) and cached so the owning pollable's own later ready() call still
+            // gets the right answer. Keep looping — there may be more strays, or poll()'s own
+            // entry, still ahead.
+            Some((_idx, OplogEntry::HostCall {
+                function_name: HostFunctionName::IoPollReady,
+                durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
+                response, ..
+            })) => {
+                let payload = decode_poll_ready_response(response).await?;
+                trace!(
+                    agent_id = %self.owned_agent_id,
+                    seq,
+                    result = ?payload.result,
+                    "POLLCALL_TRACE poll() REPLAY consumed stray same-batch ready() entry, caching"
+                );
+                self.state.record_pre_resolved_pollable_ready(
+                    seq,
+                    payload.result.unwrap_or(false),
+                );
+                continue;
+            }
+
+            // Neither shape matched — existing crash path, unchanged, for genuinely
+            // unexpected/unrelated entries.
+            _ => break Ok(durability.replay(self).await?),
         }
-        // Not a stray same-batch entry — unchanged existing path, including its existing
-        // crash behavior for genuinely unrelated/unexpected entries.
-        None => Ok(durability.replay(self).await?),
     }
 };
 ```
 
-Everything downstream (`match result { Ok(result) => ..., Err(duration) => ... }`) is unchanged.
+(`decode_poll_response`/`decode_poll_ready_response` are factored-out helpers for the existing
+payload-download-and-decode steps `Durability::replay_raw()` and `ready()`'s own replay branch
+already perform respectively — no new decoding logic, just reused in a new call site. Exact
+factoring is an implementation detail for the coding pass, not a design decision.)
 
-### Why this is safe
-
-- **Happy path unchanged.** The one new `peek_oplog_entry` call is pure/non-mutating; when it
-  finds a genuine `IoPollPoll` entry, `stray_batch_index` is `None` and control falls straight
-  into the exact same `durability.replay(self).await?` call that runs today — byte-for-byte
-  identical behavior, including its existing crash detection for anything genuinely unexpected.
-- **No seq-assignment perturbation.** `pollable_seq_if_assigned` never mutates
-  `next_pollable_seq` — it can only return a seq that some *prior* `ready()` call already
-  assigned. This preserves the Eighth-capture/Option-2 fix's invariant that seq assignment order
-  is driven exclusively by `ready()` call order, so this change cannot alter counter values for
-  already-persisted oplogs (backward compatible, unlike a hypothetical fix that made `poll()`
-  itself assign seqs).
-- **No persistence.** This is a REPLAY-only branch — nothing is ever written to the oplog here;
-  `LIVE`'s branch (`durability.is_live()`) is untouched.
-- **Self-correcting per call, no multi-entry lookahead needed.** If poll() is called again after
-  this (because the guest's busy-loop hasn't yet seen its own pollable resolve), the cursor is
-  still sitting at the same un-consumed stray entry — the guest's own subsequent `ready()` call on
-  the hinted index will consume it via the existing, unchanged `ready()` mechanism. Only ONE
-  peek is needed per `poll()` invocation; the loop itself provides the "try again" semantics.
-
-## 3. Test plan
-
-### 3a. Unit test, seeded directly from the Tenth capture's byte pattern (primary)
-
-A hand-authored deterministic Rust guest cannot literally force replay's call *order* to diverge
-from live's own recorded order (both runs execute the same instructions given the same fed-back
-answers) — see "Open question 3" below for why an integration-level repro of the *exact*
-divergence is not straightforwardly constructible. The most direct and honest way to seed a test
-from this trace is therefore at the same level the existing `try_get_oplog_entry_*` tests already
-operate (`replay_state.rs`'s test module, using `MutableBatchOplog`): construct the exact entry
-shapes from the Tenth capture and assert the new logic's behavior directly.
+**`HostPollable::ready`'s replay branch** — one new check at the top, before the existing
+`try_get_oplog_entry` call:
 
 ```rust
-#[test]
-async fn poll_replay_defers_to_stray_same_batch_ready_entry() {
-    // Entry shapes lifted directly from the Tenth capture: an IoPollPoll(ReadLocal) entry
-    // (poll()'s own, already consumed in the real trace) followed by an
-    // IoPollReady(ReadLocalPollable(154)) entry — rep 24's confirmed-true, recorded before
-    // the guest's replayed control flow reached the matching ready() call for it.
-    let io_poll_ready_for_seq_154 = OplogEntry::HostCall {
-        timestamp: Timestamp::now_utc(),
-        function_name: HostFunctionName::IoPollReady,
-        request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
-        response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
-            HostResponsePollReady { result: Ok(true) },
-        ))),
-        durable_function_type: DurableFunctionType::ReadLocalPollable(154),
-    };
-    let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
-        (OplogIndex::INITIAL, OplogEntry::NoOp { timestamp: Timestamp::now_utc() }),
-        (OplogIndex::INITIAL.next(), io_poll_ready_for_seq_154),
-    ])));
-    let mut state = ReplayState::new(owned_agent_id, oplog, DeletedRegions::new()).await.unwrap();
-
-    // peek_oplog_entry must be non-consuming and repeatable.
-    let (idx1, entry1) = state.peek_oplog_entry().await.unwrap();
-    let (idx2, entry2) = state.peek_oplog_entry().await.unwrap();
-    assert_eq!(idx1, idx2);
-    assert!(matches!(entry1, OplogEntry::HostCall { function_name: HostFunctionName::IoPollReady, .. }));
-    assert_eq!(entry1, entry2);
-
-    // Then: the stray-batch-index resolution logic (extracted so it's directly testable, or
-    // inlined and asserted via a small helper) must map seq 154 -> index 1 for a batch built
-    // as [rep_for_seq_150 (index 0), rep_for_seq_154 (index 1)], and leave the entry
-    // unconsumed afterward (a follow-up try_get_oplog_entry for IoPollReady(154) must still
-    // match — proving nothing was silently dropped).
+if let Some(pre_resolved) = self.state.take_pre_resolved_pollable_ready(pollable_seq) {
+    trace!(
+        agent_id = %self.owned_agent_id, rep = pollable_rep, seq = pollable_seq,
+        result = pre_resolved,
+        "POLLREADY_TRACE ready() REPLAY using answer pre-resolved by an earlier poll() call"
+    );
+    return Ok(pre_resolved);
 }
+// ... existing try_get_oplog_entry-based logic, completely unchanged below this point ...
 ```
 
-Also add (or extend an existing) `DurableWorkerCtx`/`PrivateDurableWorkerState`-level unit test
-for `pollable_seq_if_assigned`: assert it returns `None` for an unseen rep, `Some(seq)` after a
-prior `pollable_seq(rep)` call, and — critically — that calling it does **not** advance
-`next_pollable_seq` (call it N times, confirm the next *mutating* `pollable_seq()` call on a new
-rep still gets the value it would have gotten with zero `pollable_seq_if_assigned` calls in
-between).
+### Why this generalizes correctly to arbitrary N (question 1, resolved)
 
-### 3b. Best-effort integration-level probe (secondary, may not reproduce — that's expected)
+- The loop's only two "keep going" / "stop" conditions are per-entry, not per-batch-size: "is this
+  poll()'s own entry" (stop, success) / "is this a stray for one of my batch members" (consume,
+  cache, keep looping) / "neither" (stop, existing crash). N stray entries in a row is just N
+  loop iterations — nothing in the mechanism assumes or checks a batch size, 2-pollable or
+  otherwise. This directly satisfies "one general mechanism for 0 or more stray entries, in any
+  order, for any batch size."
+- No entry is ever double-counted or lost: `try_get_oplog_entry`'s matched-path durably advances
+  the cursor exactly once per consumed entry (this is the same proven primitive every other
+  replay path in this file already relies on); the cache is a strict one-shot hand-off consumed
+  exactly once by `take_pre_resolved_pollable_ready`.
+- Termination is guaranteed: each loop iteration consumes one real oplog entry via
+  `try_get_oplog_entry`, so the loop is bounded by the (finite) distance to the next
+  non-matching-or-genuine entry; running off the end of the oplog surfaces as the same
+  "missing oplog entry" error `internal_get_next_oplog_entry` already produces today, not an
+  infinite loop.
 
-Extend round 15's `long_lived_timer_batched_with_fresh_rpc_after_n_regions` pattern with a
-variant where the **guest's fixed structural check order and the pollables' real relative speed
-are deliberately reversed** — check index 0 first (matching a slow ~150ms `inc_by_slow` call)
-and index 1 second (a fast, near-instant local RPC or `inc_by`), so index 1 is very likely to
-have genuinely resolved *before* index 0 gets checked structurally, while the busy-loop's
-own logic (`ready(0)` → false → `poll()` again, never reaching `ready(1)` in the same pass)
-mirrors the trace's shape. This is a best-effort construction, not a proven reproduction — per
-round 14/15 and the Tenth capture's own framing, the real divergence may depend on guest-level
-(QuickJS) scheduling nondeterminism no hand-authored deterministic Rust can force. Flagging this
-sub-item as **may legitimately stay negative**; the unit test in 3a is the test that actually
-pins down the fix's correctness and is not allowed to be skipped.
+### Why question 2 (unassigned-seq batch member) is very likely unreachable, not a separate case
 
-### 3c. Falsification (bidirectional, same bar as every prior round)
+Per `wstd`'s `Reactor::ready()` (called from every task's `WaitFor::poll()` — the very first time
+any task representing a pending WASI wait gets polled, it calls the raw `ready()` host call
+directly): a pollable only gets registered into `self.inner.wakers` (and therefore only becomes
+eligible to be swept into a *batched* `poll()` call at all) *after* its own `ready()` has already
+returned `false` at least once. Since `pollable_seq(rep)` is assigned unconditionally at the top
+of every `ready()` call (live or replay) regardless of the boolean result, this means: **by the
+time a pollable can appear inside a batched `poll()`'s `in_` argument at all, it must already have
+had `ready()` called on it at least once** — so `pollable_seq_if_assigned` should always find an
+assigned seq for every genuine batch member, on both live and replay, independent of the
+HashMap-reordering issue (that issue affects *which* pollable gets checked *when*, not *whether*
+each one gets its initial optimistic check at all before ever entering a shared `poll()`). This
+isn't a 100%-certain proof (this investigation has not read `wstd`'s full `block_on` driver loop,
+only `reactor.rs`, and has not confirmed golem-ts-sdk's shim follows the identical pattern), but
+it's a source-grounded, checkable argument, and — critically — **the design does not depend on
+it being true**: if it's wrong and an unassigned-seq stray does occur, this fix's loop simply
+falls through to today's existing crash for that one sub-case, which is strictly no worse than
+current behavior. Question 2 is therefore not a separate mechanism needing its own design — it's
+the same general loop, and its "unmatched → existing crash" fallback already covers this case
+safely (if not helpfully) either way.
 
-- **Before the fix**: unit test 3a's "does not crash" assertion must FAIL against the current
-  `poll()` replay code (confirms the test actually exercises the bug).
-- **After the fix**: unit test 3a passes; all four pre-existing `try_get_oplog_entry_*` tests
-  still pass unmodified; the full `durable_host::` unit suite (64 tests as of round 15) still
-  passes.
+## 4. Test plan (updated for the general design)
 
-### 3d. Full regression sweep
+### 4a. Unit tests — N=1, N=2, N=3 strays, out-of-order among themselves, seeded from the Tenth capture's shapes
 
-- Rounds 8–15's integration tests (`rpc.rs`, `durability.rs`) — everything from
-  `timer_races_real_http_and_survives_worker_replay` through round 15's
-  `long_lived_timer_batched_with_fresh_rpc_survives_cold_replay`.
-- The Eighth capture's fix regression test:
-  `atomic_rpc_call_across_periodic_snapshot_survives_cold_replay`.
-- Note the pre-existing, unrelated `WorkerActivator` test-infra flake documented in
-  `ROUND_FIFTEEN_FINDINGS.md` (confirmed independent of any of this investigation's changes) —
-  expect it may still intermittently fail `sequential_atomic_double_ready_rpc_calls_same_target_
-  n4_survives_cold_replay` when run alone; re-run alongside siblings or re-run once if hit.
+Same `MutableBatchOplog`-based approach as v1 (`replay_state.rs` test module), extended:
 
-## 4. Open questions (why this is going out for review before implementation)
+1. **`poll_replay_consumes_single_stray_and_finds_poll_entry`** — oplog: `[IoPollReady(seq=154),
+   IoPollPoll]` (Tenth capture's literal 2-entry shape, but now testing the general loop rather
+   than a single peek). Batch = `{150, 154}`. Assert: no crash; `pre_resolved_pollable_ready`
+   contains `{154: true}` afterward; poll()'s own response is returned from the second (genuine)
+   entry unchanged.
+2. **`poll_replay_consumes_multiple_strays_before_own_entry`** — oplog:
+   `[IoPollReady(seq=154), IoPollReady(seq=161), IoPollPoll]`, batch = `{150, 154, 161, 172}`
+   (4-pollable batch, 2 strays, in a specific order). Assert: no crash; cache contains
+   `{154: true, 161: true}`; a subsequent `ready(rep-for-161)` call (via a second test step) reads
+   `true` from the cache without touching the oplog further; a subsequent `ready(rep-for-150)`
+   call (never resolved, no stray recorded for it) falls through to the normal
+   `try_get_oplog_entry` path and correctly synthesizes `false`.
+3. **`poll_replay_stray_order_independent`** — same as #2 but with the two stray entries in the
+   OPPOSITE order (`161` before `154`) — assert identical end state, proving the mechanism doesn't
+   depend on which stray arrives first.
+4. **`poll_replay_still_crashes_on_genuinely_unrelated_entry`** — oplog:
+   `[some unrelated HostCall entry, e.g. HttpTypesOutgoingBodyStreamCheckWrite]`, batch =
+   `{150, 154}`. Assert: existing crash path still fires (`durability.replay()`'s
+   `validate_oplog_entry` mismatch) — proving the fix's scope is exactly "stray same-batch
+   ready() entries," not "swallow any mismatch."
+5. **`pollable_seq_if_assigned` unit tests** (as in v1): `None` for unseen rep, `Some(seq)` after
+   assignment, and — critically — confirms it never mutates `next_pollable_seq`.
 
-1. **Single-stray-entry-per-call sufficiency.** The design assumes at most one stray entry sits
-   at the cursor per `poll()` invocation, with the guest's own retry loop naturally handling
-   further strays on subsequent calls. Is there a scenario (e.g. a 3+-pollable batch) where
-   *multiple* consecutive stray entries could be recorded before `poll()`'s own entry, requiring
-   a look-ahead beyond one peek? The Tenth capture's 2-pollable case doesn't exercise this; I
-   don't have a live example of a 3+-pollable batch to confirm either way.
-2. **Unassigned-seq batch member (Tier 2, deferred).** If the stray entry actually belongs to a
-   batch member whose `ready()` has *never* been called yet in this replay (no seq assigned,
-   `pollable_seq_if_assigned` returns `None`), Tier 1 falls through to today's crash — no worse
-   than current behavior, but not a fix for that specific sub-case either. Confirmed structurally:
-   entry 841 belongs to rep 24, and per the trace rep 24's `ready()` genuinely was already called
-   once (the very first "ready(rep=24,seq=154) -> synthesize false" step) before either poll()
-   call in this window — so Tier 1 fully covers the Tenth capture's exact case. Whether the
-   unassigned-seq sub-case occurs in practice (and needs its own follow-up) is unconfirmed.
-3. **The guest-level "why" is genuinely unexplained.** Section 1 is explicit that this design
-   does not know why replay's call order can differ from live's implied order at the QuickJS/
-   TS-SDK level. The fix is engine-level and defensive (matches the entry it finds, regardless of
-   why), which I believe is the right posture given we can't inspect the compiled guest bytecode
-   — but flagging that "we don't fully understand the trigger, only how to make replay robust to
-   its symptom" is itself worth a second opinion, in case there's a guest-level (app-code) angle
-   worth pursuing in parallel that would make this engine change less necessary or scope it
-   differently.
-4. **Trace-line accuracy after this fix ships.** Round 15's `validate_oplog_entry` enrichment
-   (already shipped, `203380c85`) logs `actual_durable_function_type` on every mismatch. Once
-   this fix lands, the specific mismatch pattern it enriches for (a stray same-batch
-   `ReadLocalPollable` entry hit during `poll()`'s replay) will no longer reach that error path at
-   all for the case this fix covers — the enrichment remains correct and useful for genuinely
-   unrelated mismatches, no change needed there, just noting for completeness.
+### 4b. Best-effort integration-level probe, revised to route through a real Task/Waker executor
 
-## 5. Ask
+v1's proposed integration probe (reversed structural-order-vs-speed, driven by hand-authored
+`WasmRpc`/raw `io::poll` calls) is now understood to be very unlikely to reproduce anything, per
+§2's finding: raw `io::poll` calls bypass `wstd`'s `Reactor`/HashMap entirely, so there is no
+source of reordering for such a test to hit, regardless of how the pollables' relative speed is
+constructed. A test with any chance of exercising the *actual* mechanism needs to route through a
+genuine Task/Waker-based concurrent-await pattern (e.g. `futures_concurrency::future::FutureGroup`
+or `futures_lite::future::zip`/`race`, as `wstd`'s own reactor.rs test module already does for ITS
+OWN unit tests at lines 337-380 and 433-458) — spawning 3+ genuinely concurrent RPC-await tasks
+and letting `wstd`'s real reactor batch them. Flagging as a valuable follow-up, not attempted in
+this design pass — even if built, since HashMap seeding is randomized per-process, such a test
+could only be a *probabilistic* repro (rerun until the seeds happen to produce divergent orders
+on a captured live oplog vs. a fresh replay process), which is a fundamentally different
+falsification shape than every prior round's deterministic repro — worth a separate design
+discussion if pursued, not bundled into this fix's landing criteria. **The unit tests in §4a are
+what actually gate correctness of this fix; they are not optional.**
 
-Proceeding to implement + test per the plan above once reviewed, unless directed otherwise. Given
-open questions 1–3 in particular, a second look before merging feels warranted — this is an
-engine-level replay-control-flow change, not a "recover a lost value" fix.
+### 4c. Falsification (bidirectional)
+
+- Before the fix: unit tests #1–3 in §4a fail (crash) against current `poll()` replay code.
+- After the fix: all of §4a passes; all four pre-existing `try_get_oplog_entry_*` tests pass
+  unmodified; full `durable_host::` unit suite (64 tests as of round 15) passes.
+
+### 4d. Full regression sweep
+
+Same as v1 §3d: rounds 8–15's integration tests, the Eighth capture's fix regression test
+(`atomic_rpc_call_across_periodic_snapshot_survives_cold_replay`), noting the pre-existing
+`WorkerActivator` test-infra flake (`ROUND_FIFTEEN_FINDINGS.md`) is unrelated and may need a rerun.
+
+## 5. Status of the three open questions
+
+1. **3+-pollable batches** — resolved. The design is a loop over the same primitive
+   (`try_get_oplog_entry`), with no batch-size assumption anywhere; N strays in any order is N
+   loop iterations. Not bounded to or specially-cased for N=2.
+2. **Unassigned-seq batch member** — bounded, not fully proven. Same general mechanism (no
+   separate design needed); very likely structurally unreachable given `wstd`'s confirmed
+   "ready() called before a pollable can join a batch" invariant, but not 100%-verified against
+   golem-ts-sdk's actual shim source. If wrong, falls through to today's crash — strictly no
+   regression either way.
+3. **Guest-level trigger** — resolved to a well-reasoned, source-grounded hypothesis (not
+   bytecode-level certainty): `wstd`'s `HashMap`-keyed waker registry, confirmed in use by
+   golem-rust via an actual backtrace from this investigation, produces per-process-randomized
+   wake/check ordering whenever multiple WASI-backed promises are concurrently pending — and
+   video-harness's `LlmClient.runOneRound()` Phase A/B (`client.ts:1279-1344`, specifically
+   `allowBatch` tools like `add_artifact_file`) is a confirmed, unbounded-N, real-world trigger
+   for exactly that condition. Also surfaced a same-mechanism scope concern
+   (`download-manager.ts`'s concurrent-fetch pattern) flagged as a follow-up, not fixed here.
+
+## 6. Recommendation
+
+Proceed to implementation per §3/§4 above. The remaining uncertainty (question 2's "very likely
+but not proven" status, and the HTTP-path scope note in §2) are both bounded such that getting
+them wrong costs nothing beyond "this specific fix doesn't help that sub-case" — neither can turn
+this change into a correctness regression relative to today. Given that, and that questions 1 and
+3 are now resolved with concrete, source-grounded reasoning, this feels ready to build — happy to
+take one more look at the code itself once written, given the standing bar of falsify
+bidirectionally + full regression sweep before calling it done.

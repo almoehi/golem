@@ -417,6 +417,28 @@ pub trait RpcCaller {
         counter_name: String,
         promise_id: PromiseId,
     ) -> Vec<u8>;
+
+    /// Round fourteen-d: the one shape 14a/14b/14c did not cover — a single, long-lived,
+    /// repeatedly-`ready()`-checked-but-never-resolving pollable (a near-infinite
+    /// `monotonic_clock::subscribe_duration` timer, matching production's Ninth-capture rep
+    /// 20/seq 179 exactly: "timer-shaped, many-times-polled, never resolved") that survives
+    /// across `n` PRIOR sequential atomic regions (each doing its own same-target RPC
+    /// dispatch, with production's interleaved `yieldForSnapshot()`-shaped promise round-trip
+    /// between them — same shape as `sequential_atomic_double_ready_rpc_calls_then_await`)
+    /// before finally being batched together with a FRESH RPC pollable in one `poll()` call —
+    /// production's `reps: [20, 23]` shape. Unlike `timer_race_multi_step`
+    /// (custom_durability.rs), which creates+drops a fresh timer every cycle, this timer is
+    /// created ONCE and never dropped until after the final batched poll, so it accumulates
+    /// real ready()-call history across regions instead of starting fresh each time. All `n+1`
+    /// regions plus the final batch happen inside ONE external invocation, matching
+    /// video-harness `main`'s actual (pre-round-decomposition) reasoning-loop shape — not the
+    /// `advanceReasoningLoop()` self-scheduled-round shape of the refactor branch.
+    fn long_lived_timer_batched_with_fresh_rpc_after_n_regions(
+        &mut self,
+        n: u32,
+        counter_name: String,
+        promise_id: PromiseId,
+    ) -> Vec<u8>;
 }
 
 #[derive(Serialize, Deserialize)]
@@ -706,6 +728,100 @@ impl RpcCaller for RpcCallerImpl {
                 .get()
                 .expect("future-invoke-result B must have a result after ready()");
         });
+
+        blocking_await_promise(&promise_id)
+    }
+
+    fn long_lived_timer_batched_with_fresh_rpc_after_n_regions(
+        &mut self,
+        n: u32,
+        counter_name: String,
+        promise_id: PromiseId,
+    ) -> Vec<u8> {
+        use golem_rust::agentic::Schema;
+
+        // ~317-year duration, matching production's monotonic_clock::subscribe_duration
+        // pattern — created ONCE, before any region, and kept alive across all of them (unlike
+        // timer_race_multi_step, which creates+drops a fresh timer every cycle).
+        const NEAR_INFINITE_NANOS: u64 = 10_000_000_000_000_000_000;
+        let long_pollable =
+            golem_rust::wasip2::clocks::monotonic_clock::subscribe_duration(NEAR_INFINITE_NANOS);
+
+        for _ in 0..n {
+            atomically(|| {
+                let constructor_data = counter_name
+                    .clone()
+                    .to_data_value()
+                    .expect("Failed to encode constructor");
+                let wasm_rpc = WasmRpc::new("RpcCounter", &constructor_data, None, &[]);
+                let input = 1u64.to_data_value().expect("Failed to encode input");
+                let future = wasm_rpc.async_invoke_and_await("inc_by_slow", &input);
+                let pollable = future.subscribe();
+
+                // Exercise the long-lived timer's ready() alongside this region's own RPC
+                // pollable, accumulating real replay-relevant call history for it across
+                // regions — always false (the ~317-year duration never elapses).
+                let long_ready = long_pollable.ready();
+                assert!(
+                    !long_ready,
+                    "near-infinite timer pollable must never report ready on its own"
+                );
+
+                let first_ready = pollable.ready();
+                if !first_ready {
+                    let _ = golem_rust::wasip2::io::poll::poll(&[&pollable]);
+                    let confirmed = pollable.ready();
+                    assert!(
+                        confirmed,
+                        "future-invoke-result pollable must report ready immediately after \
+                         poll() unblocked"
+                    );
+                }
+                let _ = future
+                    .get()
+                    .expect("future-invoke-result must have a result after ready()");
+            });
+
+            // Production's interleaved yieldForSnapshot()-shaped promise round-trip between
+            // dispatches — same shape as sequential_atomic_double_ready_rpc_calls_then_await.
+            let yield_promise_id = create_promise();
+            complete_promise(&yield_promise_id, b"1");
+            blocking_await_promise(&yield_promise_id);
+        }
+
+        // Final region: batch the long-lived (still never-resolved) timer together with a
+        // FRESH RPC pollable in ONE poll() call — production's reps:[20,23] shape (the timer =
+        // rep 20 with n prior regions of ready() history, the fresh RPC pollable = rep 23).
+        atomically(|| {
+            let constructor_data = counter_name
+                .clone()
+                .to_data_value()
+                .expect("Failed to encode constructor");
+            let wasm_rpc = WasmRpc::new("RpcCounter", &constructor_data, None, &[]);
+            let input = 1u64.to_data_value().expect("Failed to encode input");
+            let future = wasm_rpc.async_invoke_and_await("inc_by_slow", &input);
+            let fresh_pollable = future.subscribe();
+
+            let mut fresh_ready = fresh_pollable.ready();
+            while !fresh_ready {
+                let ready_positions =
+                    golem_rust::wasip2::io::poll::poll(&[&long_pollable, &fresh_pollable]);
+                if ready_positions.contains(&0) {
+                    panic!(
+                        "BUG: the ~317-year timer pollable reported ready in the final batched \
+                         poll() after {n} prior regions of ready()-check history"
+                    );
+                }
+                if ready_positions.contains(&1) {
+                    fresh_ready = fresh_pollable.ready();
+                }
+            }
+            let _ = future
+                .get()
+                .expect("future-invoke-result must have a result after ready()");
+        });
+
+        drop(long_pollable);
 
         blocking_await_promise(&promise_id)
     }

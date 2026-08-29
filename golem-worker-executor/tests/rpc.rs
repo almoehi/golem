@@ -1740,6 +1740,128 @@ async fn concurrent_double_ready_rpc_calls_survives_cold_replay_after_suspend(
     Ok(())
 }
 
+/// Round fourteen-d: the one shape 14a/14b/14c did not cover. A single, long-lived timer
+/// pollable (near-infinite `monotonic_clock::subscribe_duration`, matching the Ninth capture's
+/// rep 20/seq 179: "timer-shaped, many-times-polled, never resolved") survives across 4 PRIOR
+/// sequential atomic RPC regions (accumulating real ready()-call history, unlike
+/// `timer_race_multi_step` which creates+drops a fresh timer every cycle) before finally being
+/// batched with a FRESH RPC pollable in one `poll()` call — production's `reps: [20, 23]` shape.
+/// All regions plus the final batch happen inside ONE external invocation, matching
+/// video-harness `main`'s actual (pre-round-decomposition) reasoning-loop shape, per the live
+/// capture confirming Finding B recurs specifically on `main`, not the round-decomposed
+/// refactor branch.
+#[test]
+#[tracing::instrument]
+async fn long_lived_timer_batched_with_fresh_rpc_survives_cold_replay(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("agent_rpc_rust")] agent_rpc_rust: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let component = executor
+        .component_dep(&context.default_environment_id, agent_rpc_rust)
+        .store()
+        .await?;
+
+    let agent_id = agent_id!("RpcCaller", "round14d-long-lived-timer-batched");
+    let worker_id = executor
+        .start_agent(&component.id, agent_id.clone())
+        .await?;
+
+    let promise_id_value = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_calls_then_promise_init",
+            data_value!(0u32),
+        )
+        .await?
+        .into_return_value()
+        .ok_or_else(|| anyhow::anyhow!("expected a PromiseId return value"))?;
+
+    let Value::Record(fields) = &promise_id_value else {
+        panic!("Expected a record for PromiseId");
+    };
+    let Value::U64(oplog_idx) = fields[1] else {
+        panic!("Expected a u64 for oplog_idx");
+    };
+    let promise_id = PromiseId {
+        agent_id: worker_id.clone(),
+        oplog_idx: OplogIndex::from_u64(oplog_idx),
+    };
+    let promise_id_vat = ValueAndType::new(promise_id_value, PromiseId::get_type());
+
+    // ONE invocation: 4 prior atomic regions building up the long-lived timer's ready()-call
+    // history, then a final region batching it with a fresh RPC pollable, then
+    // blocking_await_promise — all inside the same external invocation. Fire-and-forget since
+    // it will suspend on the promise.
+    executor
+        .invoke_agent(
+            &component,
+            &agent_id,
+            "long_lived_timer_batched_with_fresh_rpc_after_n_regions",
+            DataValue::Tuple(ElementValues {
+                elements: vec![
+                    ElementValue::ComponentModel(ComponentModelElementValue {
+                        value: 4u32.into_value_and_type(),
+                    }),
+                    ElementValue::ComponentModel(ComponentModelElementValue {
+                        value: "round14d_long_lived_timer_counter"
+                            .to_string()
+                            .into_value_and_type(),
+                    }),
+                    ElementValue::ComponentModel(ComponentModelElementValue {
+                        value: promise_id_vat,
+                    }),
+                ],
+            }),
+        )
+        .await?;
+
+    // 5 real inc_by_slow blocks (~150ms each = ~750ms) plus 4 interleaved promise round-trips
+    // must complete and be durably recorded — including the final batched poll() — BEFORE the
+    // cold restart below, so replay actually has to reconstruct the batched-poll oplog entries
+    // from scratch (the point of this test) instead of merely replaying the 4 prior
+    // single-pollable regions and finishing the final region live post-restart (confirmed via
+    // POLLCALL_TRACE: a 500ms sleep leaves the worker still mid-region-4 at restart time, so the
+    // batched poll only ever runs live, never through replay). 3s gives ~4x margin over the
+    // ~750ms of real blocking work.
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+
+    // Force a genuine worker eviction + full oplog replay from genesis on a fresh
+    // executor/instance — no snapshot policy configured, matching production's actual shape.
+    drop(executor);
+    let executor = start(deps, &context).await?;
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    executor
+        .complete_promise(&promise_id, b"resumed-ok".to_vec())
+        .await?;
+
+    executor
+        .wait_for_status(&worker_id, AgentStatus::Idle, Duration::from_secs(20))
+        .await?;
+
+    let followup = executor
+        .invoke_and_await_agent(&component, &agent_id, "test3", data_value!())
+        .await?
+        .into_return_value();
+    assert_eq!(
+        followup,
+        Some(Value::U64(1)),
+        "worker must remain genuinely functional after the cold replay of a long-lived timer \
+         pollable with 4 prior regions of ready()-call history, batched with a fresh RPC \
+         pollable in the final poll() — a trap here would reproduce Finding B (the Ninth \
+         capture's reps:[20,23] shape) in isolation"
+    );
+
+    Ok(())
+}
+
 /// Regression test for the root cause identified in the Eighth capture
 /// (`INVESTIGATION_SUMMARY.md`): `pollable_seq`'s `next_pollable_seq` counter must be recovered
 /// from the durable oplog on snapshot-based resume, not reset to 0 (fixed in

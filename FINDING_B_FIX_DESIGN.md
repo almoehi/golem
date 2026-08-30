@@ -1963,6 +1963,23 @@ this as the known-remaining gap.
 server or shared resource touched — offline analysis from
 `b2d8d571-scene_plates.oplog.fresh` plus source reading, per this phase's scope. Ready for review.
 
+**Post-implementation addendum — `blocking_read` shares `read`'s gap, found live.** Live-verifying §12's
+implementation against `workspace-smoketest`'s `character_sheet` agent (cold-restart, forced replay) showed
+the `check_write`/`write` fix working correctly — the agent made genuine further progress past the original
+trap, through a `reset`, into an entirely new `run()` invocation — but then hit a new, structurally
+identical trap further out: `expected io::poll::poll, got http::types::incoming_body_stream::blocking_read`,
+`begin_index: 2253`, `WriteRemoteBatched(Some(OplogIndex(2190)))`. `HttpTypesIncomingBodyStreamBlockingRead`
+is a separate `wasi:io/streams` host function from `HttpTypesIncomingBodyStreamRead` (blocking vs
+non-blocking read of the same incoming HTTP body stream) but was never brought into the stray-entry
+catalog — only `read()`'s non-blocking path was. Since both persist the identical `HostResponseStreamChunk`
+shape for the same begin_idx identity, fixed by widening `stray_entry_identity()` and
+`decode_and_cache_stray_entry()`'s existing `HttpTypesIncomingBodyStreamRead` arms to also match
+`HttpTypesIncomingBodyStreamBlockingRead` (sharing `StrayEntryIdentity::HttpStreamRead` and
+`pre_resolved_http_stream_chunk` — no new identity variant or cache needed), and giving
+`blocking_read()`'s replay branch (`io/streams.rs`) the same cache→scan→fallback shape `read()` already
+has. `skip`/`blocking_skip` were not touched — no live evidence for them yet, same bar as the rest of this
+document.
+
 Interaction with §12: independent captures, independent agents, but 13.7.2 proposes an invariant that
 governs the same call sites §12 is widening. If both land, §12's widened `is_stray` predicates should be
 paired with §13.7.2's bounded fallbacks rather than kept unconditional.

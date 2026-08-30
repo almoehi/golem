@@ -214,7 +214,13 @@ impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
                         },
                     )
                     .await
+            } else if let Some(cached) = self.state.take_pre_resolved_http_stream_chunk(begin_idx) {
+                // `read` and `blocking_read` share one identity/cache (FINDING_B_FIX_DESIGN.md
+                // §12 addendum) — a sibling stream's, or this same stream's other read variant's,
+                // stray-scan may already have consumed this entry on our behalf.
+                Ok(cached)
             } else {
+                consume_and_cache_stray_entries(self, begin_idx).await?;
                 durability.replay(self).await
             }?;
 

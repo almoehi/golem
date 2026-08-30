@@ -4342,8 +4342,14 @@ pub fn stray_entry_identity(entry: &OplogEntry) -> Option<StrayEntryIdentity> {
             ..
         } => Some(StrayEntryIdentity::InvokeResult(*seq)),
 
+        // `read` (non-blocking) and `blocking_read` are two separate wasi:io/streams host
+        // functions but persist the identical `HostResponseStreamChunk` shape for the same
+        // logical operation (consume the next available chunk of an incoming HTTP body) — share
+        // one identity and cache rather than doubling the stray-entry surface.
         OplogEntry::HostCall {
-            function_name: HostFunctionName::HttpTypesIncomingBodyStreamRead,
+            function_name:
+                HostFunctionName::HttpTypesIncomingBodyStreamRead
+                | HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
             durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
             ..
         } => Some(StrayEntryIdentity::HttpStreamRead(*begin_idx)),
@@ -5472,7 +5478,9 @@ impl PrivateDurableWorkerState {
                 Ok(())
             }
             OplogEntry::HostCall {
-                function_name: HostFunctionName::HttpTypesIncomingBodyStreamRead,
+                function_name:
+                    HostFunctionName::HttpTypesIncomingBodyStreamRead
+                    | HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
                 durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
                 response,
                 ..
@@ -5489,7 +5497,7 @@ impl PrivateDurableWorkerState {
                     agent_id = %self.owned_agent_id,
                     %begin_idx,
                     matched_oplog_index = %idx,
-                    "HTTPSTRAY_TRACE decode_and_cache_stray_entry: HttpTypesIncomingBodyStreamRead"
+                    "HTTPSTRAY_TRACE decode_and_cache_stray_entry: HttpTypesIncomingBodyStreamRead/BlockingRead"
                 );
                 self.record_pre_resolved_http_stream_chunk(begin_idx, payload);
                 Ok(())

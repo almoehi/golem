@@ -18,8 +18,10 @@ use crate::durable_host::http::inline_retry::{
     StatusRetryOutcome, take_http_background_retry_fallback, try_status_code_retry,
 };
 use crate::durable_host::http::{continue_http_request, end_http_request};
-use crate::durable_host::{Durability, DurabilityHost, DurableWorkerCtx, HttpRequestCloseOwner};
-use crate::get_oplog_entry;
+use crate::durable_host::{
+    Durability, DurabilityHost, DurableWorkerCtx, HttpRequestCloseOwner, IdentityNamespace,
+    StrayEntryIdentity,
+};
 use crate::services::HasWorker;
 use crate::services::oplog::{CommitLevel, OplogOps};
 use crate::workerctx::WorkerCtx;
@@ -30,7 +32,7 @@ use golem_common::model::oplog::host_functions::{
 use golem_common::model::oplog::types::{SerializableHttpResponse, SerializableResponseHeaders};
 use golem_common::model::oplog::{
     DurableFunctionType, HostPayloadPair, HostRequest, HostResponse,
-    HostResponseHttpFutureTrailersGet, HostResponseHttpResponse, OplogEntry, PersistenceLevel,
+    HostResponseHttpFutureTrailersGet, HostResponseHttpResponse, PersistenceLevel,
 };
 use golem_common::model::{NamedRetryPolicy, ScheduleId};
 use golem_service_base::error::worker_executor::WorkerExecutorError;
@@ -565,11 +567,14 @@ impl<Ctx: WorkerCtx> HostFutureTrailers for DurableWorkerCtx<Ctx> {
 
                 result
             } else {
-                let serialized: HostResponseHttpFutureTrailersGet =
-                    durability
-                        .replay(self)
-                        .await
-                        .map_err(wasmtime::Error::from)?;
+                // Shares the request's batch identity with the body streams, so it is reachable
+                // in exactly the same parked-cursor state (§15.7). `Ok(None)` is its own
+                // "nothing yet" arm — the answer the guest's reactor already knows how to
+                // handle — so it can wind the request down instead of trapping.
+                let serialized: HostResponseHttpFutureTrailersGet = durability
+                    .replay_or(self, HostResponseHttpFutureTrailersGet { result: Ok(None) })
+                    .await
+                    .map_err(wasmtime::Error::from)?;
                 let result = match serialized.result {
                     Ok(Some(Ok(Ok(None)))) => Ok(Some(Ok(Ok(None)))),
                     Ok(Some(Ok(Ok(Some(serialized_trailers))))) => {
@@ -1206,42 +1211,95 @@ impl<Ctx: WorkerCtx> HostFutureIncomingResponse for DurableWorkerCtx<Ctx> {
             )
             .into())
         } else {
-            // Propagate WorkerExecutorError via `?` (From) so the downcast
-            // survives the wasmtime::Error chain — TrapType::from_error
-            // classifies UnexpectedOplogEntry as non-retriable.
-            let (_, oplog_entry) = get_oplog_entry!(self.state.replay_state, OplogEntry::HostCall)?;
+            // This is the completion-fetch of a genuinely concurrent operation: a
+            // `Promise.all` over N `fetch()`es puts N of these in flight at once, and two
+            // concurrent requests' entries share BOTH their `function_name` and their response
+            // shape. An unconditional positional read therefore does not trap on a mis-ordered
+            // pair — it silently hands request A the headers/status recorded for request B
+            // (FINDING_B_FIX_DESIGN.md §14.2.1, the strongest latent gap the §14 census found).
+            //
+            // Resolve this call's own identity first, exactly as every `Durability`-based
+            // consumer now does inside `Durability::replay_raw`. This call site is the one that
+            // never used `Durability` at all, so it is wired up by hand rather than inheriting
+            // it. `open_http_requests` is populated on the replay path that re-executes
+            // `handle()`; when it is not (post-snapshot-restore mid-request), no batch is
+            // registered either, so the mechanism correctly stays out of the way and the
+            // original unconditional read is used unchanged.
+            let my_identity = self
+                .state
+                .open_http_requests
+                .get(&handle)
+                .map(|request_state| {
+                    StrayEntryIdentity::new(
+                        HttpTypesFutureIncomingResponseGet::HOST_FUNCTION_NAME,
+                        IdentityNamespace::Batch(request_state.begin_index),
+                    )
+                });
 
-            let serialized_response = match oplog_entry {
-                OplogEntry::HostCall { response, .. } => {
-                    let response = self
-                        .state
-                        .oplog
-                        .download_payload(response)
-                        .await
-                        .map_err(|err| {
-                            WorkerExecutorError::runtime(format!(
-                                "failed to download http::types::future_incoming_response::get oplog payload: {err}"
-                            ))
-                        })?;
-                    match response {
-                        HostResponse::HttpResponse(response) => response.response,
-                        other => {
+            let cached = match &my_identity {
+                Some(identity) => match self.state.take_pre_resolved_stray(identity) {
+                    // A sibling operation's scan already consumed this entry on our behalf —
+                    // the oplog has nothing left to find, the cache is authoritative.
+                    Some(cached) => Some(cached),
+                    None => {
+                        // Defer past entries belonging to OTHER tracked operations, caching
+                        // each for its owner, before reading what is left.
+                        self.state
+                            .consume_and_cache_stray_entries(Some(identity.clone()))
+                            .await?;
+                        None
+                    }
+                },
+                None => None,
+            };
+
+            let host_response = match cached {
+                Some(cached) => cached,
+                None => {
+                    // The stray scan above stops at the first entry it does not recognize, and a
+                    // structural entry — in particular the `EndRemoteWrite` closing this very
+                    // request's batch — is exactly that, so a scan that clears the batch's whole
+                    // remaining run parks the cursor on one. This is not hypothetical: it is the
+                    // live trap in FINDING_B_FIX_DESIGN.md §15.5, where this call (the reactor
+                    // re-polling an already-resolved response future, so every entry recorded for
+                    // it had already been handed out) consumed the `EndRemoteWrite` and reported
+                    // "expected OplogEntry::HostCall, got EndRemoteWrite".
+                    //
+                    // The `try_` read leaves such an entry in place for `end_function`, its real
+                    // owner. Propagate WorkerExecutorError via `?` (From) so the downcast
+                    // survives the wasmtime::Error chain — TrapType::from_error classifies
+                    // UnexpectedOplogEntry as non-retriable.
+                    match self
+                        .try_read_persisted_durable_function_invocation()
+                        .await?
+                    {
+                        Some(invocation) => invocation.into_response(),
+                        // Nothing of ours at the cursor. `get()` has a legal "not yet" answer and
+                        // the guest's reactor is built to re-poll on it, so report pending rather
+                        // than trapping — §13.7.2's non-destructive-miss rule, which
+                        // `poll()`/`ready()`/RPC `get()` already follow.
+                        None if my_identity.is_some() => return Ok(None),
+                        // With no identity of our own (post-snapshot-restore mid-request) nothing
+                        // defers our entries out from under us, so a miss there is a genuine
+                        // mismatch and must still be reported.
+                        None => {
                             return Err(wasmtime::Error::from(
                                 WorkerExecutorError::unexpected_oplog_entry(
-                                    "HostResponse::HttpResponse",
-                                    format!("{other:?}"),
+                                    "OplogEntry::HostCall",
+                                    "a non-HostCall entry at the replay cursor (left unconsumed)",
                                 ),
                             ));
                         }
                     }
                 }
-                // The macro above already guarantees `OplogEntry::HostCall`, so
-                // this arm is structurally unreachable. We still return an
-                // error rather than panicking to keep the function panic-free.
+            };
+
+            let serialized_response = match host_response {
+                HostResponse::HttpResponse(response) => response.response,
                 other => {
                     return Err(wasmtime::Error::from(
                         WorkerExecutorError::unexpected_oplog_entry(
-                            "OplogEntry::HostCall",
+                            "HostResponse::HttpResponse",
                             format!("{other:?}"),
                         ),
                     ));

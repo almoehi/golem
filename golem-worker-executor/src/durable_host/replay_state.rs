@@ -290,13 +290,17 @@ impl ReplayState {
     /// operations doesn't have to match the guest's replayed structural check order. Callers
     /// decide what "stray" means (via `is_stray`) and what to do with one (via `on_stray`); this
     /// function only knows how to walk forward and consume matches.
+    ///
+    /// `is_stray` is `FnMut` so a caller may bound the walk with per-scan state if it ever needs
+    /// to; `StrayEntryScan`, the only caller, deliberately does not — see its doc comment for
+    /// why a per-identity occurrence bound strands entries rather than protecting anything.
     pub async fn consume_stray_entries(
         &mut self,
-        is_stray: impl Fn(&OplogEntry) -> bool,
+        mut is_stray: impl FnMut(&OplogEntry) -> bool,
         mut on_stray: impl FnMut(OplogIndex, OplogEntry),
     ) -> Result<(), WorkerExecutorError> {
         loop {
-            match self.try_get_oplog_entry(&is_stray).await? {
+            match self.try_get_oplog_entry(&mut is_stray).await? {
                 Some((idx, entry)) => on_stray(idx, entry),
                 None => return Ok(()),
             }
@@ -739,13 +743,18 @@ pub enum OplogEntryLookupResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durable_host::{
+        IdentityNamespace, PreResolvedStrayCache, StrayEntryIdentity, StrayEntryScan,
+        TrackedConcurrentOpSeqs, is_own_invoke_result_entry, is_own_poll_entry,
+        stray_entry_identity,
+    };
     use crate::services::oplog::CommitLevel;
     use async_trait::async_trait;
     use golem_common::model::component::ComponentId;
     use golem_common::model::environment::EnvironmentId;
-    use golem_common::model::oplog::{PayloadId, RawOplogPayload};
+    use golem_common::model::oplog::{DurableFunctionType, PayloadId, RawOplogPayload};
     use golem_common::model::{AgentId, Timestamp};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     use std::fmt::{Debug, Formatter};
     use std::sync::Mutex;
     use std::time::Duration;
@@ -954,9 +963,7 @@ mod tests {
         let io_poll_ready = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollReady,
-            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
-                HostRequestNoInput {},
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
                 HostResponsePollReady { result: Ok(true) },
             ))),
@@ -1015,9 +1022,9 @@ mod tests {
         let io_poll_poll = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollPoll,
-            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
-                HostRequestPollCount { count: 1 },
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(HostRequestPollCount {
+                count: 1,
+            }))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
                 HostResponsePollResult {
                     result: Ok(vec![0]),
@@ -1113,12 +1120,12 @@ mod tests {
     /// consumes `HttpTypesOutgoingBodyStreamCheckWrite` entries.
     #[test]
     async fn try_get_oplog_entry_matches_http_outgoing_check_write() {
+        use golem_common::model::oplog::host_functions::HostFunctionName;
+        use golem_common::model::oplog::types::SerializableHttpMethod;
         use golem_common::model::oplog::{
             DurableFunctionType, HostRequest, HostRequestHttpRequest, HostResponse,
             HostResponseStreamCheckWrite, OplogPayload,
         };
-        use golem_common::model::oplog::host_functions::HostFunctionName;
-        use golem_common::model::oplog::types::{SerializableHttpMethod};
         use std::collections::HashMap;
 
         let agent_id = AgentId {
@@ -1188,11 +1195,11 @@ mod tests {
     /// remain unconsumed for `poll()`'s normal replay path.
     #[test]
     async fn try_get_oplog_entry_does_not_match_io_poll_poll_for_check_write_predicate() {
+        use golem_common::model::oplog::host_functions::HostFunctionName;
         use golem_common::model::oplog::{
             DurableFunctionType, HostRequest, HostRequestPollCount, HostResponse,
             HostResponsePollResult, OplogPayload,
         };
-        use golem_common::model::oplog::host_functions::HostFunctionName;
 
         let agent_id = AgentId {
             component_id: ComponentId::new(),
@@ -1202,9 +1209,9 @@ mod tests {
         let poll_entry = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollPoll,
-            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
-                HostRequestPollCount { count: 1 },
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(HostRequestPollCount {
+                count: 1,
+            }))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
                 HostResponsePollResult {
                     result: Ok(vec![0]),
@@ -1282,9 +1289,7 @@ mod tests {
         let io_poll_ready_for_p_stream = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollReady,
-            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
-                HostRequestNoInput {},
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
                 HostResponsePollReady { result: Ok(true) },
             ))),
@@ -1370,9 +1375,7 @@ mod tests {
         let pre_snapshot_ready = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollReady,
-            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
-                HostRequestNoInput {},
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
                 HostResponsePollReady { result: Ok(true) },
             ))),
@@ -1381,9 +1384,7 @@ mod tests {
         let post_snapshot_ready = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollReady,
-            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
-                HostRequestNoInput {},
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
                 HostResponsePollReady { result: Ok(true) },
             ))),
@@ -1413,10 +1414,11 @@ mod tests {
         ])));
 
         let last_snapshot_index = OplogIndex::from_u64(4);
-        let skipped_regions = DeletedRegionsBuilder::from_regions(vec![
-            OplogRegion::from_index_range(OplogIndex::INITIAL.next()..=last_snapshot_index),
-        ])
-        .build();
+        let skipped_regions =
+            DeletedRegionsBuilder::from_regions(vec![OplogRegion::from_index_range(
+                OplogIndex::INITIAL.next()..=last_snapshot_index,
+            )])
+            .build();
 
         let mut state = ReplayState::new(
             OwnedAgentId::new(EnvironmentId::new(), &agent_id),
@@ -1475,9 +1477,7 @@ mod tests {
         let io_poll_ready_for_p_stream = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollReady,
-            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
-                HostRequestNoInput {},
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
                 HostResponsePollReady { result: Ok(true) },
             ))),
@@ -1651,9 +1651,7 @@ mod tests {
         let io_poll_ready = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollReady,
-            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
-                HostRequestNoInput {},
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
                 HostResponsePollReady { result: Ok(true) },
             ))),
@@ -1662,9 +1660,9 @@ mod tests {
         let io_poll_poll = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollPoll,
-            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
-                HostRequestPollCount { count: 1 },
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(HostRequestPollCount {
+                count: 1,
+            }))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
                 HostResponsePollResult {
                     result: Ok(vec![0]),
@@ -1765,11 +1763,13 @@ mod tests {
         let genuine = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollPoll,
-            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
-                HostRequestPollCount { count: 2 },
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(HostRequestPollCount {
+                count: 2,
+            }))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
-                HostResponsePollResult { result: Ok(vec![0]) },
+                HostResponsePollResult {
+                    result: Ok(vec![0]),
+                },
             ))),
             durable_function_type: DurableFunctionType::ReadLocal,
         };
@@ -1859,11 +1859,13 @@ mod tests {
         let genuine = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollPoll,
-            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
-                HostRequestPollCount { count: 1 },
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(HostRequestPollCount {
+                count: 1,
+            }))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
-                HostResponsePollResult { result: Ok(vec![0]) },
+                HostResponsePollResult {
+                    result: Ok(vec![0]),
+                },
             ))),
             durable_function_type: DurableFunctionType::ReadLocal,
         };
@@ -1914,7 +1916,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(genuine_found.is_some(), "poll()'s entry must remain, untouched");
+        assert!(
+            genuine_found.is_some(),
+            "poll()'s entry must remain, untouched"
+        );
     }
 
     /// "Before" half of the bidirectional falsification for the Eleventh capture: reproduces
@@ -1930,11 +1935,11 @@ mod tests {
     /// fallback.
     #[test]
     async fn old_unconditional_consume_would_have_hit_eleventh_capture_mismatch() {
+        use golem_common::model::oplog::types::SerializableInvokeResult;
         use golem_common::model::oplog::{
             DurableFunctionType, HostRequest, HostRequestNoInput, HostResponse,
             HostResponseGolemRpcInvokeGet, OplogPayload,
         };
-        use golem_common::model::oplog::types::SerializableInvokeResult;
 
         let agent_id = AgentId {
             component_id: ComponentId::new(),
@@ -1988,6 +1993,1193 @@ mod tests {
              golem::rpc::future-invoke-result::get) — exactly the defect the widened \
              is_stray_concurrent_entry mechanism (durable_host/mod.rs) fixes by checking \
              identity FIRST, before ever reaching this unconditional read"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // FINDING_B_FIX_DESIGN.md §12 / §13 regressions
+    // ---------------------------------------------------------------------------------------
+
+    fn noop_entry() -> OplogEntry {
+        OplogEntry::NoOp {
+            timestamp: Timestamp::now_utc(),
+        }
+    }
+
+    fn rpc_invoke_get_entry(seq: u32) -> OplogEntry {
+        use golem_common::model::oplog::types::SerializableInvokeResult;
+        use golem_common::model::oplog::{
+            HostRequest, HostRequestNoInput, HostResponse, HostResponseGolemRpcInvokeGet,
+            OplogPayload,
+        };
+        OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
+            response: OplogPayload::Inline(Box::new(HostResponse::GolemRpcInvokeGet(
+                HostResponseGolemRpcInvokeGet {
+                    result: SerializableInvokeResult::Pending,
+                },
+            ))),
+            durable_function_type: DurableFunctionType::WriteRemoteConcurrent(seq),
+        }
+    }
+
+    fn finish_span_entry() -> OplogEntry {
+        OplogEntry::FinishSpan {
+            timestamp: Timestamp::now_utc(),
+            span_id: golem_common::model::invocation_context::SpanId::generate(),
+        }
+    }
+
+    fn outgoing_check_write_entry(begin_idx: OplogIndex) -> OplogEntry {
+        use golem_common::model::oplog::{
+            HostRequest, HostRequestNoInput, HostResponse, HostResponseStreamCheckWrite,
+            OplogPayload,
+        };
+        OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
+            response: OplogPayload::Inline(Box::new(HostResponse::StreamCheckWrite(
+                HostResponseStreamCheckWrite {
+                    result: Ok(1048576),
+                },
+            ))),
+            durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
+        }
+    }
+
+    fn outgoing_write_entry(begin_idx: OplogIndex) -> OplogEntry {
+        use golem_common::model::oplog::{
+            HostRequest, HostRequestNoInput, HostResponse, HostResponseStreamWriteWithBytes,
+            OplogPayload,
+        };
+        OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::HttpTypesOutgoingBodyStreamWrite,
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
+            response: OplogPayload::Inline(Box::new(HostResponse::StreamWriteWithBytes(
+                HostResponseStreamWriteWithBytes { result: Ok(vec![]) },
+            ))),
+            durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
+        }
+    }
+
+    fn poll_entry() -> OplogEntry {
+        use golem_common::model::oplog::{
+            HostRequest, HostRequestPollCount, HostResponse, HostResponsePollResult, OplogPayload,
+        };
+        OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::IoPollPoll,
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(HostRequestPollCount {
+                count: 2,
+            }))),
+            response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
+                HostResponsePollResult {
+                    result: Ok(vec![0]),
+                },
+            ))),
+            durable_function_type: DurableFunctionType::ReadLocal,
+        }
+    }
+
+    async fn replay_state_over(entries: Vec<OplogEntry>) -> ReplayState {
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+        // ReplayState::new() consumes OplogIndex::INITIAL, so entries start at INITIAL.next().
+        let mut map = BTreeMap::from([(OplogIndex::INITIAL, noop_entry())]);
+        let mut idx = OplogIndex::INITIAL;
+        for entry in entries {
+            idx = idx.next();
+            map.insert(idx, entry);
+        }
+        ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            Arc::new(MutableBatchOplog::new(map)),
+            DeletedRegions::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Thirteenth capture, verbatim (FINDING_B_FIX_DESIGN.md §13.5): a `get()` whose own
+    /// `invoke_result_seq` drifted between live and replay classifies its OWN entry as a
+    /// sibling's stray and consumes it — leaving the cursor on the region's `FinishSpan`.
+    ///
+    /// Before §13.7.2, `get()`'s fallback was an unconditional
+    /// `get_oplog_entry!(.., OplogEntry::HostCall)`, which consumed that `FinishSpan` and only
+    /// then failed with "expected OplogEntry :: HostCall |, got FinishSpan" — permanent, since
+    /// every retry replays identically. With the predicate read, the `FinishSpan` survives
+    /// untouched and `get()` reports Pending, i.e. the drift degrades to one extra guest loop.
+    #[test]
+    async fn get_replay_leaves_finish_span_when_invoke_result_seq_drifts() {
+        let seq_live = 5u32;
+        let seq_replay = 6u32;
+        let mut state =
+            replay_state_over(vec![rpc_invoke_get_entry(seq_live), finish_span_entry()]).await;
+
+        // The stray-scan misclassifies the caller's own entry (identity drift) and consumes it.
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::InvokeResult(
+                seq_live,
+            )]));
+        let exclude = StrayEntryIdentity::new(
+            HostFunctionName::GolemRpcFutureInvokeResultGet,
+            IdentityNamespace::InvokeResult(seq_replay),
+        );
+        let scan = StrayEntryScan::new(tracked, Some(exclude));
+        let mut consumed = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| consumed.push((idx, e)))
+            .await
+            .unwrap();
+        assert_eq!(
+            consumed.len(),
+            1,
+            "the drifted-identity entry is consumed as a stray — this is the precondition the \
+             hardening must survive, not something it prevents"
+        );
+
+        // get()'s hardened fallback: predicate read on its OWN identity.
+        let peeked = state
+            .try_get_oplog_entry(|e| is_own_invoke_result_entry(e, seq_replay))
+            .await
+            .unwrap();
+        assert!(
+            peeked.is_none(),
+            "a FinishSpan must never satisfy get()'s own-identity predicate"
+        );
+
+        // ... and the structural entry is still there for whoever legitimately consumes it.
+        let survivor = state
+            .try_get_oplog_entry(|e| matches!(e, OplogEntry::FinishSpan { .. }))
+            .await
+            .unwrap();
+        assert!(
+            survivor.is_some(),
+            "the FinishSpan must survive the predicate read — consuming it is the defect"
+        );
+    }
+
+    /// Happy path must be byte-identical: when identity matches, the predicate read consumes
+    /// exactly what the old unconditional read consumed.
+    #[test]
+    async fn get_replay_consumes_its_own_tagged_entry() {
+        let mut state = replay_state_over(vec![rpc_invoke_get_entry(5), finish_span_entry()]).await;
+        let peeked = state
+            .try_get_oplog_entry(|e| is_own_invoke_result_entry(e, 5))
+            .await
+            .unwrap();
+        assert!(peeked.is_some());
+    }
+
+    /// Legacy oplogs recorded before per-call tagging carry `WriteRemote` and no identity —
+    /// they must keep being consumed positionally, unchanged.
+    #[test]
+    async fn get_replay_consumes_legacy_untagged_entry() {
+        let legacy = match rpc_invoke_get_entry(0) {
+            OplogEntry::HostCall {
+                timestamp,
+                function_name,
+                request,
+                response,
+                ..
+            } => OplogEntry::HostCall {
+                timestamp,
+                function_name,
+                request,
+                response,
+                durable_function_type: DurableFunctionType::WriteRemote,
+            },
+            other => other,
+        };
+        let mut state = replay_state_over(vec![legacy]).await;
+        let peeked = state
+            .try_get_oplog_entry(|e| is_own_invoke_result_entry(e, 12345))
+            .await
+            .unwrap();
+        assert!(
+            peeked.is_some(),
+            "untagged legacy entries must still be consumed regardless of the caller's seq"
+        );
+    }
+
+    /// Twelfth capture (§12): an outgoing-body `check_write` entry sitting where `poll()`'s own
+    /// `IoPollPoll` entry was expected. `poll()`'s scan must now recognize and consume it (with
+    /// its `write` partner), and `poll()`'s own entry must survive to be read normally.
+    #[test]
+    async fn poll_replay_defers_to_stray_outgoing_body_write_entries() {
+        let begin_idx = OplogIndex::from_u64(42);
+        let mut state = replay_state_over(vec![
+            outgoing_check_write_entry(begin_idx),
+            outgoing_write_entry(begin_idx),
+            poll_entry(),
+        ])
+        .await;
+
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::Batch(begin_idx)]));
+        let scan = StrayEntryScan::new(tracked, None);
+        let mut consumed = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| consumed.push((idx, e)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            consumed.len(),
+            2,
+            "both halves of the per-chunk write protocol must be recognized"
+        );
+        let peeked = state.try_get_oplog_entry(is_own_poll_entry).await.unwrap();
+        assert!(
+            peeked.is_some(),
+            "poll()'s own entry must be reachable once the strays are out of the way"
+        );
+    }
+
+    /// FINDING_B_FIX_DESIGN.md §15, at the real replay cursor: a multi-chunk body records
+    /// `check_write`/`write` pairs for the SAME request back to back, so one identity repeats.
+    /// The scan must walk the WHOLE cluster — the earlier one-entry-per-identity bound stopped
+    /// at the second occurrence and stranded it at the cursor, where `poll()` (which has no way
+    /// to consume someone else's stream entry) trapped on it.
+    #[test]
+    async fn stray_scan_walks_every_occurrence_of_a_repeated_identity() {
+        let begin_idx = OplogIndex::from_u64(42);
+        let mut state = replay_state_over(vec![
+            outgoing_check_write_entry(begin_idx),
+            outgoing_write_entry(begin_idx),
+            outgoing_check_write_entry(begin_idx),
+            outgoing_write_entry(begin_idx),
+            poll_entry(),
+        ])
+        .await;
+
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::Batch(begin_idx)]));
+        let scan = StrayEntryScan::new(tracked, None);
+        let mut consumed = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| consumed.push((idx, e)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            consumed.len(),
+            4,
+            "every occurrence must be deferred — anything left behind is unreachable"
+        );
+        assert!(
+            state
+                .try_get_oplog_entry(is_own_poll_entry)
+                .await
+                .unwrap()
+                .is_some(),
+            "poll()'s own entry must be reachable once the entire cluster is out of the way"
+        );
+    }
+
+    /// The exact live capture behind FINDING_B_FIX_DESIGN.md §15
+    /// (`WorkerAgent("workspace-smoketest@1.0", "...@character_sheet")`, oplog `#02254`/`#02255`):
+    /// TWO `blocking_read()` entries on ONE incoming body stream — same `(function_name,
+    /// namespace)` identity, back to back — followed by the `poll()` entry that trapped with
+    /// `expected io::poll::poll, got http::types::incoming_body_stream::blocking_read`.
+    ///
+    /// Asserts CONTENT, not merely "no crash": the two calls must get their own respective
+    /// chunks, in order. A wrong-slot bug would be a silent misdelivery (§14.2.1's failure
+    /// mode), which a crash-only assertion would not catch.
+    #[test]
+    async fn two_blocking_reads_on_one_stream_each_replay_to_their_own_answer() {
+        use golem_common::model::oplog::{HostResponse, HostResponseStreamChunk};
+        let begin_idx = OplogIndex::from_u64(2190);
+        let chunk = |bytes: &[u8]| {
+            batched_entry(
+                HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+                begin_idx,
+                HostResponse::StreamChunk(HostResponseStreamChunk {
+                    result: Ok(bytes.to_vec()),
+                }),
+            )
+        };
+        let mut state =
+            replay_state_over(vec![chunk(b"first"), chunk(b"second"), poll_entry()]).await;
+
+        // poll() scans with no identity of its own to exclude.
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::Batch(begin_idx)]));
+        let scan = StrayEntryScan::new(tracked, None);
+        let mut consumed = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| consumed.push((idx, e)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            consumed.len(),
+            2,
+            "BOTH blocking_read entries must be deferred; stranding #02255 is the bug"
+        );
+
+        // Cache them exactly as `decode_and_cache_stray_entry` does, then hand them back to the
+        // owner in call order — the two halves must agree on which occurrence is which.
+        let identity = StrayEntryIdentity::new(
+            HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+            IdentityNamespace::Batch(begin_idx),
+        );
+        let mut cache = PreResolvedStrayCache::default();
+        for (_, entry) in consumed {
+            assert_eq!(stray_entry_identity(&entry).as_ref(), Some(&identity));
+            let OplogEntry::HostCall { response, .. } = entry else {
+                unreachable!()
+            };
+            let golem_common::model::oplog::OplogPayload::Inline(boxed) = response else {
+                unreachable!("test entries are built inline")
+            };
+            cache.record(identity.clone(), *boxed);
+        }
+        for expected in [b"first".to_vec(), b"second".to_vec()] {
+            let taken: HostResponseStreamChunk = cache
+                .take(&identity)
+                .expect("an answer is waiting for this call")
+                .try_into()
+                .expect("narrows to blocking_read's own response type");
+            assert_eq!(taken.result, Ok(expected));
+        }
+        assert!(cache.take(&identity).is_none());
+
+        // ... and poll()'s own entry is now reachable, which is what used to trap.
+        assert!(
+            state
+                .try_get_oplog_entry(is_own_poll_entry)
+                .await
+                .unwrap()
+                .is_some(),
+            "poll() must find its own entry, not the stranded second blocking_read"
+        );
+    }
+
+    /// The `EndRemoteWrite` that closes a batch — the structural entry that immediately follows
+    /// a body-stream cluster, carrying a `begin_index: OplogIndex` field of the very same shape
+    /// and value as the identity namespace the cluster's entries are keyed by
+    /// (`Batch(OplogIndex)`). Superficially "matching" that field is exactly the confusion the
+    /// tests below rule out.
+    fn end_remote_write_entry(begin_index: OplogIndex) -> OplogEntry {
+        OplogEntry::EndRemoteWrite {
+            timestamp: Timestamp::now_utc(),
+            begin_index,
+        }
+    }
+
+    /// FINDING_B_FIX_DESIGN.md §15.5, recognition half: a cluster of exactly two same-identity
+    /// entries followed by the batch's own `EndRemoteWrite`. The scan must drain both entries
+    /// and STOP at the structural one, never consuming it — even though that entry carries a
+    /// `begin_index` field holding the identical `OplogIndex` the cluster is keyed by.
+    #[test]
+    async fn a_structural_entry_closing_the_batch_is_never_consumed_by_a_scan() {
+        use golem_common::model::oplog::{HostResponse, HostResponseStreamChunk};
+        let begin_idx = OplogIndex::from_u64(2190);
+        let read = |bytes: &[u8]| {
+            batched_entry(
+                HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+                begin_idx,
+                HostResponse::StreamChunk(HostResponseStreamChunk {
+                    result: Ok(bytes.to_vec()),
+                }),
+            )
+        };
+        let mut state = replay_state_over(vec![
+            read(b"body"),
+            read(b""),
+            end_remote_write_entry(begin_idx),
+        ])
+        .await;
+
+        // Identity derivation must reject the structural entry outright — it is not a HostCall,
+        // so it has no identity at all, regardless of its begin_index.
+        assert_eq!(
+            stray_entry_identity(&end_remote_write_entry(begin_idx)),
+            None
+        );
+
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::Batch(begin_idx)]));
+        let scan = StrayEntryScan::new(tracked, None);
+        let mut consumed = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| consumed.push((idx, e)))
+            .await
+            .unwrap();
+
+        assert_eq!(consumed.len(), 2, "both reads defer, the marker does not");
+        let survivor = state
+            .try_get_oplog_entry(|e| matches!(e, OplogEntry::EndRemoteWrite { .. }))
+            .await
+            .unwrap();
+        assert!(
+            survivor.is_some(),
+            "EndRemoteWrite must still be at the cursor for end_function, its real owner"
+        );
+    }
+
+    /// §15.5, consumption half — the actual live trap. After the scan clears the cluster the
+    /// cursor sits on `EndRemoteWrite`, and the post-scan read must REFUSE it non-destructively.
+    /// The unconditional `get_oplog_entry!(.., OplogEntry::HostCall)` used before consumed it and
+    /// only then reported "expected OplogEntry::HostCall, got EndRemoteWrite", destroying the
+    /// engine's region bookkeeping and making the failure permanent instead of retriable.
+    #[test]
+    async fn a_post_scan_read_refuses_a_structural_entry_without_consuming_it() {
+        use golem_common::model::oplog::{HostResponse, HostResponseStreamChunk};
+        let begin_idx = OplogIndex::from_u64(2190);
+        let mut state = replay_state_over(vec![
+            batched_entry(
+                HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+                begin_idx,
+                HostResponse::StreamChunk(HostResponseStreamChunk { result: Ok(vec![]) }),
+            ),
+            end_remote_write_entry(begin_idx),
+        ])
+        .await;
+
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::Batch(begin_idx)]));
+        let scan = StrayEntryScan::new(tracked, None);
+        state
+            .consume_stray_entries(|e| scan.accept(e), |_, _| {})
+            .await
+            .unwrap();
+
+        // BEFORE (the bug): `get_oplog_entry!` expands to `get_oplog_entry()`, i.e.
+        // `try_get_oplog_entry(|_| true)`. Reproduced here against the real primitive to pin
+        // what the old post-scan read did — it CONSUMES the structural entry, and the caller's
+        // "expected HostCall, got EndRemoteWrite" is reported only afterwards, too late.
+        // (`poll_entry` is only a trailing sentinel so the cursor stays inside the replay target
+        // after the destructive read; nothing about it matters beyond being a later entry.)
+        let mut destructive =
+            replay_state_over(vec![end_remote_write_entry(begin_idx), poll_entry()]).await;
+        let (_, eaten) = destructive.get_oplog_entry().await.unwrap();
+        assert!(
+            matches!(eaten, OplogEntry::EndRemoteWrite { .. }),
+            "the unconditional read consumes whatever sits at the cursor — the defect"
+        );
+        assert!(
+            destructive
+                .try_get_oplog_entry(|e| matches!(e, OplogEntry::EndRemoteWrite { .. }))
+                .await
+                .unwrap()
+                .is_none(),
+            "and it is gone: end_function can never find it again"
+        );
+
+        // AFTER (the fix): the same read, guarded by the predicate
+        // `try_read_persisted_durable_function_invocation` and
+        // `future_incoming_response::get`'s replay both now use.
+        let attempt = state
+            .try_get_oplog_entry(|entry| matches!(entry, OplogEntry::HostCall { .. }))
+            .await
+            .unwrap();
+        assert!(
+            attempt.is_none(),
+            "a HostCall-only read must not match EndRemoteWrite"
+        );
+
+        // ... and crucially, the refusal left the cursor untouched.
+        let survivor = state
+            .try_get_oplog_entry(|e| matches!(e, OplogEntry::EndRemoteWrite { .. }))
+            .await
+            .unwrap();
+        assert!(
+            survivor.is_some(),
+            "the refused entry must survive for end_function; consuming it is the §15.5 bug"
+        );
+    }
+
+    /// Generalization of the above beyond `EndRemoteWrite`: any non-`HostCall` variant that can
+    /// follow a cluster must be refused identically. `FinishSpan` (the entry immediately after
+    /// `EndRemoteWrite` in the live capture) has no `begin_index` at all, `EndAtomicRegion` has
+    /// one — neither may be consumed by a HostCall read.
+    #[test]
+    async fn every_structural_variant_is_refused_by_a_host_call_read() {
+        let begin_idx = OplogIndex::from_u64(2190);
+        for structural in [
+            end_remote_write_entry(begin_idx),
+            finish_span_entry(),
+            OplogEntry::EndAtomicRegion {
+                timestamp: Timestamp::now_utc(),
+                begin_index: begin_idx,
+            },
+        ] {
+            assert_eq!(
+                stray_entry_identity(&structural),
+                None,
+                "{structural:?} must carry no stray identity"
+            );
+            let mut state = replay_state_over(vec![structural.clone()]).await;
+            let attempt = state
+                .try_get_oplog_entry(|entry| matches!(entry, OplogEntry::HostCall { .. }))
+                .await
+                .unwrap();
+            assert!(
+                attempt.is_none(),
+                "{structural:?} must not satisfy a HostCall read"
+            );
+        }
+    }
+
+    /// FINDING_B_FIX_DESIGN.md §15.6 — the livelock, as the exact live call sequence.
+    ///
+    /// After a scan clears a batch's whole entry run the cursor sits on that batch's
+    /// `EndRemoteWrite`. Three consumers then peek it back to back — `ready()`'s seq predicate,
+    /// `poll()`'s own-entry predicate, and (when the miss bound trips) `poll()`'s fallback
+    /// host-call read — each of which MUST refuse it, MUST leave the cursor unmoved, and none of
+    /// which can ever claim it: its owner is `end_function`, driven by guest control flow.
+    ///
+    /// This is the pattern behind the trace `peeked 2256 EndRemoteWrite matched: false` ×3
+    /// followed by a trap. The three refusals are correct; what was wrong was giving up after
+    /// them. The test pins both halves: all three predicates refuse non-destructively, and the
+    /// entry survives every one of them for its real owner.
+    #[test]
+    async fn ready_then_poll_both_refuse_a_parked_structural_entry_without_consuming_it() {
+        use golem_common::model::oplog::{HostResponse, HostResponseStreamChunk};
+        let begin_idx = OplogIndex::from_u64(2190);
+        let pollable_seq = 503u32;
+
+        // The live window: two same-identity blocking_reads, then the batch's EndRemoteWrite.
+        let read = |bytes: &[u8]| {
+            batched_entry(
+                HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+                begin_idx,
+                HostResponse::StreamChunk(HostResponseStreamChunk {
+                    result: Ok(bytes.to_vec()),
+                }),
+            )
+        };
+        let mut state = replay_state_over(vec![
+            read(b"body"),
+            read(b""),
+            end_remote_write_entry(begin_idx),
+        ])
+        .await;
+
+        // A scan (poll()'s, with no identity of its own) clears the run and parks the cursor.
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::Batch(begin_idx)]));
+        let scan = StrayEntryScan::new(tracked, None);
+        let mut drained = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| drained.push((idx, e)))
+            .await
+            .unwrap();
+        assert_eq!(drained.len(), 2, "both reads defer; the marker stays");
+
+        // Peek 1 — ready()'s seq predicate, and the `cursor_is_host_call` capture it now makes.
+        let mut ready_saw_host_call = true;
+        let ready_peek = state
+            .try_get_oplog_entry(|entry| {
+                ready_saw_host_call = matches!(entry, OplogEntry::HostCall { .. });
+                matches!(
+                    entry,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollReady,
+                        durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
+                        ..
+                    } if *seq == pollable_seq
+                )
+            })
+            .await
+            .unwrap();
+        assert!(ready_peek.is_none(), "ready() must refuse the marker");
+        assert!(
+            !ready_saw_host_call,
+            "ready() must observe a STRUCTURAL cursor — this is what flips its synthesized \
+             answer from `false` (keep waiting forever) to `true` (go make progress)"
+        );
+
+        // Peek 2 — poll()'s own-entry predicate, plus its identical capture.
+        let mut poll_saw_host_call = true;
+        let poll_peek = state
+            .try_get_oplog_entry(|entry| {
+                poll_saw_host_call = matches!(entry, OplogEntry::HostCall { .. });
+                is_own_poll_entry(entry)
+            })
+            .await
+            .unwrap();
+        assert!(poll_peek.is_none(), "poll() must refuse the marker");
+        assert!(
+            !poll_saw_host_call,
+            "poll() must observe a STRUCTURAL cursor — this is what suppresses the \
+             guaranteed-to-fail give-up fallback"
+        );
+
+        // Peek 3 — poll()'s fallback read, i.e. the guarded host-call read. Also refuses.
+        let fallback_peek = state
+            .try_get_oplog_entry(|entry| matches!(entry, OplogEntry::HostCall { .. }))
+            .await
+            .unwrap();
+        assert!(
+            fallback_peek.is_none(),
+            "the fallback read must refuse the marker rather than consume it"
+        );
+
+        // After all three refusals the marker is STILL there, for end_function.
+        let survivor = state
+            .try_get_oplog_entry(|e| matches!(e, OplogEntry::EndRemoteWrite { .. }))
+            .await
+            .unwrap();
+        assert!(
+            survivor.is_some(),
+            "three consecutive refusals must leave the cursor exactly where it was"
+        );
+    }
+
+    /// The other side of the §15.6 rule: while the cursor holds a HOST-CALL entry, `ready()` and
+    /// `poll()` must keep their original "not ready yet" behaviour. That entry has a real
+    /// consumer that will claim it and move the cursor, so waiting is productive and the
+    /// give-up bound's counting argument still holds.
+    #[test]
+    async fn a_host_call_cursor_is_still_reported_as_not_ready() {
+        let begin_idx = OplogIndex::from_u64(2190);
+        let mut state = replay_state_over(vec![
+            outgoing_check_write_entry(begin_idx),
+            end_remote_write_entry(begin_idx),
+        ])
+        .await;
+
+        // No scan this time: a foreign HostCall is sitting at the cursor.
+        let mut saw_host_call = false;
+        let peek = state
+            .try_get_oplog_entry(|entry| {
+                saw_host_call = matches!(entry, OplogEntry::HostCall { .. });
+                is_own_poll_entry(entry)
+            })
+            .await
+            .unwrap();
+        assert!(peek.is_none(), "not poll()'s own entry");
+        assert!(
+            saw_host_call,
+            "a host-call cursor must NOT be treated as parked — its owner can still claim it"
+        );
+    }
+
+    /// N=2 is not special-cased: five occurrences of one identity behave identically.
+    #[test]
+    async fn many_occurrences_of_one_identity_all_replay_in_order() {
+        use golem_common::model::oplog::{HostResponse, HostResponseStreamChunk};
+        let begin_idx = OplogIndex::from_u64(2190);
+        let expected: Vec<Vec<u8>> = (0u8..5).map(|n| vec![n]).collect();
+        let mut entries: Vec<OplogEntry> = expected
+            .iter()
+            .map(|bytes| {
+                batched_entry(
+                    HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+                    begin_idx,
+                    HostResponse::StreamChunk(HostResponseStreamChunk {
+                        result: Ok(bytes.clone()),
+                    }),
+                )
+            })
+            .collect();
+        entries.push(poll_entry());
+        let mut state = replay_state_over(entries).await;
+
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::Batch(begin_idx)]));
+        let scan = StrayEntryScan::new(tracked, None);
+        let mut consumed = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| consumed.push((idx, e)))
+            .await
+            .unwrap();
+
+        assert_eq!(consumed.len(), expected.len());
+        let identity = StrayEntryIdentity::new(
+            HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+            IdentityNamespace::Batch(begin_idx),
+        );
+        let mut cache = PreResolvedStrayCache::default();
+        for (_, entry) in consumed {
+            let OplogEntry::HostCall { response, .. } = entry else {
+                unreachable!()
+            };
+            let golem_common::model::oplog::OplogPayload::Inline(boxed) = response else {
+                unreachable!()
+            };
+            cache.record(identity.clone(), *boxed);
+        }
+        for want in expected {
+            let taken: HostResponseStreamChunk = cache
+                .take(&identity)
+                .expect("answer")
+                .try_into()
+                .expect("narrows");
+            assert_eq!(taken.result, Ok(want));
+        }
+        assert!(
+            state
+                .try_get_oplog_entry(is_own_poll_entry)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The other bound is unchanged and still load-bearing: a scan run on behalf of one
+    /// `blocking_read()` call must NOT swallow the next `blocking_read()` entry on the same
+    /// stream, however many are queued — that entry is the caller's own next answer.
+    #[test]
+    async fn a_repeated_identity_still_stops_its_own_owners_scan() {
+        use golem_common::model::oplog::{HostResponse, HostResponseStreamChunk};
+        let begin_idx = OplogIndex::from_u64(2190);
+        let read = || {
+            batched_entry(
+                HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+                begin_idx,
+                HostResponse::StreamChunk(HostResponseStreamChunk { result: Ok(vec![]) }),
+            )
+        };
+        let mut state = replay_state_over(vec![
+            outgoing_check_write_entry(begin_idx),
+            read(),
+            read(),
+            poll_entry(),
+        ])
+        .await;
+
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::Batch(begin_idx)]));
+        let own = StrayEntryIdentity::new(
+            HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+            IdentityNamespace::Batch(begin_idx),
+        );
+        let scan = StrayEntryScan::new(tracked, Some(own));
+        let mut consumed = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| consumed.push((idx, e)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            consumed.len(),
+            1,
+            "only the foreign check_write may be deferred; the caller's own reads must survive"
+        );
+        assert!(
+            state
+                .try_get_oplog_entry(|e| matches!(
+                    e,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+                        ..
+                    }
+                ))
+                .await
+                .unwrap()
+                .is_some(),
+            "the caller's own first blocking_read entry must still be at the cursor"
+        );
+    }
+
+    /// Builds a `HostCall` entry tagged `WriteRemoteBatched(Some(begin_idx))` for an arbitrary
+    /// host function and response — the generalized mechanism is function- and shape-agnostic,
+    /// so newly-covered families are exercised through this one builder.
+    fn batched_entry(
+        function_name: HostFunctionName,
+        begin_idx: OplogIndex,
+        response: golem_common::model::oplog::HostResponse,
+    ) -> OplogEntry {
+        use golem_common::model::oplog::{HostRequest, HostRequestNoInput, OplogPayload};
+        OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name,
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
+            response: OplogPayload::Inline(Box::new(response)),
+            durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
+        }
+    }
+
+    /// A `future_incoming_response::get` entry carrying a status code that identifies WHICH
+    /// concurrent request recorded it — the whole point of the §14.2.1 regression below is that
+    /// the two are otherwise indistinguishable.
+    fn future_response_entry(begin_idx: OplogIndex, status: u16) -> OplogEntry {
+        use golem_common::model::oplog::HostResponse;
+        use golem_common::model::oplog::HostResponseHttpResponse;
+        use golem_common::model::oplog::types::{
+            SerializableHttpResponse, SerializableResponseHeaders,
+        };
+        batched_entry(
+            HostFunctionName::HttpTypesFutureIncomingResponseGet,
+            begin_idx,
+            HostResponse::HttpResponse(HostResponseHttpResponse {
+                response: SerializableHttpResponse::HeadersReceived(SerializableResponseHeaders {
+                    status,
+                    headers: std::collections::HashMap::new(),
+                }),
+            }),
+        )
+    }
+
+    fn response_status_of(entry: &OplogEntry) -> u16 {
+        use golem_common::model::oplog::types::SerializableHttpResponse;
+        use golem_common::model::oplog::{HostResponse, OplogPayload};
+        let OplogEntry::HostCall {
+            response: OplogPayload::Inline(boxed),
+            ..
+        } = entry
+        else {
+            panic!("expected an inline HostCall entry")
+        };
+        match boxed.as_ref() {
+            HostResponse::HttpResponse(r) => match &r.response {
+                SerializableHttpResponse::HeadersReceived(h) => h.status,
+                other => panic!("expected HeadersReceived, got {other:?}"),
+            },
+            other => panic!("expected HttpResponse, got {other:?}"),
+        }
+    }
+
+    /// FINDING_B_FIX_DESIGN.md §14.2.1 — the highest-severity latent gap, and the only one whose
+    /// failure mode is SILENT rather than a trap.
+    ///
+    /// Two `fetch()`es are in flight concurrently (a `Promise.all` fan-out). Their
+    /// `http::types::future_incoming_response::get` entries share both `function_name` and
+    /// response shape, and land in completion order — B first — while the replayed guest reaches
+    /// A's structural check first. The old unconditional positional read therefore did not trap;
+    /// it accepted B's entry and decoded it cleanly as A's own response, handing request A
+    /// request B's status and headers.
+    ///
+    /// Correctness, not merely absence of a trap, is what this asserts: A must end up with 201
+    /// and B with 202.
+    #[test]
+    async fn concurrent_future_response_entries_reach_their_own_callers() {
+        let a = OplogIndex::from_u64(10);
+        let b = OplogIndex::from_u64(20);
+
+        // The pre-fix failure mode, pinned: a positional read at A's turn returns B's entry.
+        let mut naive = replay_state_over(vec![
+            future_response_entry(b, 202),
+            future_response_entry(a, 201),
+        ])
+        .await;
+        let (_, first) = naive
+            .try_get_oplog_entry(|_| true)
+            .await
+            .unwrap()
+            .expect("an entry is at the cursor");
+        assert_eq!(
+            response_status_of(&first),
+            202,
+            "precondition: an unconditional positional read hands request A request B's \
+             response — silently, since both decode to the same type"
+        );
+
+        // With the mechanism: A defers B's entry into the cache and reads its own.
+        let mut state = replay_state_over(vec![
+            future_response_entry(b, 202),
+            future_response_entry(a, 201),
+        ])
+        .await;
+        let tracked = TrackedConcurrentOpSeqs::new(HashSet::from([
+            IdentityNamespace::Batch(a),
+            IdentityNamespace::Batch(b),
+        ]));
+        let a_identity = StrayEntryIdentity::new(
+            HostFunctionName::HttpTypesFutureIncomingResponseGet,
+            IdentityNamespace::Batch(a),
+        );
+        let b_identity = StrayEntryIdentity::new(
+            HostFunctionName::HttpTypesFutureIncomingResponseGet,
+            IdentityNamespace::Batch(b),
+        );
+
+        let scan = StrayEntryScan::new(tracked, Some(a_identity.clone()));
+        let mut deferred = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| deferred.push((idx, e)))
+            .await
+            .unwrap();
+
+        assert_eq!(deferred.len(), 1, "exactly B's entry is deferred");
+        assert_eq!(
+            stray_entry_identity(&deferred[0].1),
+            Some(b_identity),
+            "the deferred entry is cached under B's identity, not A's"
+        );
+        assert_eq!(
+            response_status_of(&deferred[0].1),
+            202,
+            "request B's own response is what got cached for B"
+        );
+
+        let (_, own) = state
+            .try_get_oplog_entry(|e| stray_entry_identity(e) == Some(a_identity.clone()))
+            .await
+            .unwrap()
+            .expect("A's own entry is now at the cursor");
+        assert_eq!(
+            response_status_of(&own),
+            201,
+            "request A must receive its OWN response, not its sibling's"
+        );
+    }
+
+    /// New coverage, outgoing stream family (§14.2): `flush` / `blocking_flush` /
+    /// `write_zeroes` / `splice` / `blocking_splice` were never in the hand-written catalog, so
+    /// any of them sitting at the cursor trapped a concurrent `poll()`. They now defer cleanly,
+    /// each into its own cache slot under the request's shared `begin_index`.
+    #[test]
+    async fn poll_replay_defers_previously_uncatalogued_outgoing_stream_entries() {
+        use golem_common::model::oplog::{
+            HostResponse, HostResponseStreamSkip, HostResponseStreamWriteResult,
+            HostResponseStreamWriteZeroes,
+        };
+        let begin_idx = OplogIndex::from_u64(42);
+        let entries = vec![
+            batched_entry(
+                HostFunctionName::HttpTypesOutgoingBodyStreamFlush,
+                begin_idx,
+                HostResponse::StreamWriteResult(HostResponseStreamWriteResult { result: Ok(()) }),
+            ),
+            batched_entry(
+                HostFunctionName::HttpTypesOutgoingBodyStreamBlockingFlush,
+                begin_idx,
+                HostResponse::StreamWriteResult(HostResponseStreamWriteResult { result: Ok(()) }),
+            ),
+            batched_entry(
+                HostFunctionName::HttpTypesOutgoingBodyStreamWriteZeroes,
+                begin_idx,
+                HostResponse::StreamWriteZeroes(HostResponseStreamWriteZeroes { result: Ok(8) }),
+            ),
+            batched_entry(
+                HostFunctionName::HttpTypesOutgoingBodyStreamSplice,
+                begin_idx,
+                HostResponse::StreamSkip(HostResponseStreamSkip { result: Ok(8) }),
+            ),
+            batched_entry(
+                HostFunctionName::HttpTypesOutgoingBodyStreamBlockingSplice,
+                begin_idx,
+                HostResponse::StreamSkip(HostResponseStreamSkip { result: Ok(8) }),
+            ),
+            poll_entry(),
+        ];
+        let expected_strays = entries.len() - 1;
+        let mut state = replay_state_over(entries).await;
+
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::Batch(begin_idx)]));
+        let scan = StrayEntryScan::new(tracked, None);
+        let mut consumed = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| consumed.push((idx, e)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            consumed.len(),
+            expected_strays,
+            "every outgoing-stream operation must defer, not just check_write/write"
+        );
+        let peeked = state.try_get_oplog_entry(is_own_poll_entry).await.unwrap();
+        assert!(
+            peeked.is_some(),
+            "poll()'s own entry must be reachable once the strays are out of the way"
+        );
+    }
+
+    /// New coverage, incoming stream family (§14.2): `blocking_read` (previously covered only by
+    /// being folded into `read`'s identity), `skip` and `blocking_skip`.
+    #[test]
+    async fn poll_replay_defers_incoming_stream_skip_and_blocking_read_entries() {
+        use golem_common::model::oplog::{
+            HostResponse, HostResponseStreamChunk, HostResponseStreamSkip,
+        };
+        let begin_idx = OplogIndex::from_u64(42);
+        let entries = vec![
+            batched_entry(
+                HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+                begin_idx,
+                HostResponse::StreamChunk(HostResponseStreamChunk {
+                    result: Ok(vec![1]),
+                }),
+            ),
+            batched_entry(
+                HostFunctionName::HttpTypesIncomingBodyStreamSkip,
+                begin_idx,
+                HostResponse::StreamSkip(HostResponseStreamSkip { result: Ok(4) }),
+            ),
+            batched_entry(
+                HostFunctionName::HttpTypesIncomingBodyStreamBlockingSkip,
+                begin_idx,
+                HostResponse::StreamSkip(HostResponseStreamSkip { result: Ok(4) }),
+            ),
+            poll_entry(),
+        ];
+        let expected_strays = entries.len() - 1;
+        let mut state = replay_state_over(entries).await;
+
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::Batch(begin_idx)]));
+        let scan = StrayEntryScan::new(tracked, None);
+        let mut consumed = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| consumed.push((idx, e)))
+            .await
+            .unwrap();
+
+        assert_eq!(consumed.len(), expected_strays);
+        assert!(
+            state
+                .try_get_oplog_entry(is_own_poll_entry)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// New coverage, `future_trailers::get` (§14.2): same per-request identity as the body
+    /// streams, fires only for chunked responses carrying trailers.
+    #[test]
+    async fn poll_replay_defers_future_trailers_get_entries() {
+        use golem_common::model::oplog::{HostResponse, HostResponseHttpFutureTrailersGet};
+        let begin_idx = OplogIndex::from_u64(42);
+        let mut state = replay_state_over(vec![
+            batched_entry(
+                HostFunctionName::HttpTypesFutureTrailersGet,
+                begin_idx,
+                HostResponse::HttpFutureTrailersGet(HostResponseHttpFutureTrailersGet {
+                    result: Ok(None),
+                }),
+            ),
+            poll_entry(),
+        ])
+        .await;
+
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::Batch(begin_idx)]));
+        let scan = StrayEntryScan::new(tracked, None);
+        let mut consumed = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| consumed.push((idx, e)))
+            .await
+            .unwrap();
+
+        assert_eq!(consumed.len(), 1);
+        assert!(
+            state
+                .try_get_oplog_entry(is_own_poll_entry)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// New coverage, RDBMS result streams (§14.2): `query-stream` / `get-columns` / `get-next`
+    /// share one stream's `begin_index` across three response shapes — the same many-functions-
+    /// one-value structure that falsified the value-only identity key (§14.3). Each must land in
+    /// its own cache slot, and a concurrently-tracked HTTP request's entry interleaved among
+    /// them must defer too.
+    #[test]
+    async fn stray_scan_defers_rdbms_result_stream_entries() {
+        use golem_common::model::oplog::types::SerializableRdbmsError;
+        use golem_common::model::oplog::{
+            HostResponse, HostResponseGolemRdbmsColumns, HostResponseGolemRdbmsRequest,
+            HostResponseGolemRdbmsResultChunk,
+        };
+        let stream = OplogIndex::from_u64(30);
+        let request = OplogIndex::from_u64(40);
+        let entries = vec![
+            batched_entry(
+                HostFunctionName::RdbmsPostgresDbConnectionQueryStream,
+                stream,
+                HostResponse::GolemRdbmsRequest(HostResponseGolemRdbmsRequest {
+                    // The scan never inspects the payload — only the identity — so the cheapest
+                    // constructible variant of this shape is enough to pin participation.
+                    request: Err(SerializableRdbmsError::Other("test".to_string())),
+                }),
+            ),
+            batched_entry(
+                HostFunctionName::RdbmsPostgresDbResultStreamGetColumns,
+                stream,
+                HostResponse::GolemRdbmsColumns(HostResponseGolemRdbmsColumns {
+                    result: Ok(vec![]),
+                }),
+            ),
+            batched_entry(
+                HostFunctionName::RdbmsPostgresDbResultStreamGetNext,
+                stream,
+                HostResponse::GolemRdbmsResultChunk(HostResponseGolemRdbmsResultChunk {
+                    result: Ok(None),
+                }),
+            ),
+            outgoing_check_write_entry(request),
+            poll_entry(),
+        ];
+        let expected_strays = entries.len() - 1;
+        let mut state = replay_state_over(entries).await;
+
+        let tracked = TrackedConcurrentOpSeqs::new(HashSet::from([
+            IdentityNamespace::Batch(stream),
+            IdentityNamespace::Batch(request),
+        ]));
+        let scan = StrayEntryScan::new(tracked, None);
+        let mut consumed = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| consumed.push((idx, e)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            consumed.len(),
+            expected_strays,
+            "all three result-stream functions plus the interleaved HTTP entry must defer"
+        );
+        assert!(
+            state
+                .try_get_oplog_entry(is_own_poll_entry)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The §14.6 counterexample as a regression: with no batch registered as open, a batched
+    /// entry must survive the scan untouched. `check_write`'s `replaying_http_batch` and
+    /// post-snapshot-restore branches read the oplog directly without consulting the cache, and
+    /// are reached exactly in that state — deferring an entry there would strand them.
+    #[test]
+    async fn untracked_batch_entries_survive_a_scan() {
+        let begin_idx = OplogIndex::from_u64(42);
+        let mut state =
+            replay_state_over(vec![outgoing_check_write_entry(begin_idx), poll_entry()]).await;
+
+        let scan = StrayEntryScan::new(TrackedConcurrentOpSeqs::new(HashSet::new()), None);
+        let mut consumed = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| consumed.push((idx, e)))
+            .await
+            .unwrap();
+
+        assert!(
+            consumed.is_empty(),
+            "nothing may be deferred with no open batch"
+        );
+        let survivor = state
+            .try_get_oplog_entry(|e| {
+                matches!(
+                    e,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+                        ..
+                    }
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            survivor.is_some(),
+            "the check_write entry must still be at the cursor for its own bare read"
         );
     }
 }

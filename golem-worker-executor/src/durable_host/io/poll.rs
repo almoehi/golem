@@ -398,14 +398,13 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
             // forward, consuming (for real — `try_get_oplog_entry` durably advances past a
             // match) zero or more such stray entries of ANY known kind (`IoPollReady` for any
             // currently-tracked pollable, `GolemRpcFutureInvokeResultGet` for any currently-
-            // tracked RPC call — poll() has no RPC identity of its own to exclude), caching each
-            // one's answer for its real owner's own later replay to consult — until the next
-            // entry is NOT one of those, at which point defer entirely to the unchanged,
-            // existing `durability.replay()` path: either it's poll()'s own genuine entry
-            // (happy path, byte-for-byte unchanged), or it's genuinely unexpected and the
-            // existing crash path fires exactly as it does today. No batch-size or entry-kind
-            // assumption: N stray entries of any recognized kind, in any order, is simply N
-            // loop iterations.
+            // tracked RPC call, or an HTTP body-stream read/check_write/write for any currently-
+            // open request — poll() has no RPC or HTTP identity of its own to exclude), caching
+            // each one's answer for its real owner's own later replay to consult — until the
+            // next entry is NOT one of those, at which point poll()'s own predicate read below
+            // takes over. No batch-size or entry-kind assumption: N stray entries of any
+            // recognized kind, in any order, is simply N loop iterations (bounded to one per
+            // identity, see StrayEntryScan).
             self.state
                 .consume_and_cache_stray_entries(None, None)
                 .await?;

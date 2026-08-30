@@ -407,9 +407,11 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
             // open request — poll() has no RPC or HTTP identity of its own to exclude), caching
             // each one's answer for its real owner's own later replay to consult — until the
             // next entry is NOT one of those, at which point poll()'s own predicate read below
-            // takes over. No batch-size or entry-kind assumption: N stray entries of any
-            // recognized kind, in any order, is simply N loop iterations (bounded to one per
-            // identity, see StrayEntryScan).
+            // takes over. No batch-size, entry-kind or per-identity-occurrence assumption: N
+            // stray entries of any recognized kind, in any order — including several for the
+            // SAME identity in a row, such as a chunked body's repeated blocking_read() calls
+            // — is simply N loop iterations, each answer queued for its owner in oplog order
+            // (see StrayEntryScan and `pre_resolved_stray`).
             self.state.consume_and_cache_stray_entries(None).await?;
 
             // Whatever's left is consumed only if it positively identifies as poll()'s own

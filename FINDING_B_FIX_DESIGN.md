@@ -2747,3 +2747,142 @@ silent-misdelivery before/after pair on payload content; and one cursor-level de
 newly-wired family (outgoing stream, incoming stream, trailers, RDBMS). Every pre-existing
 `stray_entry_tests` and `replay_state::tests` case survives with only the mechanical identity-
 constructor change, except the one documented above.
+
+## 15. Fourteenth capture — one identity repeating back to back strands its own second entry
+
+Status: **IMPLEMENTED.** Branch `hrapp/scene-plates-sequential-poll-trap`.
+
+### 15.1 The live capture
+
+`WorkerAgent("workspace-smoketest@1.0","3e0f1d89-bd02-4bff-a96e-3374a03f2399@character_sheet")`,
+oplog entries `#02254` and `#02255` — both `HttpTypesIncomingBodyStreamBlockingRead`, both
+`WriteRemoteBatched(Some(OplogIndex(2190)))`, i.e. **the same `StrayEntryIdentity`, twice in a row**.
+The trap that followed:
+
+```
+Unexpected oplog entry during replay: expected io::poll::poll,
+got http::types::incoming_body_stream::blocking_read
+```
+
+Raw evidence: `oplog-backups/2026-08-30_WorkerAgent_workspace-smoketest_3e0f1d89-character_sheet_POSTFIX_CHECKWRITE-FIXED_BLOCKINGREAD-TRAP.oplog`.
+
+Two `blocking_read()` calls on one incoming body stream is not an exotic shape — it is what a chunked
+response body that doesn't arrive in a single call always produces, the incoming-direction twin of
+§12.2's 106 `check_write`/`write` pairs.
+
+### 15.2 Root cause: the one-answer-per-identity cache, and the scan bound built on top of it
+
+Both halves of §14's general mechanism assumed at most one pending answer per identity:
+
+- `pre_resolved_stray: HashMap<StrayEntryIdentity, HostResponse>` — one slot per key.
+- `StrayEntryScan` therefore refused a second entry for an identity it had already consumed, **or
+  one whose answer was still uncollected in the cache** (`cached_stray_identities()` seeded the
+  scan's `consumed` set). Documented in §12/§14.7(d) as protecting against a scan running away
+  through a whole write cluster and keeping only the last answer of each kind.
+
+The bound is correct given a single-slot cache, and it was correct that different *functions*
+sharing one namespace (`check_write` vs `write`) need distinct identities. What neither half handled
+is the same exact `(function_name, namespace)` pair repeating for genuinely distinct calls.
+
+The failure sequence, reconstructed against the code:
+
+1. `poll()`'s replay calls `consume_and_cache_stray_entries(None)` (`io/poll.rs`). The scan defers
+   `#02254`, caches it, then **refuses `#02255`** and stops, leaving it at the cursor.
+2. `poll()` then reads with `is_own_poll_entry` — misses, since `#02255` sits there.
+3. It synthesizes a ready-set and returns (§13.7.2's non-destructive miss), and the guest re-polls.
+4. On the retry, `stray_entry_scan()` re-seeds `consumed` from `cached_stray_identities()`. `#02254`'s
+   answer is still uncollected, so the identity is still blocked and `#02255` is refused **again**.
+   The cursor has not moved.
+5. `record_poll_replay_miss()` counts consecutive misses at that unmoved cursor. Once the streak
+   exceeds the entries remaining ahead of it, `poll()` falls back to the original unconditional
+   `durability.replay(self)` — which consumes `#02255` and reports the mismatch. Permanent trap.
+
+This also explains why the analogous `IoPollReady` shape never trapped this way: `ready()`'s owner
+*does* get scheduled between poll retries, collects the cached answer, frees the identity, and the
+next scan then consumes the second occurrence. `blocking_read`'s owner was not scheduled, so the
+streak ran to the bound. The mechanism's self-healing was load-bearing and merely happened to work.
+
+### 15.3 The fix
+
+**Key the cache on `(StrayEntryIdentity, occurrence_index)`, with the occurrence index carried
+implicitly as FIFO queue position** — `PreResolvedStrayCache`, a named type wrapping
+`HashMap<StrayEntryIdentity, VecDeque<HostResponse>>` with `record`/`take`/`peek`.
+
+This is the brief's design; the deviation is only in how `occurrence_index` is represented, and it
+is deliberate. An explicit index has to be agreed on by two parties — the scan that defers an entry
+and the owner that later collects it — and neither can derive it from the other without a shared
+counter that both mutate (the scan on defer, the owner on *every* collect, including collects that
+bypass the cache and read the oplog directly). That is a write index and a read index over one
+per-identity sequence, i.e. exactly a FIFO queue, with the counters made explicit and therefore
+capable of drifting. Making the position implicit removes the failure mode instead of managing it.
+
+Its correctness rests on one invariant, already established in §14.7(d) and unchanged here: **one
+identity's entries are produced, deferred and collected in oplog order.** The replay cursor advances
+monotonically, so entries enter a queue in oplog order; a `StrayEntryIdentity` corresponds to one
+WASI resource owned by one guest task (WASI resource ownership makes two tasks sharing a
+`Resource<InputStream>` impossible), so its calls are serialized and its Nth call wants its Nth
+entry. Pushing at the back and popping at the front therefore cannot get out of step.
+
+**Snapshot recovery needs no handling here, and this was verified rather than assumed.** Unlike
+`pollable_seq`/`invoke_result_seq` — whose values must stay consistent with *already-persisted*
+entries, hence their snapshot-restore machinery — the cache is pure per-replay-pass scratch state:
+constructed empty (`PreResolvedStrayCache::default()`), never serialized, never read outside a
+replay pass. Nothing about queue position spans a snapshot boundary.
+
+**The scan bound is removed entirely** (question 2 of the brief). §12's stated reason for it was
+cache collision, which no longer exists. No *other* reason survives scrutiny, and re-adding one
+would reintroduce this exact trap: a scan stops at the first entry it does not accept, so a
+contiguous run of foreign tracked entries must be cleared in full before the caller's own entry can
+be reached — consuming less than all of it cannot make progress, and whatever is left behind is
+reachable by nobody. `StrayEntryScan` is now bounded by the only two things that genuinely bound it,
+both already in `is_stray_concurrent_entry`: an entry belonging to no tracked operation, and an
+entry carrying the caller's OWN identity. It consequently became stateless (`accept(&self)`), and
+`cached_stray_identities()` was deleted.
+
+The trade-off, recorded in `StrayEntryScan`'s doc comment: one scan can now hold a whole contiguous
+foreign run's payloads in memory at once (a 106-pair body cluster) rather than leaving most in the
+oplog. That run has to be consumed before the caller can proceed either way — only retention
+differs, and it is released as each owner collects. Note this is not the common path: in-order
+replay defers nothing, because each consumer's own entry is at the cursor and its own identity is
+excluded, so the scan stops immediately at zero entries.
+
+**Question 3 (every consumer computing its own occurrence index) needs no per-consumer work.** All
+four collection paths — `Durability::replay_raw` (~92 sites), `ready()`, RPC `get()`,
+`future_incoming_response::get` — already funnel through `take_pre_resolved_stray(&identity)`, and
+`poll()`'s synthesis peek through `is_pollable_pre_resolved_ready`. Making those pop/peek the queue
+front is the entire consumer-side change; no call site learns a new concept. The positive-identity
+match against the live cursor is unaffected: it matches on identity, and successive occurrences are
+indistinguishable there by construction — whichever is at the cursor IS the caller's next one,
+because the cursor advances in oplog order.
+
+### 15.4 Test results
+
+`cargo build --release -p golem-worker-executor` clean; `cargo clippy --release --lib --tests` clean.
+`cargo test -p golem-worker-executor --lib --release` = **493 passed, 0 failed, 0 ignored, 0
+filtered** (488 before: −2 obsolete bound tests, +7 new).
+
+New tests, all asserting payload CONTENT rather than merely "no crash" — a wrong-slot bug here is a
+silent misdelivery (§14.2.1's failure mode), not necessarily a trap:
+
+| Test | Asserts |
+|---|---|
+| `two_blocking_reads_on_one_stream_each_replay_to_their_own_answer` (replay_state) | The capture verbatim: two same-identity `blocking_read` entries + `poll_entry`, at the real replay cursor. BOTH defer; each replays to its own chunk (`first`/`second`) in order; `poll()`'s own entry is then reachable. Fails on the old bound at the first assertion. |
+| `many_occurrences_of_one_identity_all_replay_in_order` (replay_state) | Same with N=5 — confirms N=2 is not special-cased. |
+| `a_repeated_identity_still_stops_its_own_owners_scan` (replay_state) | The surviving bound: a `blocking_read`'s own scan defers the foreign `check_write` but leaves both of its own entries at the cursor. |
+| `stray_scan_walks_every_occurrence_of_a_repeated_identity` (replay_state) | Rewrite of `stray_scan_stops_at_the_second_entry_for_one_identity` — same 4-entry `check_write`/`write` cluster, now asserting all 4 defer and `poll()` gets through. |
+| `repeated_occurrences_of_one_identity_are_returned_in_call_order` (mod) | `PreResolvedStrayCache` directly: 3 chunks in, `peek` and `take` both yield the owner's NEXT answer in order, queue drains to empty. |
+| `queues_of_different_identities_are_independent` (mod) | Interleaved `blocking_read`/`write` records; collecting one identity does not shift the other's ordering. |
+| `scan_accepts_every_occurrence_of_a_repeated_identity` (mod) | Replaces `scan_accepts_at_most_one_entry_per_identity` — the inverse assertion, plus the two surviving bounds. |
+| `scan_still_stops_at_every_occurrence_of_its_own_identity` (mod) | Exclusion is per-identity and repetition-insensitive. |
+
+Two tests were **deleted** as assertions of the now-removed bound, not adapted:
+`scan_accepts_at_most_one_entry_per_identity` and `scan_refuses_identities_whose_answer_is_already_cached`
+(the latter tested `cached_stray_identities()` seeding, the exact mechanism behind step 4 above).
+`each_deferred_entry_is_returned_to_its_own_owner` — §14.3's counterexample — was retargeted from a
+hand-rolled `HashMap` simulation onto the real `PreResolvedStrayCache`, so it now exercises
+production code rather than a re-implementation of it.
+
+`tests/rpc.rs` / `tests/durability.rs` compile clean under `cargo check --release --tests` but were
+**not run**: this worktree has only 5 of the ~21 `test-components/*.wasm` fixtures built, so the
+integration harness aborts during component cache warm-up before any test body executes. An
+environmental gap, unrelated to this change. Live verification is deliberately out of scope here.

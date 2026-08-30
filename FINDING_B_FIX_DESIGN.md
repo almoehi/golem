@@ -1080,6 +1080,22 @@ mechanical — add the `HostFunctionName` variant(s) to `is_stray_concurrent_ent
 the matching `decode_and_cache_stray_entry` arm — not a redesign, but not implemented now absent
 live evidence of need.
 
+**Status clarification (post-implementation Q&A, unambiguous, for anyone auditing scope)**:
+- **Input side (`HttpTypesIncomingBodyStreamRead`, concurrent fetches/reads) — FIXED.** Wired into
+  the shared mechanism end to end; matches `download-manager.ts`'s actual `Promise.all(fetchBytes)`
+  usage exactly.
+- **Output side (`check_write`/`write`/`flush`/`splice`, concurrent outgoing writes) — NOT FIXED AT
+  ALL.** Only the identity shape was spot-checked (confirming the mechanism *would* work if wired
+  up); zero code changes to these functions' replay branches — they still use the plain,
+  unmodified `durability.replay(self)` path with no stray-recognition whatsoever.
+- **Is the output-side gap a confirmed live risk today?** No. A grep sweep of video-harness for
+  concurrent-write patterns near upload/write call sites (`fileshare.ts:81`'s `presignPut`/
+  `presignGet` — local URL-signing, no outgoing HTTP call at all; `workflow-agent.ts:2911` — reads,
+  not writes) found no real concurrent-outgoing-body-write scenario. The output side's risk is
+  inferred purely from structural similarity to the (fixed) input side, not from any observed
+  trigger — a documented, plausible-but-unconfirmed gap for future investigation, not a live bug
+  being knowingly left open.
+
 ### What was implemented, file by file
 
 - **`golem-common/src/model/oplog/raw_types.rs`**: new `DurableFunctionType::WriteRemoteConcurrent(u32)`

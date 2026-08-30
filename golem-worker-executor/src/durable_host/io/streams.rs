@@ -20,7 +20,7 @@ use crate::durable_host::http::{continue_http_request, end_http_request};
 use crate::durable_host::io::{ManagedStdErr, ManagedStdOut};
 use crate::durable_host::{
     Durability, DurabilityHost, DurableWorkerCtx, HttpOutputStreamState, HttpRequestCloseOwner,
-    PendingFilesystemReservation,
+    PendingFilesystemReservation, is_stray_concurrent_entry,
 };
 use crate::model::event::InternalWorkerEvent;
 use crate::services::oplog::OplogOps;
@@ -112,7 +112,38 @@ impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
                         },
                     )
                     .await
+            } else if let Some(cached) =
+                self.state.take_pre_resolved_http_stream_chunk(begin_idx)
+            {
+                // A sibling concurrent stream's stray-scan already consumed this entry on our
+                // behalf (FINDING_B_FIX_DESIGN.md §8.7) — use it directly, oplog untouched.
+                Ok(cached)
             } else {
+                // Scan past any stray entries belonging to OTHER tracked concurrent operations
+                // (excluding this stream's own begin_idx), caching each for its real owner —
+                // same shared mechanism as poll()/get() (FINDING_B_FIX_DESIGN.md).
+                let tracked = self.state.tracked_concurrent_op_seqs();
+                let mut strays = Vec::new();
+                self.state
+                    .replay_state
+                    .consume_stray_entries(
+                        |entry| {
+                            is_stray_concurrent_entry(entry, &tracked, None, Some(begin_idx))
+                        },
+                        |idx, entry| strays.push((idx, entry)),
+                    )
+                    .await
+                    .map_err(|e| StreamError::Trap(wasmtime::Error::from_anyhow(e.into())))?;
+                for (idx, entry) in strays {
+                    self.state
+                        .decode_and_cache_stray_entry(idx, entry)
+                        .await
+                        .map_err(|e| StreamError::Trap(wasmtime::Error::from_anyhow(e.into())))?;
+                }
+
+                // Unchanged existing fallback — whatever's left must be mine (every other known
+                // identity has been filtered out) or a genuine, still-correctly-crashing
+                // mismatch.
                 durability.replay(self).await
             }?;
 

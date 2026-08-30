@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::durable_host::durability::{ClassifiedHostError, HostFailureKind, InFunctionRetryHost};
-use crate::durable_host::{Durability, DurabilityHost, DurableWorkerCtx, InternalRetryResult};
+use crate::durable_host::{
+    Durability, DurabilityHost, DurableWorkerCtx, InternalRetryResult, is_stray_concurrent_entry,
+};
 use crate::get_oplog_entry;
 use crate::preview2::golem::agent::host::{
     CancellationToken, FutureInvokeResult, HostCancellationToken, HostFutureInvokeResult,
@@ -516,6 +518,16 @@ impl<Ctx: WorkerCtx> HostWasmRpc for DurableWorkerCtx<Ctx> {
         if result.is_err() {
             self.end_function(&DurableFunctionType::WriteRemote, begin_index)
                 .await?;
+        } else if let Ok(fut) = &result {
+            // Assigned unconditionally (live or replay) here, at dispatch time — the only point
+            // this resource is guaranteed to exist and to have been observed identically on both
+            // live and replay (see FINDING_B_FIX_DESIGN.md §8.2.2/§8.8: dispatch order for
+            // concurrently-fired RPC calls is fully deterministic, driven by the guest's own
+            // sequential dispatch loop, unlike completion-checking order — so assigning here,
+            // rather than lazily at first get() call, keeps this in the same
+            // deterministic-call-order category as pollable_seq's assignment at the top of
+            // ready()).
+            self.state.invoke_result_seq(fut.rep());
         }
 
         result
@@ -672,6 +684,7 @@ impl<Ctx: WorkerCtx> HostFutureInvokeResult for DurableWorkerCtx<Ctx> {
     > {
         self.observe_function_call("golem::rpc::future-invoke-result", "get");
         let rpc = self.rpc();
+        let this_rep = this.rep();
 
         let span_id = {
             let entry = self.table().get_mut(&this)?;
@@ -829,6 +842,15 @@ impl<Ctx: WorkerCtx> HostFutureInvokeResult for DurableWorkerCtx<Ctx> {
                     SerializableInvokeResult::Pending
                 );
 
+                // Tagged with this call's own invoke_result_seq (assigned at dispatch time,
+                // async_invoke_and_await) instead of plain WriteRemote, so replay can match this
+                // entry to THIS specific concurrently-tracked call rather than consuming
+                // positionally — see FINDING_B_FIX_DESIGN.md and ReadLocalPollable's analogous
+                // role for pollables.
+                let invoke_result_seq = self
+                    .state
+                    .invoke_result_seq_if_assigned(this_rep)
+                    .expect("invoke_result_seq assigned unconditionally at dispatch time");
                 self.state
                     .oplog
                     .add_host_call(
@@ -837,7 +859,7 @@ impl<Ctx: WorkerCtx> HostFutureInvokeResult for DurableWorkerCtx<Ctx> {
                         &HostResponse::GolemRpcInvokeGet(HostResponseGolemRpcInvokeGet {
                             result: serializable_invoke_result,
                         }),
-                        DurableFunctionType::WriteRemote,
+                        DurableFunctionType::WriteRemoteConcurrent(invoke_result_seq),
                     )
                     .await
                     .unwrap_or_else(|err| panic!("failed to serialize RPC response: {err}"));
@@ -870,48 +892,90 @@ impl<Ctx: WorkerCtx> HostFutureInvokeResult for DurableWorkerCtx<Ctx> {
             )
             .into())
         } else {
-            // Propagate WorkerExecutorError via `?` (From) so the downcast
-            // survives the anyhow::Error chain — TrapType::from_error
-            // classifies UnexpectedOplogEntry as non-retriable.
-            let (_, oplog_entry) = get_oplog_entry!(self.state.replay_state, OplogEntry::HostCall)?;
+            // this call's own invoke_result_seq — assigned unconditionally at dispatch time
+            // (async_invoke_and_await), so it's always already assigned by the time get() can
+            // possibly replay (dispatch necessarily precedes it).
+            let my_invoke_result_seq = self
+                .state
+                .invoke_result_seq_if_assigned(this_rep)
+                .expect("invoke_result_seq assigned unconditionally at dispatch time");
 
-            let serialized_invoke_result = match oplog_entry {
-                OplogEntry::HostCall { response, .. } => {
-                    let response =
-                        self.state
-                            .oplog
-                            .download_payload(response)
-                            .await
-                            .map_err(|err| {
-                                WorkerExecutorError::runtime(format!(
-                                    "Failed to download golem::rpc::future-invoke-result oplog payload: {err}"
-                                ))
-                            })?;
+            // 1. Check the cache first — a sibling poll()/get() call's stray-scan may already
+            //    have consumed my own entry on my behalf (see FINDING_B_FIX_DESIGN.md).
+            let serialized_invoke_result = if let Some(cached) = self
+                .state
+                .take_pre_resolved_invoke_result(my_invoke_result_seq)
+            {
+                cached
+            } else {
+                // 2. Scan past any stray entries belonging to OTHER tracked operations
+                //    (excluding my own invoke_result_seq), caching each for its real owner.
+                let tracked = self.state.tracked_concurrent_op_seqs();
+                let mut strays = Vec::new();
+                self.state
+                    .replay_state
+                    .consume_stray_entries(
+                        |entry| {
+                            is_stray_concurrent_entry(
+                                entry,
+                                &tracked,
+                                Some(my_invoke_result_seq),
+                                None,
+                            )
+                        },
+                        |idx, entry| strays.push((idx, entry)),
+                    )
+                    .await?;
+                for (idx, entry) in strays {
+                    self.state.decode_and_cache_stray_entry(idx, entry).await?;
+                }
 
-                    match response {
-                        HostResponse::GolemRpcInvokeGet(HostResponseGolemRpcInvokeGet {
-                            result,
-                        }) => result,
-                        other => {
-                            return Err(anyhow::Error::from(
-                                WorkerExecutorError::unexpected_oplog_entry(
-                                    "HostResponse::GolemRpcInvokeGet",
-                                    format!("{other:?}"),
-                                ),
-                            ));
+                // 3. Unchanged existing fallback — whatever's left must be mine (every other
+                //    known identity has been filtered out) or a genuine, still-correctly-
+                //    crashing mismatch. Propagate WorkerExecutorError via `?` (From) so the
+                //    downcast survives the anyhow::Error chain — TrapType::from_error
+                //    classifies UnexpectedOplogEntry as non-retriable.
+                let (_, oplog_entry) =
+                    get_oplog_entry!(self.state.replay_state, OplogEntry::HostCall)?;
+
+                match oplog_entry {
+                    OplogEntry::HostCall { response, .. } => {
+                        let response =
+                            self.state
+                                .oplog
+                                .download_payload(response)
+                                .await
+                                .map_err(|err| {
+                                    WorkerExecutorError::runtime(format!(
+                                        "Failed to download golem::rpc::future-invoke-result oplog payload: {err}"
+                                    ))
+                                })?;
+
+                        match response {
+                            HostResponse::GolemRpcInvokeGet(HostResponseGolemRpcInvokeGet {
+                                result,
+                            }) => result,
+                            other => {
+                                return Err(anyhow::Error::from(
+                                    WorkerExecutorError::unexpected_oplog_entry(
+                                        "HostResponse::GolemRpcInvokeGet",
+                                        format!("{other:?}"),
+                                    ),
+                                ));
+                            }
                         }
                     }
-                }
-                // The macro above already guarantees `OplogEntry::HostCall`, so
-                // this arm is structurally unreachable. We still return an
-                // error rather than panicking to keep the function panic-free.
-                other => {
-                    return Err(anyhow::Error::from(
-                        WorkerExecutorError::unexpected_oplog_entry(
-                            "OplogEntry::HostCall",
-                            format!("{other:?}"),
-                        ),
-                    ));
+                    // The macro above already guarantees `OplogEntry::HostCall`, so
+                    // this arm is structurally unreachable. We still return an
+                    // error rather than panicking to keep the function panic-free.
+                    other => {
+                        return Err(anyhow::Error::from(
+                            WorkerExecutorError::unexpected_oplog_entry(
+                                "OplogEntry::HostCall",
+                                format!("{other:?}"),
+                            ),
+                        ));
+                    }
                 }
             };
 
@@ -1079,6 +1143,9 @@ impl<Ctx: WorkerCtx> HostFutureInvokeResult for DurableWorkerCtx<Ctx> {
                 for child_rep in &entry.child_pollables {
                     self.state.rpc_pollable_to_parent.remove(child_rep);
                 }
+                // Only once the rep is truly freed back to the resource table (not deferred by
+                // HasChildren below) — same rep-reuse rationale as clear_pollable_seq.
+                self.state.clear_invoke_result_seq(future_rep);
             }
             Err(ResourceTableError::HasChildren) => {
                 let parent: Resource<FutureInvokeResult> = Resource::new_borrow(future_rep);

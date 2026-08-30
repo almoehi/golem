@@ -592,6 +592,7 @@ impl From<DurableFunctionType> for durability::DurableFunctionType {
             DurableFunctionType::ReadRemote => durability::DurableFunctionType::ReadRemote,
             DurableFunctionType::ReadLocal => durability::DurableFunctionType::ReadLocal,
             DurableFunctionType::ReadLocalPollable(_) => durability::DurableFunctionType::ReadLocal,
+            DurableFunctionType::WriteRemoteConcurrent(_) => durability::DurableFunctionType::WriteRemote,
             DurableFunctionType::WriteRemoteTransaction(oplog_index) => {
                 durability::DurableFunctionType::WriteRemoteTransaction(
                     oplog_index.map(|idx| idx.into()),
@@ -1214,7 +1215,9 @@ impl<Pair: HostPayloadPair> Durability<Pair> {
             | DurableFunctionType::ReadLocal
             | DurableFunctionType::ReadLocalPollable(_)
             | DurableFunctionType::WriteLocal => true,
-            DurableFunctionType::WriteRemote => self.durable_execution_state.assume_idempotence,
+            DurableFunctionType::WriteRemote | DurableFunctionType::WriteRemoteConcurrent(_) => {
+                self.durable_execution_state.assume_idempotence
+            }
             DurableFunctionType::WriteRemoteBatched(_)
             | DurableFunctionType::WriteRemoteTransaction(_) => false,
         }

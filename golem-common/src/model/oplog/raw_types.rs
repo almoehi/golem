@@ -349,6 +349,15 @@ pub enum DurableFunctionType {
     /// a different pollable (see poll.rs ready() implementation).
     #[desert(transparent)]
     ReadLocalPollable(u32),
+
+    /// Like WriteRemote, but also carries a logical, call-order-derived sequence number
+    /// identifying which concurrently-tracked RPC call this entry belongs to. Used by
+    /// golem::rpc::future-invoke-result::get() to distinguish per-call oplog entries during
+    /// replay, preventing a sibling concurrently-dispatched call's completion from being
+    /// consumed as if it were this call's own (see wasm_rpc/mod.rs's HostFutureInvokeResult::get
+    /// implementation and FINDING_B_FIX_DESIGN.md).
+    #[desert(transparent)]
+    WriteRemoteConcurrent(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, BinaryCodec, IntoValue, FromValue)]

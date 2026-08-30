@@ -1187,3 +1187,1563 @@ full state):
   near the `oplog`/`DurableFunctionType` code this round touched).
 - `http.rs`, `wasi.rs`, and other integration test files requiring components not built in this
   worktree were not run — same pre-existing environment gap noted in every prior round.
+
+## 12. Twelfth/thirteenth capture confirms the output-stream gap live — `check_write` fix design
+
+Status: **DESIGN ONLY — not implemented, not approved yet.** §11's own "Status clarification"
+flagged the HTTP output-stream side (`check_write`/`write`/`flush`/`splice`) as spot-checked but
+"NOT FIXED AT ALL... a documented, plausible-but-unconfirmed gap." This section confirms it live,
+root-causes it with the same rigor as §8/§11, and proposes the fix. No code has been changed; no
+`cargo build` was run for this section (offline analysis only, per explicit direction).
+
+### 12.1 The live capture
+
+Source: `/Users/hannes/work/golem/oplog-backups/2026-08-30_smoketest_findings/3e0f1d89-character_sheet.oplog.fresh`
+(3138-line dump, ~608 real entries), agent
+`WorkerAgent("workspace-smoketest@1.0","3e0f1d89-bd02-4bff-a96e-3374a03f2399@character_sheet")`,
+captured on `main`'s custom golem binary `sha=5135ea4fcff1a550a0aa08dbe339463ccfd1ffe6` (per
+`/golem-build-info.txt`, confirmed to have every fix documented above — including the §11 v4
+`is_stray_concurrent_entry`/`consume_stray_entries` mechanism — as an ancestor). This is the same
+oplog `golem/oplog-backups/README.md`'s "Twelfth/thirteenth capture — 2026-08-30" section already
+gave a preliminary read on; this section supersedes that preliminary read with full root-causing
+and a fix design. Cross-references the top-level `video-harness/CLAUDE.md`'s "Agents with
+long-running `awaitPromise`" rule, which already named this exact signature from an earlier,
+oplog-less RCA (2026-08-27) — this is occurrence #3, now fully traced.
+
+**The exact entries** (own oplog dump; `at:` timestamps and `result:` payloads read directly, not
+inferred):
+
+```
+#00601 CALL golem::api::create_promise        at 05:13:08.116Z   (yieldForSnapshot fence)
+#00602 CALL golem::api::complete_promise       at 05:13:08.117Z
+#00603 CALL io::poll::poll            {count:1} at 05:13:08.117Z  -> ok([0])
+#00604 CALL io::poll::pollable::ready          at 05:13:08.117Z  -> ok(true)
+#00605 CALL golem::api::get_promise_result     at 05:13:08.117Z  -> some([49])   ("1", the fence's own payload)
+#00606 LOG   "wf_krea2_character_sheet: awaiting render promise (renderId=bd4fe65860c768f2aa0b2fdfe933aa98)"
+#00607 SUSPEND                                 at 05:13:08.118Z   (clean — no error)
+#00608 ERROR                                   at 05:19:21.886Z   retry from: 605
+#00610 ERROR (second forced resume)            at 05:20:53.609Z   retry from: 605
+#00613 ERROR (third forced resume)             at 05:43:51.552Z   retry from: 605
+```
+
+Server-log-equivalent error text captured in the dump's own `error:` field (three separate
+occurrences, byte-identical):
+```
+Unexpected oplog entry during replay: expected io::poll::poll, got http::types::outgoing_body_stream::check_write
+```
+
+`#00606`/`#00607` are `workflowToolFinish()`'s `awaitPromise(promiseId)` call
+(`video-harness/src/worker/worker-agent.ts:1467`, log line at `:1427`) — the render dispatched at
+`#00590-#00600`'s `atomicRpcCall()` region hadn't completed yet, so the worker genuinely suspended
+(clean `SUSPEND`, not a trap) to wait for an external `complete_promise()` call from the render
+backend. Three later resume attempts (external `wakeUp`/TUI-reconnect-poll kicks, per the
+README's own read) each require reconstructing the whole worker instance via replay from the
+single construction-time `SNAPSHOT` (entry `#00006` — the separate, already-tracked snapshot-
+frequency gap noted in this repo's `CLAUDE.md`, explicitly out of scope here) through `#00607`,
+and each of the three replay attempts traps identically.
+
+### 12.2 Locating the concurrency: a stranded entry from ~500 positions earlier, not a same-vicinity mismatch
+
+A full function-name census of the capture (`grep -oE 'CALL [a-zA-Z:_.-]+' | sort | uniq -c`):
+
+```
+126 io::poll::pollable::ready        21 io::poll::poll
+106 http::types::outgoing_body_stream::write
+106 http::types::outgoing_body_stream::check_write
+ 55 http::types::incoming_body_stream::blocking_read
+ 16 random::get_random_u             14 http::types::future_incoming_response::get
+ 12 golem::agent::get_agent_type      8 golem::api::create_promise
+  7 wall_clock::now                   7 monotonic_clock::subscribe_duration
+  7 golem::api::get_promise_result    7 golem::api::complete_promise
+  6 keyvalue::eventual::set           6 golem::rpc::future-invoke-result::get
+```
+
+Every `check_write`/`write` entry in the dump is clustered into four narrow windows — entries
+`#00060-00106`, `#00150-00204`, `#00251-00308`, `#00332-...` (confirmed via `awk` scanning for the
+nearest preceding `#NNNNN:` marker before each `check_write` line) — each cluster's timestamps span
+under 100ms, consistent with one LLM completion request's request-body write loop per round of the
+reasoning loop. **None of these clusters are anywhere near `#00605-00608`** — the nearest cluster
+ends around `#00308`, roughly 300 entries before the trap surfaces. Since Golem's replay engine
+tracks a single linear cursor (`try_get_oplog_entry`/`ReplayState`, walked strictly forward, never
+backward), "expected `io::poll::poll`, got `check_write`" at the `#605` neighborhood can only mean
+one thing: **the cursor is still parked on a `check_write` entry from one of those far-earlier
+clusters, never consumed**, and by the time guest code (in THIS replay attempt's own execution) next
+calls `io::poll::poll()` — most plausibly the fence's own `#00603` call, or an equivalent call
+inside the render-promise wait's own polling machinery — the "next unconsumed" entry the engine
+hands it is that stranded `check_write`, hundreds of positions earlier in wall-clock terms but
+still first in cursor order.
+
+This is not a hypothetical replay-vs-original-live divergence (the classic Finding B shape,
+requiring two different process instantiations) — **all three ERROR entries are separate replay
+attempts of the identical byte-for-byte oplog**, so this is genuinely a case of the SAME divergence
+mechanism (§2's `wstd`-reactor-HashMap non-determinism) triggering identically three times,
+independently, at 05:19, 05:20, and 05:43 — three different process instantiations (three different
+random HashMap seeds), all landing on a stray at the same point. Given the entry density involved
+— 106 `check_write` + 106 `write` + 55 incoming reads, all pollable-backed, concentrated across
+~250 oplog entries early in the invocation — this reads less like "a rare unlucky ordering" and
+more like "with this many concurrently-registerable pollables in play, some stray is close to
+guaranteed regardless of the specific random seed." Worth noting as a severity signal, not
+re-litigating §2's already-settled mechanism.
+
+**Direct confirmation that `check_write` calls are themselves poll-gated** (own oplog dump,
+`#00059-00061`):
+```
+#00059 CALL io::poll::pollable::ready   at 05:11:12.615Z  -> ok(true)
+#00060 CALL http::types::outgoing_body_stream::check_write
+            input: {uri: "https://ollama.com/api/chat", method: post, ...}
+            result: ok(1048576)
+#00061 CALL http::types::outgoing_body_stream::write
+            input: {...}  result: ok([...large JSON chunk...])
+```
+Every `check_write` is preceded by its own `ready()`/(implicitly, batched) `poll()` wait on the
+output stream's own pollable — structurally identical to the pollable-batching shape already
+root-caused for `IoPollReady` (§2) and RPC `get()` (§8.1). An outgoing-body-stream pollable is
+exactly as eligible to be swept into `wstd`'s shared, HashMap-ordered `poll()` batch as any other
+concurrently-pending pollable — there is nothing special about it that would exempt it from §2's
+mechanism.
+
+### 12.3 App-level trigger: traced, and it's an ordinary single `fetch()` — no double-dispatch bug
+
+The `check_write`/`write` entries' own `uri` field (`https://ollama.com/api/chat`) points to
+`OllamaBackend.chat()` (`video-harness/src/llm/ollama-backend.ts:159`):
+
+```typescript
+const response = await fetch(`${this.endpoint}/api/chat`, {
+  method: "POST",
+  headers,
+  body: JSON.stringify(body),
+});
+...
+const payload = (await response.json()) as OllamaChatResponse;
+```
+
+Traced end to end: a single, plain, sequentially-`await`ed `fetch()` call — no `ReadableStream`
+body, no `duplex`, no `ReadableStream`/`Promise.all` fan-out, nothing resembling
+`LlmClient.runOneRound()`'s Phase A concurrent tool dispatch (§2) or `download-manager.ts`'s
+concurrent-fetch pattern (§8.7). This is a materially different — and more concerning — finding
+than §11's own risk assessment: §11's grep sweep (upload/write call sites: `fileshare.ts:81`,
+`workflow-agent.ts:2911`) concluded "no real concurrent-outgoing-body-write scenario" and treated
+the output-side gap as needing an app-level concurrent-write trigger to matter. **This capture
+shows that is not required** — one ordinary, sequentially-awaited `fetch()` POST, with a body large
+enough to need multiple `check_write`/`write` cycles (106 of each here — a large system-prompt-plus-
+tool-schema payload, per the excerpted body content), is sufficient on its own, given `wstd`'s
+generic per-pollable batching (§2) has no notion of "this is just one ordinary fetch." Any
+`fetch()` call whose body needs more than a single `write()` cycle is a candidate, not just
+call sites with visible concurrent-dispatch code.
+
+### 12.4 Same mechanism? Confirmed by reading the actual code, not assumed
+
+`HostOutputStream::check_write` (`golem-worker-executor/src/durable_host/io/streams.rs:346-461`),
+`is_http` branch:
+
+```rust
+let result = if durability.is_live() {
+    /* ... unchanged live path ... */
+} else {
+    durability.replay(self).await          // <- line 396: unconditional, no stray-scan
+}
+.map_err(StreamError::from)?;
+```
+
+This is the exact same unconditional-consumption shape `poll()`, `get()`, and `read()` all had
+*before* their respective fixes (§1, §8.2, §11) — confirmed by direct comparison, not inferred
+from naming. `is_stray_concurrent_entry` (`durable_host/mod.rs:4263-4295`) has exactly three match
+arms today — `IoPollReady`, `GolemRpcFutureInvokeResultGet`, `HttpTypesIncomingBodyStreamRead` —
+and falls to `_ => false` for everything else, confirmed by reading the full match exhaustively.
+`HttpTypesOutgoingBodyStreamCheckWrite` is not among them, so `consume_stray_entries` never
+recognizes a stray `check_write` entry, and any call site that reaches it (currently `poll()`'s and
+`get()`'s and `read()`'s own stray-scanners, none of which check for it either) has no path but the
+unconditional fallback — which is precisely `expected io::poll::poll, got
+http::types::outgoing_body_stream::check_write`.
+
+**The identity mechanism this needs already exists and is already sound — confirmed, not assumed.**
+`check_write`'s `state.begin_index` comes from `get_http_output_stream_state`
+(`io/streams.rs:1127-1139`), which reads `open_http_requests`'s `HttpRequestState.begin_index`
+(`durable_host/mod.rs:3913-3917`) — **the exact same field, same map, same request-scoped identity**
+the already-fixed `read()` (input side) uses via `get_http_request_begin_idx`
+(`io/streams.rs:1165-1175`, per §8.7/§11). One `HttpRequestState` per request covers *both*
+directions (`output_stream_rep`, `body_handle` are separate fields on the same struct,
+`mod.rs:3913-3937`) — there is no new identity concept to design here, unlike RPC's `begin_index`
+(§8.2.1, ruled unsound) or a from-scratch counter (`pollable_seq`/`invoke_result_seq`, §8.2.2).
+§11's own HTTP lifecycle trace already confirmed `WriteRemoteBatched(None)` unconditionally writes
+a real `BeginRemoteWrite` entry at `handle()` regardless of `assume_idempotence` (`http/
+outgoing_http.rs:234-237`) — that finding applies identically to the output-stream side, since it's
+the same `begin_index` value, not a separately-computed one.
+
+**Verdict: this is the same mechanism as §1/§8/§11 — a straightforward generalization, not a
+structurally different problem.** No new identity, no new counter, no snapshot-recovery
+complication beyond what §11 already resolved (and explicitly scoped) for HTTP.
+
+### 12.5 Fix design
+
+Five changes, all additive, none touching the already-shipped poll/get/read paths beyond widening
+one shared match statement:
+
+**1. `is_stray_concurrent_entry`** (`durable_host/mod.rs:4263-4295`) — new arm, reusing the
+existing `http_begin_indexes`/`exclude_http_begin_idx` (no new tracked set — `open_http_requests`
+already covers both directions, §12.4):
+
+```rust
+OplogEntry::HostCall {
+    function_name: HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+    durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
+    ..
+} => {
+    Some(*begin_idx) != exclude_http_begin_idx
+        && tracked.http_begin_indexes.contains(begin_idx)
+}
+```
+
+**2. New cache field + accessors** (`durable_host/mod.rs`, alongside
+`pre_resolved_http_stream_chunk`/`record_pre_resolved_http_stream_chunk`/
+`take_pre_resolved_http_stream_chunk`, `mod.rs:4189,4826-4855`) — a **separate** cache, not a reuse
+of `pre_resolved_http_stream_chunk`, because the response *shape* differs
+(`HostResponseStreamCheckWrite` vs. `HostResponseStreamChunk`) — same reasoning that already forced
+`pre_resolved_pollable_ready`/`pre_resolved_invoke_result`/`pre_resolved_http_stream_chunk` to stay
+three separate maps rather than one shared one (§8.4):
+
+```rust
+/// REPLAY-ONLY cache, symmetric with pre_resolved_http_stream_chunk: a stray
+/// HttpTypesOutgoingBodyStreamCheckWrite entry's decoded result, consumed early by a DIFFERENT
+/// call's stray-scan, cached here for the owning check_write() call to consult first.
+pre_resolved_http_stream_check_write: HashMap<OplogIndex, HostResponseStreamCheckWrite>,
+```
+`record_pre_resolved_http_stream_check_write`/`take_pre_resolved_http_stream_check_write` mirror
+the `_chunk` pair exactly (insert/remove, same trace-log shape).
+
+**3. `decode_and_cache_stray_entry`** (`durable_host/mod.rs:4887-4969`) — new match arm, same
+download-payload-then-`try_into()` shape as the existing three arms:
+
+```rust
+OplogEntry::HostCall {
+    function_name: HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+    durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
+    response,
+    ..
+} => {
+    let host_response: HostResponse = self.oplog.download_payload(response).await
+        .map_err(WorkerExecutorError::runtime)?;
+    let payload: HostResponseStreamCheckWrite = host_response.try_into()
+        .map_err(WorkerExecutorError::runtime)?;
+    self.record_pre_resolved_http_stream_check_write(begin_idx, payload);
+    Ok(())
+}
+```
+
+**4. `check_write()`'s `is_http` branch** (`io/streams.rs:368-398`) — restructure the replay half
+to the same cache-then-scan-then-fallback shape `read()` already has (`io/streams.rs:115-148`):
+
+```rust
+let result = if durability.is_live() {
+    /* unchanged */
+} else if let Some(cached) =
+    self.state.take_pre_resolved_http_stream_check_write(state.begin_index)
+{
+    Ok(cached)
+} else {
+    let tracked = self.state.tracked_concurrent_op_seqs();
+    let mut strays = Vec::new();
+    self.state.replay_state.consume_stray_entries(
+        |entry| is_stray_concurrent_entry(entry, &tracked, None, Some(state.begin_index)),
+        |idx, entry| strays.push((idx, entry)),
+    ).await.map_err(|e| StreamError::Trap(wasmtime::Error::from_anyhow(e.into())))?;
+    for (idx, entry) in strays {
+        self.state.decode_and_cache_stray_entry(idx, entry).await
+            .map_err(|e| StreamError::Trap(wasmtime::Error::from_anyhow(e.into())))?;
+    }
+    durability.replay(self).await
+}
+.map_err(StreamError::from)?;
+```
+
+**5. No change needed** to `check_write()`'s `replaying_http_batch`/post-snapshot-restore branches
+(`io/streams.rs:401-447`) — identical scope-narrowing already accepted for `read()` in §11 (the
+narrower mid-request-snapshot recovery path, not exercised by this capture's shape — one long
+invocation, single genesis snapshot, matching both this and the Tenth/Eleventh captures).
+
+**Traced explicitly, not assumed: no cross-direction contamination.** `read()`'s own
+`exclude_http_begin_idx: Some(my_begin_idx)` parameter is per-*request*, not per-*direction* — so
+once the new arm above exists, a `read()` call for request X will correctly also exclude request
+X's *own* `check_write` entries from being treated as "someone else's" stray (the condition
+`Some(*begin_idx) != exclude_http_begin_idx` evaluates false for X either way, regardless of which
+arm/function-name matched), leaving them for `check_write()`'s own replay to consume normally — not
+accidentally swallowed by a `read()` call on the same request's other direction. Verified by
+re-reading the actual condition, not inferred from the fields' names.
+
+### 12.6 Scope recommendation: fix `check_write` and `write` together, not `check_write` alone
+
+`write()` (`io/streams.rs:463-566`) has the **identical** unconditional-replay gap at line 513
+(`let replayed = durability.replay(self).await;`), using the same `state.begin_index` identity.
+Six more call sites share the exact same `WriteRemoteBatched(Some(state.begin_index))` shape
+(`flush`/`blocking_flush`/`write_zeroes`/`blocking_write_zeroes_and_flush`/`splice`/
+`blocking_splice`, grepped at `io/streams.rs:587,675,728,805,895,976,1043`) — confirmed via the
+shared-pattern doc comment at `io/streams.rs:1249-1251` ("the standard retry pattern shared by
+`check_write`, `write`, `flush`, `blocking_flush`, `write_zeroes`, and
+`blocking_write_zeroes_and_flush`").
+
+§11 scoped its own fix to `HttpTypesIncomingBodyStreamRead` only (not `blocking_read`/`skip`/
+`blocking_skip`) on the reasoning that `read()` was the one confirmed call shape and the others
+were rarer, separately-triggered patterns not worth fixing without their own live evidence. That
+reasoning does **not** transfer cleanly to `check_write`/`write`: this capture's own census
+(§12.2) shows **106 `check_write` and 106 `write` calls, 1:1, in lockstep** — they are not separate
+call shapes exercised independently, they are the two halves of the same per-chunk write protocol
+(`check_write` reports capacity, `write` consumes it — confirmed adjacent in the oplog,
+`#00060`→`#00061`). Fixing `check_write` alone leaves `write()` exposed to the structurally
+identical "expected io::poll::poll, got http::types::outgoing_body_stream::write" trap — not a
+new/different bug, the other half of the exact pattern this capture already demonstrates is real
+and reachable via one ordinary `fetch()` call. **Recommendation: implement both `check_write` and
+`write` in the same change** (each gets its own small cache — response shapes differ,
+`HostResponseStreamCheckWrite` vs. `HostResponseStreamWriteWithBytes` — but the restructuring is
+mechanical, identical shape, per point 4 above applied twice).
+
+`flush`/`blocking_flush`/`write_zeroes`/`blocking_write_zeroes_and_flush`/`splice`/
+`blocking_splice`: **zero occurrences in this capture** (confirmed via the full function-census in
+§12.2 — none appear at all). Leave unfixed, same "no live evidence yet" bar §11 already applied to
+`blocking_read`/`skip`/`blocking_skip` — flagged as the same latent, structurally-identical,
+not-yet-observed gap, mechanical to extend later (add the `HostFunctionName` variant(s) to both
+match statements) if a future capture shows one of them is live-relevant.
+
+### 12.7 Test plan (mirrors §8.9/§11's approach)
+
+- **Regression, mandatory**: all existing `stray_entry_tests` (§11) and `read()`/`check_write`
+  unit coverage keep passing unmodified against the widened `is_stray_concurrent_entry` match.
+- **New unit test, seeded from this capture's actual shape**: once the real `begin_index` values
+  are extracted from the archived oplog (don't guess) — a stray `check_write` (and separately, a
+  stray `write`) entry preceding a `poll()`'s own `IoPollPoll` entry, with the stray's begin_idx in
+  `tracked.http_begin_indexes`; assert consumed+cached, `poll()`'s own entry survives untouched.
+- **"Exclude my own identity" test** (mirrors `excludes_own_invoke_result_identity`/
+  `excludes_own_http_request_identity`, §11): two concurrent HTTP requests' `check_write` entries,
+  own request's entry genuinely second — assert the sibling is recognized+cached, the caller's own
+  is left for its normal fallback read.
+- **Cross-direction non-interference test** (new, specific to this section's finding in §12.5): a
+  `read()` call for request X does NOT consume a `check_write` entry ALSO tagged begin_idx=X (same
+  request, other direction) — proving the shared `exclude_http_begin_idx` parameter treats "my own
+  request, either direction" as non-stray, correctly deferring to `check_write()`'s own replay.
+- **`check_write`/`write` cache-hit tests**: `take_pre_resolved_http_stream_check_write`
+  (resp. the `write` equivalent) populated by a prior simulated stray-consume; assert the replay
+  path uses it directly without touching the oplog.
+- **Bidirectional falsification**: a same-oplog "before" test reproducing this capture's exact
+  entry shape against the OLD unconditional `durability.replay()` mechanism (proving it genuinely
+  mismatches, matching the literal production error text in §12.1), paired with an "after" test
+  proving the widened mechanism avoids it. A true integration-level live/replay-divergence repro
+  remains not achievable for the same reason established in §4b/§7/§8.9 (hand-authored
+  deterministic Rust cannot force the underlying `wstd`-reactor-level ordering non-determinism) —
+  unchanged conclusion, now confirmed applicable to HTTP output streams too.
+- **Full regression sweep**: same bar as §7/§11 — full `--lib`, `durable_host::`, full
+  `rpc.rs`/`durability.rs` integration suites, Eighth capture's fix test, re-run after this change.
+
+### 12.8 Status
+
+**Design only.** Not implemented, not approved. No `cargo build` run, no container/binary touched,
+per this investigation phase's explicit scope (offline analysis working from the already-captured
+`3e0f1d89-character_sheet.oplog.fresh` evidence and source reading only). Ready for review.
+
+---
+
+## 13. Thirteenth capture, second agent — `expected HostCall, got FinishSpan`: the stray-scan itself over-consumes when RPC identity drifts
+
+**Capture:** `/Users/hannes/work/golem/oplog-backups/2026-08-30_smoketest_findings/b2d8d571-scene_plates.oplog.fresh`
+**Agent:** `WorkerAgent("workspace-smoketest@1.0","b2d8d571-7e0e-4a28-902c-a940f4cc42da@scene_plates")`
+**Binary:** the shipped Finding-B fix (`ed4c58fcc` / merge `5135ea4fc`) — this is a *post-fix* trap, not stale
+pre-fix evidence.
+
+Investigated independently of, and in parallel with, §12 (`3e0f1d89-character_sheet`'s `check_write`
+trap — a different agent, different entry pair, not touched here).
+
+### 13.1 The live capture
+
+```
+#01148:
+ERROR
+          at:                2026-08-30T05:23:35.234Z
+          retry from:        1098
+          error:             Unexpected oplog entry during replay: expected OplogEntry :: HostCall |,
+                             got FinishSpan { timestamp: Timestamp(Timestamp("2026-08-30T05:21:33.116000000Z")),
+                                              span_id: SpanId(13566386660567402609) }
+```
+
+Repeated verbatim at `#01149`, `#01150`, `#01152`, `#01153`, `#01155`, `#01157`, `#01159` — deterministic
+and permanent, identical `retry from: 1098` every time.
+
+`13566386660567402609 == 0xbc457cca3cb7c871`. That resolves *exactly* to an entry in this same oplog:
+
+```
+#01107:
+FINISH SPAN
+          at:                2026-08-30T05:21:33.116Z          <- byte-identical timestamp to the error
+          span id:           bc457cca3cb7c871
+```
+
+### 13.2 First conclusion: the oplog is well-formed. Nothing is misordered.
+
+The premise this investigation started from — "a span belonging to one `atomicRpcCall` region is being
+delivered/replayed at a DIFFERENT region's boundary" — is **falsified by the capture**. The relevant window
+(`#01083`–`#01140`) contains four structurally identical, strictly non-overlapping regions, each one a
+textbook `atomicRpcCall()` → `WorkflowAgent("krea2_base_realism@main",…).run()` dispatch:
+
+| Region | BeginAtomic | `get_agent_type` ×2 | StartSpan (rpc-connection) | StartSpan (rpc-invocation) | poll | ready | `future-invoke-result::get` | **FinishSpan** | EndAtomic (begin index) |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1083 | 1084–1085 | 1086 `f98d43a9cad6cba1` | 1087 `11d60b8bf0507bc5` | 1088 | 1089 | 1090 | **1091** `11d60b8bf0507bc5` | 1092 (1083) |
+| 2 | 1098 | 1099–1100 | 1101 `caf43432b25fbce7` | 1102 `bc457cca3cb7c871` | 1104 | 1105 | 1106 | **1107** `bc457cca3cb7c871` | 1108 (1098) |
+| 3 | 1114 | 1115–1116 | 1117 `2d2012cbdcd48d3d` | 1118 `a086f2c124d61844` | 1120 | 1121 | 1122 | **1123** `a086f2c124d61844` | 1124 (1114) |
+| 4 | 1130 | 1131–1132 | 1133 `d9f1a13fe17ce111` | 1134 `48d376785b2d6af8` | 1136 | 1137 | 1138 | **1139** `48d376785b2d6af8` | 1140 (1130) |
+
+Every `FinishSpan` sits exactly one entry after its own region's `future-invoke-result::get`, closing its own
+region's own `rpc-invocation` span — precisely what
+`HostFutureInvokeResult::get` does (`wasm_rpc/mod.rs:985-990`: `end_function(...)` then
+`self.finish_span(&span_id)`). `#01107` belongs to region 2 and is recorded in region 2, in the right place.
+
+(The `rpc-connection` spans — `f98d43a9…`, `caf43432…`, `2d2012cb…`, `d9f1a13f…` — are never finished at all:
+`WasmRpcEntry::drop` (`wasm_rpc/mod.rs:644-654`) is what closes them, and the guest's `WorkflowAgent` proxy
+objects were still alive at `SUSPEND`. `START SPAN` count 31 vs `FINISH SPAN` count 24 across the whole
+oplog. This is expected, not the bug — but see §13.6, it *is* the reason the deferred-drop path in §13.5 is
+reachable.)
+
+Also ruled out by direct inspection: this is **not** the overlapping-`atomically()` bug fixed app-side by
+`bdd966f`. Every `BEGIN ATOMIC REGION` in the window has its matching `END ATOMIC REGION` before the next
+`BEGIN`, with a correct `begin index:` back-reference. The app-level "serialize suspends starts" fix is
+working exactly as intended.
+
+**So the misordering is not in the recording. It is in the consumption.** Something during replay consumed
+`#01106` — region 2's own `future-invoke-result::get` entry, the only entry between the last known-good
+cursor and `#01107` — and then still demanded a `HostCall`, landing on the structural `FinishSpan` at
+`#01107`.
+
+### 13.3 Which consumer produced the error string
+
+`expected OplogEntry :: HostCall |` is the `stringify!($($cases |)+)` output of `get_oplog_entry!`
+(`durable_host/mod.rs:5632-5650`) invoked with the single case `OplogEntry::HostCall`. There are exactly
+three such call sites in the RPC/poll path:
+
+| Site | Consumer |
+|---|---|
+| `durable_host/durability.rs:868` | `read_persisted_durable_function_invocation`, reached from every `Durability::replay()` — including `poll()`'s `durability.replay(self)` (`io/poll.rs:417`) |
+| `durable_host/wasm_rpc/mod.rs:935` | `HostFutureInvokeResult::get`'s replay fallback, immediately after its stray-scan |
+| (HTTP sites — not in this trace) | |
+
+Critically, `durability.rs:1270-1296` consumes **first and validates second**: `replay_raw()` calls
+`read_persisted_durable_function_invocation()` (which runs the destructive `get_oplog_entry!`) and only then
+calls `validate_oplog_entry()` to compare `function_name`. So *any* non-`HostCall` entry at the cursor —
+`FinishSpan`, `EndAtomicRegion`, `EndRemoteWrite` — traps inside the macro with this exact message, before
+any identity check can run. **A replay consumer can destroy a structural entry it had no business reading.**
+That is the class-level defect (§13.7).
+
+### 13.4 The concurrency that makes this reachable: `poll()` batch size goes 1 → 2 at exactly region 2
+
+Every `io::poll::poll` entry in the capture, with its recorded `count` and result:
+
+```
+#01068  count: 1   ok([0])
+#01088  count: 1   ok([0])     <- region 1 RPC poll
+#01095  count: 1   ok([0])     <- region 1 promise poll
+#01104  count: 2   ok([1])     <- region 2 RPC poll   ** batch size becomes 2 here **
+#01111  count: 2   ok([1])
+#01120  count: 2   ok([1])     <- region 3 RPC poll
+#01127  count: 2   ok([1])
+#01136  count: 2   ok([1])     <- region 4 RPC poll
+#01143  count: 2   ok([1])
+```
+
+From `#01104` onward a second pollable is permanently co-resident in every `poll()` batch and never becomes
+ready (`ok([1])`, never `ok([0,1])`, never `ok([0])`). **Region 1 — the only region that replayed without
+trapping — is the only region whose `poll()` had a batch of 1. The trap is at region 2, the first region with
+a concurrent pollable batch.** That is the §2 Finding-B precondition, verbatim: `wstd`'s `Reactor` batching
+2+ concurrently-pending pollables through a `HashMap`-keyed waker set whose iteration order is
+per-process-randomized.
+
+There was no crash/restart here — `#01147` is a clean `SUSPEND` (the guest awaiting the render promise,
+`#01146` `wf_krea2_base_realism: awaiting render promise`). The trap is on the **resume replay** after that
+suspend. The only `SNAPSHOT` in the entire oplog is at line 36 (near genesis), so this is a full
+genesis replay of ~1100 entries against a freshly instantiated QuickJS guest — a different process, hence a
+different `HashMap` seed and different GC timing from the live segment that recorded them.
+
+### 13.5 Root cause: `invoke_result_seq` leaks on the deferred-`FutureInvokeResult`-delete path, so RPC identity is not replay-stable
+
+The shipped fix's soundness rests entirely on `invoke_result_seq` being assigned identically in live and in
+replay (§8.2.2, §8.8). It is not, because of a concrete gap in the clear path.
+
+**The gap.** `HostFutureInvokeResult::drop` (`wasm_rpc/mod.rs:1135-1156`) has two branches:
+
+```rust
+match self.table().delete(this) {
+    Ok(entry) => {
+        for child_rep in &entry.child_pollables { self.state.rpc_pollable_to_parent.remove(child_rep); }
+        // Only once the rep is truly freed back to the resource table (not deferred by
+        // HasChildren below) — same rep-reuse rationale as clear_pollable_seq.
+        self.state.clear_invoke_result_seq(future_rep);          // <-- cleared here
+    }
+    Err(ResourceTableError::HasChildren) => {
+        let parent: Resource<FutureInvokeResult> = Resource::new_borrow(future_rep);
+        self.table().get_mut(&parent)?.drop_pending = true;      // <-- deferred, NOT cleared (correct so far)
+    }
+    Err(err) => return Err(err.into()),
+}
+```
+
+The deferred branch is correct in isolation: the rep is still occupied, so the seq must survive. But the
+place where that deferral is *finally* honoured — `HostPollable::drop` in `io/poll.rs:196-220` — never
+clears it:
+
+```rust
+if let Some(parent_rep) = parent_rep {
+    self.state.rpc_pollable_to_parent.remove(&child_rep);
+    ...
+    if should_delete {
+        let parent_owned: Resource<...> = Resource::new_own(parent_rep);
+        if let Err(err) = self.table().delete(parent_owned) { ... }   // rep freed…
+        // …and NO self.state.clear_invoke_result_seq(parent_rep);
+    }
+}
+```
+
+`clear_invoke_result_seq` is called from exactly one place in the entire crate (`wasm_rpc/mod.rs:1146`), so
+this deferred path leaks unconditionally. Note the asymmetry with the pollable side, which is correct:
+`io/poll.rs:186` calls `clear_pollable_seq(child_rep)` unconditionally at the top of the same function.
+
+**Why the leak is not merely cosmetic.** `invoke_result_seq()` (`durable_host/mod.rs:4760-4775`) is
+`entry(rep).or_insert_with(|| { next++ })`. A leaked entry for a rep that wasmtime has already freed means
+that when the resource table hands that rep to the **next** `FutureInvokeResult`
+(`async_invoke_and_await` → `self.table().push(...)` → `invoke_result_seq(fut.rep())`,
+`wasm_rpc/mod.rs:498-528`), the lookup *hits* the stale entry: the new call silently inherits the old call's
+seq **and `next_invoke_result_seq` is not incremented**. Two distinct RPC calls then share one identity, and
+the counter is permanently offset. Additionally the leaked value never leaves
+`tracked_concurrent_op_seqs()` (`durable_host/mod.rs:4870-4880` — it is literally
+`self.invoke_result_seq.values()`), so it stays "tracked", i.e. stray-matchable, forever.
+
+**Why live and replay take different branches.** Which branch `HostFutureInvokeResult::drop` takes depends
+purely on whether the future's child pollable (created by `subscribe`, `wasm_rpc/mod.rs:658-673`) is still
+alive at the moment the future is dropped. In this guest that is decided by **QuickJS finalizer/GC timing**,
+which is not replay-stable: the live segment ran with real network latency and real suspends interleaved,
+the replay segment runs at memory speed in a fresh process. The capture proves non-trivial pollable-lifetime
+drift is already happening here — one pollable survives every region boundary from `#01104` onward
+(`count: 2` forever), and the `rpc-connection` spans are never finished at all (§13.2), i.e. the guest's RPC
+resources are living well past their logical use.
+
+**The resulting trap, step by step, at region 2:**
+
+1. Live recorded `#01106` tagged `DurableFunctionType::WriteRemoteConcurrent(S_live)`
+   (`wasm_rpc/mod.rs:843-861`), where `S_live` is whatever the live-side counter produced under live's
+   drop/GC ordering.
+2. Replay reaches region 2's `get()`. `my_invoke_result_seq = S_replay` from
+   `invoke_result_seq_if_assigned(this_rep)` (`wasm_rpc/mod.rs:896-899`) — assigned at dispatch under
+   *replay's* drop/GC ordering. `S_replay != S_live`.
+3. Cache miss: `take_pre_resolved_invoke_result(S_replay)` → `None` (`wasm_rpc/mod.rs:902-906`).
+4. Stray-scan (`wasm_rpc/mod.rs:908-927`) evaluates `#01106` via
+   `is_stray_concurrent_entry(entry, &tracked, Some(S_replay), None)`
+   (`durable_host/mod.rs:4276-4282`):
+   - `Some(S_live) != Some(S_replay)` → the "exclude my own identity" guard **does not fire**;
+   - `tracked.invoke_result_seqs.contains(&S_live)` → **true**, because `S_live` is still in the map
+     (either from the leaked entry, or from a sibling future that is still alive — every one of the four
+     futures is still alive at this point, per §13.2).
+   → **`#01106`, the caller's own entry, is classified as a stray, durably consumed, and cached under the
+   wrong key `S_live`.**
+5. The scan loop continues to `#01107` `FinishSpan` → `is_stray_concurrent_entry`'s `_ => false` arm →
+   scan stops (correctly).
+6. `get_oplog_entry!(self.state.replay_state, OplogEntry::HostCall)` (`wasm_rpc/mod.rs:935`) reads
+   `#01107` → **`Unexpected oplog entry during replay: expected OplogEntry :: HostCall |, got FinishSpan {
+   … span_id: SpanId(13566386660567402609) }`** — the observed error, with the observed span id and the
+   observed timestamp, inside the atomic region that began at `#01098` (the observed `retry from: 1098`).
+
+Every element of the production error text is accounted for, with no free parameters.
+
+**Secondary exposure, same defect, different consumer.** The identical over-consumption is reachable through
+`poll()` even without seq drift, and would produce a *byte-identical* error string via
+`durability.rs:868`. `poll()`'s stray-scan passes `exclude_invoke_result_seq: None` by design
+(`io/poll.rs:392-402`; §8.4: "poll() has no RPC identity of its own to exclude"), so **any** tracked
+`GolemRpcFutureInvokeResultGet` entry at its cursor — including one that is about to be legitimately claimed
+by a `get()` that simply has not run yet — is consumed. If the reactor reaches a `poll()` call while
+`#01106` is at the cursor, `poll()` eats `#01106`, then `durability.replay(self)` demands its own
+`IoPollPoll` and hits `#01107`. Such an extra `poll()` iteration is exactly what the recorded-positional
+poll result makes possible: `HostResponsePollResult { result: Ok(vec![1]) }` is a list of **indices into the
+guest-supplied `in_` vector**, and that vector's order comes straight from the reactor's randomized
+`HashMap` iteration. Replaying `ok([1])` against a differently-ordered `in_` wakes the *wrong* task, which
+makes no progress and re-enters `poll()`. This is the one channel of the original Finding-B non-determinism
+that the shipped fix did **not** close: `ready()` was made identity-matched (`ReadLocalPollable(seq)`) and
+`get()` was made identity-matched (`WriteRemoteConcurrent(seq)`), but `poll()`'s own recorded *answer* is
+still positional.
+
+### 13.6 Is this the same mechanism as Finding B? Yes — but it is a defect *in the fix*, not a new instance of the original bug
+
+Same root non-determinism (guest-side `HashMap`-ordered reactor batching + GC-timing-dependent resource
+lifetimes), same family, same call sites. But the failure is now one level up:
+
+- **Finding B (fixed):** a positional consumer ate an entry belonging to someone else, then mis-decoded it.
+- **This capture:** the stray-scanner built to prevent that ate an entry belonging to **itself**, then
+  crashed on the next structural entry.
+
+The stray-scan converts a *decode* failure into a *structural* failure. The observable symptom moved from
+`expected io::poll::poll, got io::poll::pollable::ready` / `expected HostResponse::PollResult, got …` to
+`expected HostCall, got FinishSpan`. That symptom shift is diagnostic: `FinishSpan` at the cursor can only
+mean the consumer is exactly one entry past where it should be.
+
+It is **not** the same mechanism as `GOLEM_SPAN_RECURSION_BUG.md`. That is a *serialization-size* bug
+(`linked_context` chains growing O(N^K) across pipeline hops → `AgentStatusRecord` blob → SQLITE_TOOBIG),
+already fixed via `without_linked_contexts()`. It touches `InvocationContextStack` construction and
+`kv_storage`, never oplog replay ordering. The only overlap is the word "span". Checked and dismissed.
+(One genuine adjacency worth recording: the `StartSpan` entries at `#01087`/`#01102`/`#01118`/`#01134` all
+carry `linked span:` equal to their own parent — i.e. `add_link()` fired
+(`durable_host/mod.rs:2815-2830`) because the `rpc-connection` parent was not in the current stack. That is
+the growth source that bug fixed; here it is benign and unrelated to the trap.)
+
+### 13.7 Fix design
+
+Three parts. (1) is a straight correctness bug and should land regardless. (2) is the principled fix for the
+class. (3) is optional depth.
+
+#### 13.7.1 Plug the `invoke_result_seq` leak (required, small, independent)
+
+`io/poll.rs`, in `HostPollable::drop`'s deferred-parent-deletion branch, mirror what the non-deferred branch
+in `wasm_rpc/mod.rs:1146` does:
+
+```rust
+if should_delete {
+    let parent_owned: Resource<golem_wasm::FutureInvokeResultEntry> = Resource::new_own(parent_rep);
+    match self.table().delete(parent_owned) {
+        Ok(_) => {
+            // The rep is only NOW freed back to wasmtime's resource table — the deferred half of
+            // HostFutureInvokeResult::drop's HasChildren branch (wasm_rpc/mod.rs:1148-1151), which
+            // deliberately does not clear here because the rep was still occupied at that point.
+            // Without this, the seq assignment leaks and the next FutureInvokeResult that reuses
+            // this rep silently inherits it (invoke_result_seq's or_insert_with hits the stale
+            // entry and does not bump next_invoke_result_seq) — two calls, one identity, and a
+            // live/replay-divergent counter. See FINDING_B_FIX_DESIGN.md §13.5.
+            self.state.clear_invoke_result_seq(parent_rep);
+        }
+        Err(err) => debug!(parent_rep, error = %err, "Deferred future invoke result delete failed"),
+    }
+}
+```
+
+Centralization note (DRY, and the reason the bug existed): "free the rep" and "clear its seq" are currently
+two facts a caller has to remember to keep together, in two different files. Prefer extracting a single
+`delete_future_invoke_result(&mut self, rep: u32)` helper that does both, and route *both* call sites
+(`wasm_rpc/mod.rs:1139` and `io/poll.rs:212`) through it, so a third deletion path cannot reintroduce the
+drift.
+
+This alone does not make the fix sound — it removes one known source of identity drift, but the mechanism
+below must not depend on identity being perfect.
+
+#### 13.7.2 No replay consumer may destructively read an entry it has not positively identified as its own (required)
+
+This is the real fix, and it is the generalization the shipped fix stopped one step short of. The invariant:
+
+> **A replay consumer consumes an oplog entry only if that entry positively matches its own identity.
+> Anything else is left in place, and the consumer synthesizes a legal "not yet" answer.**
+
+`ready()` already obeys this and is provably order-robust because of it (`io/poll.rs:113-167`: predicate
+`*seq == pollable_seq`, and on no-match `Ok(false)` — "not ready yet", a completely legal answer that makes
+the guest loop and try again). Every other consumer violates it by ending in an unconditional
+`get_oplog_entry!(…, OplogEntry::HostCall)` / `durability.replay()`. Bring them into line:
+
+**a) `HostFutureInvokeResult::get` (`wasm_rpc/mod.rs:929-975`).** Replace the terminal unconditional read
+with a predicate read on its own identity, and synthesize `Pending` on miss:
+
+```rust
+let peeked = self.state.replay_state.try_get_oplog_entry(|entry| matches!(entry,
+    OplogEntry::HostCall {
+        function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
+        durable_function_type: DurableFunctionType::WriteRemoteConcurrent(seq), ..
+    } if *seq == my_invoke_result_seq)
+    // Legacy, pre-WriteRemoteConcurrent oplogs: untagged entries are consumed positionally,
+    // exactly as before this change — unchanged behaviour for already-persisted history.
+    || matches!(entry, OplogEntry::HostCall {
+        function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
+        durable_function_type: DurableFunctionType::WriteRemote, .. })
+).await?;
+match peeked {
+    Some((_, OplogEntry::HostCall { response, .. })) => { /* existing decode, unchanged */ }
+    _ => SerializableInvokeResult::Pending,   // legal today: get() already returns Ok(None) for Pending
+}
+```
+
+`Pending` is not a new code path — `get()`'s existing `match serialized_invoke_result` already handles it
+(`wasm_rpc/mod.rs:991-993`, `SerializableInvokeResult::Pending => Ok(None)`), and the
+`if !matches!(…, Pending)` guard already skips `end_function`/`finish_span` for it. So on a miss the guest
+simply re-registers and polls again — the same self-correcting loop `ready()` relies on. **This alone would
+have turned the observed permanent trap into a transient extra loop iteration**, even with the §13.5 seq
+drift still present.
+
+**b) `poll()` (`io/poll.rs:414-417`).** Replace `durability.replay(self)` with a predicate read on
+`HostFunctionName::IoPollPoll`. On miss, do not consume: synthesize a ready-set from state that is already
+known — the indices of input pollables whose `pollable_seq` has a `pre_resolved_pollable_ready(seq) == true`,
+plus (via `rpc_pollable_to_parent` → `invoke_result_seq_if_assigned`) the indices of pollables whose parent
+future has a `pre_resolved_invoke_result` cached. Those caches exist precisely because a stray-scan already
+consumed the corresponding entry, so reporting them ready is not a guess — it is replaying the recorded
+answer to the correct pollable. If the synthesized set is empty, return `Ok(all indices)`: waking every
+registered task is safe once (a) makes `get()` and `ready()` both identity-matched and self-correcting, and
+it guarantees forward progress toward whichever task owns the next entry, instead of livelocking on
+`Ok(vec![])`.
+
+**c) HTTP stream reads / `check_write` / `write`** — the same treatment, using the `begin_idx` identity they
+already carry. This should be coordinated with §12, which is changing the same call sites; §12's
+`exclude_http_begin_idx` widening and this invariant are complementary, not competing (§12 widens *what is
+recognized as someone else's*; this bounds *what may be consumed when nothing is recognized as mine*).
+
+**Why this is strictly safer than the status quo, including for already-persisted oplogs.** Today a
+consumer that finds a non-matching entry destroys it and then fails. Under the invariant it leaves it and
+returns "not yet". The only behavioural change on the happy path is nil (the predicate matches, identical
+consumption). On the unhappy path a permanent trap becomes a retry. The one genuinely new risk is an
+infinite guest loop when the needed entry can never be produced — bounded by the existing replay-target /
+suspend machinery, and strictly preferable to today's permanent, unrecoverable trap. The legacy untagged
+fallback arms keep pre-`WriteRemoteConcurrent` oplogs byte-identical.
+
+**Why `consume_stray_entries` itself does not need to change.** It is correct as written: it walks forward
+and stops at the first non-match (`replay_state.rs:308-319`), and it correctly stopped at `#01107` here. The
+bug is not that it scanned too far — it is that its `is_stray` predicate returned a false positive on the
+caller's own entry (because identity drifted), and that the caller's *fallback* was unconditional. Fixing
+the fallback makes the mechanism robust to predicate false-positives instead of fatally dependent on
+predicate perfection. That dependency is the design smell worth removing: §8.3's "a caller must exclude its
+own identity or this would wrongly consume its own genuine entry" is a correctness precondition enforced
+only by a `!=` on a value that §13.5 proves is not replay-stable.
+
+**Post-implementation refinement — bounding (b)'s retry with the actual remaining oplog size, not a flat
+constant.** The first implementation of (b) bounded the "synthesize and retry" loop with a flat
+`MAX_POLL_REPLAY_MISSES = 64`, reverting to the unconditional read after 64 consecutive misses at an
+unmoved cursor. Reviewed and replaced: `64` is an arbitrary number with no relationship to the actual
+problem size — it is exactly the kind of guessed constant this document's own rigor bar (§7, §11, §12.4)
+rejects elsewhere. This directly implements what this section already gestured at above ("bounded by the
+existing replay-target… machinery") rather than a round number.
+
+The principled bound: replay operates over a fixed, already-recorded oplog for the duration of one replay
+pass (it does not grow mid-replay), so the cursor can advance from position `K` to `replay_target()` only
+by *someone* consuming one of the entries still between them — and there are at most
+`replay_target() - K` such entries, hence at most that many distinct "someone else made progress" events
+before the pass provably has nothing left to give. `record_poll_replay_miss()` now recomputes this
+remaining-entry count on every miss (`replay_target().distance_from(cursor)`) and gives up once the
+consecutive-miss streak at that fixed cursor exceeds it, instead of comparing against a flat constant.
+This is not merely a larger or smaller number than 64 in practice — it is a *different kind* of bound: it
+scales down to near-zero patience when almost nothing is left to replay (where 64 retries would have been
+pure waste against a pass that's already nearly live), and scales up without an artificial ceiling for a
+long remaining history where genuine cross-region interleaving (§13.4's `count: 1 → 2` batch growth is
+exactly this) could still legitimately resolve it. The cursor-movement-resets-the-streak behavior is
+unchanged — this only replaces the "how many chances" number with one tied to the problem's own bounded
+state instead of a guess. Implemented in `record_poll_replay_miss()` (`durable_host/mod.rs`) and its call
+site in `io/poll.rs`.
+
+#### 13.7.3 Optional depth: make `IoPollPoll`'s recorded result identity-based, not positional
+
+`HostResponsePollResult { result: Ok(vec![u32]) }` stores indices into the guest's `in_` list. That list's
+order is guest-controlled and, for `wstd`'s `Reactor`, `HashMap`-randomized — so a replayed index does not
+denote the same pollable it denoted live (§13.5, secondary exposure). Recording the ready pollables'
+`pollable_seq` values alongside (not instead of) the indices, and remapping seq → current position on
+replay, would close the last positional channel. Costs: a wire-format field on `HostResponsePollResult`
+(with the index list retained for old-oplog compatibility), and assigning `pollable_seq` for every member of
+`in_` inside `poll()` — which perturbs `next_pollable_seq` numbering relative to already-persisted oplogs
+and therefore needs its own careful compatibility analysis. **Recommendation: not now.** 13.7.2(b) already
+makes an extra `poll()` iteration harmless, which removes the trap without touching the wire format. Record
+this as the known-remaining gap.
+
+### 13.8 Test plan
+
+- **Falsification, `get()` self-consumption (the exact capture):** oplog =
+  `[HostCall{GolemRpcFutureInvokeResultGet, WriteRemoteConcurrent(S_live)}, FinishSpan{span_id}]`, caller
+  replaying with `my_invoke_result_seq = S_replay != S_live` and `tracked.invoke_result_seqs ∋ S_live`.
+  *Before*: asserts the current code consumes entry 1 as a stray and fails on entry 2 with literally
+  `expected OplogEntry :: HostCall |, got FinishSpan` — the production string. *After*: asserts the entry is
+  left in place and `get()` returns `Ok(None)` (Pending).
+- **`poll()` self-consumption:** oplog =
+  `[HostCall{GolemRpcFutureInvokeResultGet, WriteRemoteConcurrent(s)}, FinishSpan]` with `s` tracked;
+  *before* reproduces the same string via `durability.rs:868`; *after* asserts `poll()` consumes nothing and
+  synthesizes from cache.
+- **Seq-leak regression (§13.7.1), no oplog involved:** drive `HostFutureInvokeResult::drop` into the
+  `HasChildren` branch, then drop the child pollable, then assert `invoke_result_seq_if_assigned(rep)` is
+  `None` and that a subsequent `invoke_result_seq(rep)` returns a *fresh* seq with `next_invoke_result_seq`
+  incremented. This is the unit test that would have caught the leak — it needs no replay machinery at all.
+- **Happy-path byte-identity:** all six existing `io/poll.rs` tests, the §11 `get()`/HTTP stray tests, and
+  the Eighth capture's `recover_next_pollable_seq` test must pass unmodified — the predicate read must
+  consume exactly what the unconditional read consumed whenever identity matches.
+- **Legacy-oplog compatibility:** untagged `WriteRemote`-typed `GolemRpcFutureInvokeResultGet` entries are
+  still consumed by `get()`'s replay (the fallback arm), asserted explicitly.
+- **Full regression sweep:** same bar as §7/§11/§12.7 — full `--lib`, `durable_host::`, `rpc.rs` and
+  `durability.rs` integration suites.
+
+### 13.9 Status
+
+**Design only.** Not implemented, not approved, not committed. No `cargo build` run, no container, golem
+server or shared resource touched — offline analysis from
+`b2d8d571-scene_plates.oplog.fresh` plus source reading, per this phase's scope. Ready for review.
+
+**Post-implementation addendum — `blocking_read` shares `read`'s gap, found live.** Live-verifying §12's
+implementation against `workspace-smoketest`'s `character_sheet` agent (cold-restart, forced replay) showed
+the `check_write`/`write` fix working correctly — the agent made genuine further progress past the original
+trap, through a `reset`, into an entirely new `run()` invocation — but then hit a new, structurally
+identical trap further out: `expected io::poll::poll, got http::types::incoming_body_stream::blocking_read`,
+`begin_index: 2253`, `WriteRemoteBatched(Some(OplogIndex(2190)))`. `HttpTypesIncomingBodyStreamBlockingRead`
+is a separate `wasi:io/streams` host function from `HttpTypesIncomingBodyStreamRead` (blocking vs
+non-blocking read of the same incoming HTTP body stream) but was never brought into the stray-entry
+catalog — only `read()`'s non-blocking path was. Since both persist the identical `HostResponseStreamChunk`
+shape for the same begin_idx identity, fixed by widening `stray_entry_identity()` and
+`decode_and_cache_stray_entry()`'s existing `HttpTypesIncomingBodyStreamRead` arms to also match
+`HttpTypesIncomingBodyStreamBlockingRead` (sharing `StrayEntryIdentity::HttpStreamRead` and
+`pre_resolved_http_stream_chunk` — no new identity variant or cache needed), and giving
+`blocking_read()`'s replay branch (`io/streams.rs`) the same cache→scan→fallback shape `read()` already
+has. `skip`/`blocking_skip` were not touched — no live evidence for them yet, same bar as the rest of this
+document.
+
+Interaction with §12: independent captures, independent agents, but 13.7.2 proposes an invariant that
+governs the same call sites §12 is widening. If both land, §12's widened `is_stray` predicates should be
+paired with §13.7.2's bounded fallbacks rather than kept unconditional.
+
+---
+
+## 14. Toward a general mechanism — investigating whether cataloging can be eliminated
+
+Status: **INVESTIGATION / DESIGN ONLY.** No code changed, no `cargo build` run, no container touched.
+Worktree `/Users/hannes/work/golem-worktrees/finding-b-general-design`, branch
+`hrapp/finding-b-general-mechanism-design`, at `6cb6203fd` ("fix: replace poll() replay-miss flat
+constant with a remaining-oplog-size bound"), clean tree.
+
+**Question asked:** every extension of the stray-entry mechanism so far (§8.1 `IoPollReady`, §8.4
+`GolemRpcFutureInvokeResultGet`, §8.7 `HttpTypesIncomingBodyStreamRead`, §12
+`HttpTypesOutgoingBodyStreamCheckWrite`+`Write`) has been driven by a *live production trap* naming
+one more `(HostFunctionName, DurableFunctionType)` pair that had to be hand-added to
+`stray_entry_identity()`'s match arms, `decode_and_cache_stray_entry()`'s match arms, and usually a
+new typed cache. Is there a mechanism that derives participation from a property these functions
+*already* have, so future ones are covered without editing a catalog?
+
+**Answer in one line:** the catalog is eliminable, but not by the exact hypothesis proposed — the
+hypothesis as stated (identity from `(variant_kind, inner_value)`, function-name-blind) is
+**falsified by the real code**, and the corrected key `(function_name, inner_value)` *is* sound and
+*does* eliminate the catalog. Detail below, with the counterexample, the corrected design, the
+census of latent gaps, and the two places where irreducible per-call-site knowledge genuinely
+remains.
+
+### 14.1 What "the catalog" actually consists of, read from the code
+
+Four separable concerns, currently entangled across two hand-maintained `match` statements and five
+typed caches:
+
+| # | Concern | Where it lives today | Generalizable? |
+|---|---|---|---|
+| 1 | **Identity extraction** — "which tracked operation does this entry belong to" | `stray_entry_identity()`, `durable_host/mod.rs:4331-4365` (5 arms) + `StrayEntryIdentity`, `mod.rs:4321-4327` (5 variants) | **Yes, fully** (§14.4) |
+| 2 | **Tracked-identity source** — "is that operation currently live" | `tracked_concurrent_op_seqs()`, `mod.rs:5373-5383` — reads `pollable_seq` / `invoke_result_seq` / `open_http_requests` | **Yes, but needs one new registry** (§14.6) |
+| 3 | **Decode + cache** — turn a stray entry into a cached answer | `decode_and_cache_stray_entry()`, `mod.rs:5421-5549` (5 arms) + 5 typed `pre_resolved_*` maps, `mod.rs:4145/4176/4189/4197/4205` | **Yes, fully** (§14.4) |
+| 4 | **Own-entry predicate + legal "not yet" answer on a miss** (§13.7.2) | `is_own_poll_entry` `mod.rs:4395-4403`, `is_own_invoke_result_entry` `mod.rs:4376-4390`, `ready()`'s inline predicate `io/poll.rs:119-134` | Predicate: **yes** (§14.8). "Not yet" answer: **no — irreducible** (§14.5) |
+
+Concerns 1 and 3 are the whack-a-mole. Concern 2 is the part nobody has had to touch yet because
+all three existing identity families happened to already have a registry. Concern 4's *predicate*
+half generalizes; its *answer* half does not, and that is the one genuine per-call-site residue.
+
+### 14.2 Point 2 answered first — the full census, and the latent gaps it exposes
+
+This is independently valuable regardless of the general-mechanism question, so it is stated first.
+Method: mechanical extraction of every `Durability::<Pair>::new(ctx, DurableFunctionType::X)` site
+under `golem-worker-executor/src/durable_host/` (a script matching the constructor and its
+`DurableFunctionType` argument — 94 sites total), plus a separate grep for raw
+`oplog.add_host_call(...)` sites that bypass `Durability` entirely, cross-referenced against
+`stray_entry_identity()`'s five arms.
+
+**`DurableFunctionType::ReadLocalPollable(u32)` — 1 producing site, covered.**
+
+| Function | Site | In catalog? |
+|---|---|---|
+| `IoPollReady` | `io/poll.rs:72-81` | **yes** (`mod.rs:4333-4337`) |
+
+**`DurableFunctionType::WriteRemoteConcurrent(u32)` — 1 producing site, covered.**
+
+| Function | Site | In catalog? |
+|---|---|---|
+| `GolemRpcFutureInvokeResultGet` | `wasm_rpc/mod.rs:878-887` | **yes** (`mod.rs:4339-4343`) |
+
+**`DurableFunctionType::WriteRemoteBatched(Some(_))` — 23 producing sites across 23 distinct
+`HostFunctionName`s. 5 covered, 18 NOT.**
+
+| Function | Site(s) | Response type | In catalog? |
+|---|---|---|---|
+| `HttpTypesIncomingBodyStreamRead` | `io/streams.rs:82-85` | `StreamChunk` | **yes** (`mod.rs:4345-4349`) |
+| `HttpTypesOutgoingBodyStreamCheckWrite` | `io/streams.rs:364-367`, `423-426` | `StreamCheckWrite` | **yes** (`mod.rs:4351-4355`) |
+| `HttpTypesOutgoingBodyStreamWrite` | `io/streams.rs:490-493`, `555-558`, `615-618` | `StreamWriteWithBytes` | **yes** (`mod.rs:4357-4361`) |
+| `HttpTypesIncomingBodyStreamBlockingRead` | `io/streams.rs:167-170` | `StreamChunk` | **NO** in this worktree — reported fixed on another branch by widening the `Read` arm |
+| `HttpTypesIncomingBodyStreamSkip` | `io/streams.rs:239-242` | `StreamSkip` | **NO** |
+| `HttpTypesIncomingBodyStreamBlockingSkip` | `io/streams.rs:288-291` | `StreamSkip` | **NO** |
+| `HttpTypesOutgoingBodyStreamFlush` | `io/streams.rs:715-718` | `StreamWriteResult` | **NO** |
+| `HttpTypesOutgoingBodyStreamBlockingFlush` | `io/streams.rs:768-771` | `StreamWriteResult` | **NO** |
+| `HttpTypesOutgoingBodyStreamWriteZeroes` | `io/streams.rs:845-848`, `935-938` | `StreamWriteZeroes` | **NO** |
+| `HttpTypesOutgoingBodyStreamSplice` | `io/streams.rs:1016-1019` | `StreamSkip` | **NO** |
+| `HttpTypesOutgoingBodyStreamBlockingSplice` | `io/streams.rs:1083-1086` | `StreamSkip` | **NO** |
+| `HttpTypesFutureTrailersGet` | `http/types.rs:505-508` | `HttpFutureTrailersGet` | **NO** |
+| **`HttpTypesFutureIncomingResponseGet`** | `http/types.rs:1507-1512` (raw `add_host_call`, not `Durability`) | `HttpResponse` | **NO — see below, the strongest latent gap** |
+| `Rdbms{Mysql,Postgres,Ignite2}DbConnectionQueryStream` (×3) | `rdbms/mod.rs:322-329` | `GolemRdbmsRequest` | **NO** |
+| `Rdbms{Mysql,Postgres,Ignite2}DbResultStreamGetColumns` (×3) | `rdbms/mod.rs:432-440` | `GolemRdbmsColumns` | **NO** |
+| `Rdbms{Mysql,Postgres,Ignite2}DbResultStreamGetNext` (×3) | `rdbms/mod.rs:506-514` | `GolemRdbmsResultChunk` | **NO** |
+
+(Response types read from the `host_payload_pairs!` table, `golem-common/src/model/oplog/payload/mod.rs:448-505`.)
+
+Also checked and **correctly excluded** — these do NOT use any of the three tracked variants, so they
+are outside this bug class by construction, not latent gaps: all `websocket/client.rs` calls
+(`WriteRemote`, lines 115/211/301/392/516), all `blobstore/` calls (`ReadRemote`/`WriteRemote`), all
+`keyvalue/` calls (`ReadRemote`/`WriteRemote`), `sockets/ip_name_lookup.rs:68` (`ReadRemote`),
+`clocks/`, `random/`, `filesystem/`, `quota/`, and `golem/v1x.rs` (`ReadLocal`/`ReadRemote`/
+`WriteLocal`/`WriteRemote`). The `rdbms` transaction family (`TxnQuery`/`TxnExecute`/
+`TxnQueryStream`, `rdbms/mod.rs:627/696/755`) uses `WriteRemoteTransaction(Some(_))` — a *fourth*
+variant with the same structural shape, deliberately left out of scope here (see §14.7(c)).
+
+#### 14.2.1 The strongest latent gap: `http::types::future_incoming_response::get`
+
+This one deserves calling out separately, because it has every property of the four already-confirmed
+live traps and one more that makes it worse:
+
+1. **It is tagged with a tracked variant.** `WriteRemoteBatched(Some(begin_index))`, using the
+   *same* per-request `begin_index` from `open_http_requests` that the already-fixed
+   `read()`/`check_write()`/`write()` use (`http/types.rs:1512`; `outgoing_http.rs:234-237` mints it).
+2. **Its replay consumer is the raw, pre-fix, consume-then-validate pattern.**
+   `http/types.rs:1212`: `let (_, oplog_entry) = get_oplog_entry!(self.state.replay_state,
+   OplogEntry::HostCall)?;` — unconditional, no identity check, no stray-scan, no cache. It is one of
+   only **two** remaining unconditional `OplogEntry::HostCall` consumers in the whole crate (the
+   other being `read_persisted_durable_function_invocation`, `durability.rs:868`, which every
+   `Durability::replay()` goes through). This is verbatim the shape §13.3/§13.7.2 identified as the
+   class-level defect.
+3. **It is the completion-fetch of a genuinely concurrent operation** — the awaited half of
+   `fetch()`. `download-manager.ts:138`'s `Promise.all(batch.map(item => this.fetchBytes(item.url)))`
+   puts N of these in flight simultaneously, which is exactly the §2 precondition. The §12.2 capture's
+   own census counted **14** `http::types::future_incoming_response::get` calls in a single agent's
+   oplog.
+4. **It already has a legal "not yet" answer**, so §13.7.2's fix applies verbatim with no invention
+   needed: `SerializableHttpResponse::Pending => Ok(None)` (`http/types.rs:1251`).
+5. **Its failure mode includes the silent one.** Two concurrent requests' entries share
+   `function_name`, so today a mis-ordered pair would be accepted by `get_oplog_entry!` *and* decode
+   cleanly as `HostResponse::HttpResponse` — request A silently receiving request B's response
+   headers/status. That is §8.7's "silent data misattribution", not a loud trap.
+
+I did not find a captured oplog demonstrating this one; it is inferred from the code above, which is
+the same standard of evidence §11 used to (correctly) predict the output-stream gap before §12
+captured it live.
+
+Secondary, weaker latent gaps worth recording: `HttpTypesFutureTrailersGet` (same shape, same
+per-request identity, `Ok(None)` = Pending available, but only fires for chunked responses with
+trailers — rare in practice), and the RDBMS result-stream family (same shape, per-stream identity,
+but requires concurrently-awaited query streams and there is no registry for its `begin_index`
+today — see §14.6).
+
+### 14.3 The hypothesis as stated is falsified: `(variant_kind, inner_value)` is not an identity
+
+The proposal was to derive identity purely from the `DurableFunctionType` variant shape and its
+inner value, dropping the per-function match. Reading the real code, this is **many-to-one over both
+consumers and payload shapes**, and adopting it would be a correctness regression, not a
+generalization.
+
+**Counterexample, concrete and verified.** A single outgoing HTTP request has exactly one
+`begin_index` (`outgoing_http.rs:234-237` mints it once via
+`begin_durable_function(&WriteRemoteBatched(None))`; `HttpRequestState.begin_index`,
+`durable_host/mod.rs:3913-3917`, stores it once and covers both directions plus the response and
+trailers futures). **Thirteen distinct `HostFunctionName`s record entries tagged
+`WriteRemoteBatched(Some(that_same_begin_index))`** — `future_trailers::get`,
+`future_incoming_response::get`, `incoming_body_stream::{read, blocking_read, skip, blocking_skip}`,
+`outgoing_body_stream::{check_write, write, flush, blocking_flush, write_zeroes, splice,
+blocking_splice}` (`payload/mod.rs:493-505`) — spanning **eight distinct response payload types**:
+`HttpFutureTrailersGet`, `HttpResponse`, `StreamChunk`, `StreamSkip`, `StreamCheckWrite`,
+`StreamWriteWithBytes`, `StreamWriteResult`, `StreamWriteZeroes`.
+
+RDBMS reproduces the same shape independently: one result-stream's `begin_index`
+(`ctx.table().get(entry)?.begin_index`, `rdbms/mod.rs:431`, `505`) is shared by
+`DbConnectionQueryStream`, `DbResultStreamGetColumns` and `DbResultStreamGetNext` — three functions,
+three response types (`GolemRdbmsRequest`, `GolemRdbmsColumns`, `GolemRdbmsResultChunk`).
+
+Two concrete failures follow:
+
+1. **Cache mis-delivery — a correctness regression.** With a cache keyed by `begin_idx` alone, a
+   stray `check_write` entry consumed by some scan is cached under key `begin_idx`. The next
+   consumer to look up `begin_idx` may be `write()`, which does
+   `HostResponse::try_into::<HostResponseStreamWriteWithBytes>()` and gets
+   `Err("Expected StreamWriteWithBytes, got StreamCheckWrite(...)")` (the macro-generated
+   `TryFrom`, `golem-common/src/base_model/oplog/oplog_macro.rs:264-274`). Loud rather than silent
+   — but the entry is already durably consumed and the answer is gone, so this converts a working
+   replay into a permanent trap. Strictly worse than today.
+2. **`StrayEntryScan`'s dedup collapses.** `StrayEntryScan::accept` (`mod.rs:4442-4455`) refuses a
+   second entry per distinct identity, precisely because each cache holds one answer. With
+   `begin_idx` as the whole identity, a single HTTP request would be able to defer *one* entry
+   total across all thirteen functions — so the §12 capture's `check_write`+`write` pair (106 of
+   each, 1:1 lockstep, `§12.2`) could not both be deferred, which is exactly what §12.6 established
+   is required.
+
+The `WriteRemoteBatched(Some(_))` variant marks *"this entry belongs to batch N"*, not *"this entry
+belongs to operation N"*. Batches are not operations. That distinction is what the current code
+encodes by having five `StrayEntryIdentity` variants for three `DurableFunctionType` variants.
+
+### 14.4 The corrected hypothesis IS sound: key on `(function_name, inner_value)`
+
+Replacing the five-variant enum with a two-field key restores one-to-one identity while keeping the
+derivation fully mechanical — no per-function arm anywhere.
+
+```rust
+/// Which concurrently-tracked operation an oplog entry belongs to. Derived structurally from the
+/// entry itself: the DurableFunctionType variant says WHICH identity namespace the entry lives in
+/// and carries the identity VALUE; the function name distinguishes operations that legitimately
+/// share one value (one HTTP request's begin_index is shared by 13 host functions with 8 response
+/// shapes — see §14.3). No per-function catalog: any entry carrying one of the three
+/// concurrency-tracking variants participates automatically.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StrayEntryIdentity {
+    function_name: HostFunctionName,
+    namespace: IdentityNamespace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IdentityNamespace {
+    Pollable(u32),      // from ReadLocalPollable(seq)
+    InvokeResult(u32),  // from WriteRemoteConcurrent(seq)
+    Batch(OplogIndex),  // from WriteRemoteBatched(Some(begin_idx))
+}
+
+/// The entire replacement for stray_entry_identity()'s five hand-written arms.
+pub fn stray_entry_identity(entry: &OplogEntry) -> Option<StrayEntryIdentity> {
+    let OplogEntry::HostCall { function_name, durable_function_type, .. } = entry else {
+        return None;
+    };
+    let namespace = match durable_function_type {
+        DurableFunctionType::ReadLocalPollable(seq) => IdentityNamespace::Pollable(*seq),
+        DurableFunctionType::WriteRemoteConcurrent(seq) => IdentityNamespace::InvokeResult(*seq),
+        DurableFunctionType::WriteRemoteBatched(Some(idx)) => IdentityNamespace::Batch(*idx),
+        _ => return None,
+    };
+    Some(StrayEntryIdentity { function_name: function_name.clone(), namespace })
+}
+```
+
+Five arms keyed on function names become three arms keyed on variant shapes, and the set of
+participating functions becomes closed-by-construction: whoever writes
+`Durability::<NewThing>::new(self, DurableFunctionType::WriteRemoteBatched(Some(idx)))` gets
+stray-participation for free, with no second list to remember.
+
+**`decode_and_cache_stray_entry()` (5 arms, ~130 lines, `mod.rs:5421-5549`) disappears entirely**,
+replaced by a single generic cache holding un-narrowed `HostResponse` values:
+
+```rust
+/// REPLAY-ONLY: answers consumed early by a DIFFERENT operation's stray-scan, held un-narrowed for
+/// their real owner to take and narrow itself. Replaces the five typed pre_resolved_* maps.
+pre_resolved_stray: HashMap<StrayEntryIdentity, HostResponse>,
+```
+
+```rust
+pub async fn decode_and_cache_stray_entry(&mut self, idx: OplogIndex, entry: OplogEntry)
+    -> Result<(), WorkerExecutorError>
+{
+    let identity = stray_entry_identity(&entry)
+        .ok_or_else(|| WorkerExecutorError::runtime("scan matched a non-identity entry"))?;
+    let OplogEntry::HostCall { response, .. } = entry else { unreachable!() };
+    let host_response: HostResponse =
+        self.oplog.download_payload(response).await.map_err(WorkerExecutorError::runtime)?;
+    self.pre_resolved_stray.insert(identity, host_response);
+    Ok(())
+}
+```
+
+**Is that round-trip actually supported? Verified by reading, not assumed:**
+
+- `OplogEntry::HostCall.response` is `OplogPayload<HostResponse>`
+  (`golem-common/src/base_model/oplog/mod.rs:106-118`).
+- `Oplog::download_payload` already returns the *enum* `HostResponse`, not a narrowed type — this
+  is what the current `decode_and_cache_stray_entry` calls (`mod.rs:5433-5437`), immediately
+  followed by `host_response.try_into()` to narrow (`mod.rs:5438-5440`). **The download and the
+  narrowing are already two separate steps**; the change is purely to stop performing the second
+  one at scan time.
+- The narrowing is the macro-generated `impl TryFrom<HostResponse> for HostResponse<Case>`
+  (`oplog_macro.rs:264-274`) — a pure `match`, `Error = String`, no side effects, so it is equally
+  valid at any later point.
+- `HostResponse` derives `Clone, Debug, PartialEq` (`oplog_macro.rs:213`), so it is storable in a
+  map by value.
+- Every consumer already has its target type available at compile time:
+  `HostPayloadPair::Resp: Into<HostResponse> + TryFrom<HostResponse, Error = String> + Clone`
+  (`golem-common/src/model/oplog/payload/mod.rs:435`), and every `Durability<Pair>` is
+  parameterised by exactly that `Pair`. `Durability::replay()` already performs this identical
+  narrowing on the non-cached path (`durability.rs:1260-1268`).
+
+So the answer to "does `OplogPayload`/`HostResponse` support round-tripping this way" is **yes,
+verified** — and the design is not even a new capability, it is a *removal* of a premature
+narrowing that the current code performs at the wrong place.
+
+**One real, small prerequisite found:** `HostFunctionName` is generated with
+`#[derive(Debug, Clone, PartialEq, desert_rust::BinaryCodec)]` (`oplog_macro.rs:326-327`) — it has
+neither `Eq` nor `Hash`, and `DurableFunctionType` has `Eq` but not `Hash`
+(`golem-common/src/model/oplog/raw_types.rs:308-317`). Using either in a `HashMap` key requires
+adding those derives. Both are fieldless enums plus one `Custom(String)` arm, so the derives are
+mechanical and total — but this is a `golem-common` change, not a `golem-worker-executor`-local one,
+and should be called out rather than discovered at compile time.
+
+### 14.5 Question 1 answered: what irreducible per-type knowledge remains
+
+Three things remain per-call-site. Two of them are *not* the problem being solved; one is real.
+
+1. **Narrowing the cached `HostResponse` to the concrete response type at the point of use.**
+   Already free — `Pair::Resp` is a compile-time associated type on the `Durability<Pair>` the call
+   site already constructs. **This is emphatically NOT the same problem as the catalog**, and the
+   distinction is worth stating precisely: the catalog is a *centralized* list that must be kept in
+   sync with a *decentralized* set of call sites — the failure mode is a call site existing that the
+   central list has never heard of, which is undiscoverable by the compiler and only surfaces as a
+   production trap. Narrowing-at-use has the opposite structure: the knowledge lives at the one
+   place that already has it, the compiler enforces it, and a new call site cannot be "forgotten"
+   because it does not exist until someone writes it. Confirmed by reading: `durability.rs:1260-1268`
+   already does exactly this narrowing today for every one of the 92 `durability.replay(...)` call
+   sites in the crate, and nobody maintains a list of them.
+
+2. **Consumer-side side effects on a cache hit.** e.g. `future_incoming_response::get`'s
+   `self.table().push(incoming_response)` / `continue_http_request(...)` / `state.response_status`
+   mutation (`http/types.rs:1251-1275`). These already live at the call site and are unaffected —
+   the stray-scan only downloads and caches the raw payload; the owner still performs its own
+   effects when it takes the cached answer.
+
+3. **The legal "not yet" answer on an own-entry miss (§13.7.2) — genuinely irreducible.** There is
+   no way to derive from `(function_name, DurableFunctionType)` that
+   `SerializableInvokeResult::Pending`, or `SerializableHttpResponse::Pending`, or `Ok(false)`, or
+   `Ok(None)` is the value that makes the guest retry harmlessly. It is a semantic property of each
+   host function's contract. **However**, a safe *generic default* exists and is strictly better
+   than today: on a miss, **do not consume, and return
+   `WorkerExecutorError::unexpected_oplog_entry`**. Today's behaviour is *consume, then* fail
+   (`durability.rs:1287-1294`: `read_persisted_durable_function_invocation()` runs the destructive
+   `get_oplog_entry!` at `durability.rs:868` and only then `validate_oplog_entry` runs) — which is
+   precisely the §13.3 defect that destroys structural entries and makes a recoverable divergence
+   permanent. So the generalization can ship with "non-destructive error" as the default for all 92
+   `Durability::replay()` sites, and the handful of functions with a real Pending answer opt in
+   individually. That opt-in is a per-call-site override, not a central catalog.
+
+### 14.6 Question 2's other half: the tracked-identity source, and why it must NOT be dropped
+
+The tempting further simplification — "if every consumer participates, we don't need
+`tracked_concurrent_op_seqs()` at all; any entry with a tracked-shape variant is deferrable" — is
+**unsound**, and there is a concrete counterexample in the shipped code.
+
+**Counterexample.** `check_write()` has three replay-reachable branches, and only the first consults
+the cache:
+- `io/streams.rs:397-415` — the `is_http` branch: cache → scan → `durability.replay`. Participates.
+- `io/streams.rs:417-430` — the `replaying_http_batch` branch: plain `durability.replay(self)`. Does
+  **not** consult `pre_resolved_http_stream_check_write`.
+- `io/streams.rs:432-465` — the post-snapshot-restore branch: a bare function-name-only
+  `try_get_oplog_entry`. Does **not** consult the cache either.
+
+The second and third branches are reached exactly when `open_http_requests` is empty — which is also
+exactly when `tracked_concurrent_op_seqs()` returns an empty `http_begin_indexes` set
+(`mod.rs:5377-5381`), so today nothing defers their entries and they see them. Remove the tracked-set
+guard and some other consumer's scan can now defer an entry that one of these two branches is about
+to look for; the post-snapshot branch's predicate then returns `None` and it **falls through to a
+live `HostOutputStream::check_write` while still replaying** (`io/streams.rs:466-470`). That is a
+real regression, and it is the precise scope caveat already documented in
+`tracked_concurrent_op_seqs()`'s own doc comment (`mod.rs:5365-5372`) and §11.
+
+**So: generalize the source, keep the guard.** The generalization is straightforward and, notably,
+covers the whole `WriteRemoteBatched` family in one stroke:
+
+```rust
+/// Every currently-open batched-remote-write region, by its BeginRemoteWrite index. Inserted in
+/// begin_function() when a WriteRemoteBatched(None) call mints one, removed in end_function() when
+/// the matching EndRemoteWrite is written/consumed — the single authoritative pair of points, so a
+/// new batched host function needs no registry work of its own.
+open_batches: HashSet<OplogIndex>,
+```
+
+Verified this is the right pair of points by reading them: `begin_function`
+(`durable_host/mod.rs:1203-1345`) takes the `BeginRemoteWrite` branch for
+`WriteRemoteBatched(None)` **unconditionally, independent of `assume_idempotence`**
+(`mod.rs:1212-1217`), writing the entry when live (`mod.rs:1219-1225`) and consuming it via
+`get_oplog_entry!(.., OplogEntry::BeginRemoteWrite)` when replaying (`mod.rs:1227-1228`) — so the
+index is symmetric across live and replay, which is exactly the property §8.2.1 found *missing* from
+RPC's rejected `begin_index` idea. `end_function` (`mod.rs:1348-1381`) is the symmetric close
+(`mod.rs:1365-1376`).
+
+This registry has **the same scope** as today's `open_http_requests`-derived set — it is repopulated
+on a full replay that re-executes `handle()`, and is not repopulated when resuming past a snapshot
+taken mid-request (in which case `begin_function` is not re-executed either, for the same reason).
+So it is a strict generalization with no scope change: HTTP behaves identically, and RDBMS
+result-streams gain a registry they do not have today for free. `pollable_seq` and
+`invoke_result_seq` stay exactly as they are (one producing site each, §14.2).
+
+Net effect on `tracked_concurrent_op_seqs()`: three sources instead of three sources — but the third
+is now shape-derived rather than HTTP-specific, so **adding a new `WriteRemoteBatched` host function
+requires zero registry work**, which was the last remaining per-function obligation.
+
+### 14.7 Question 3 answered: where generalization could be unsound — five candidates checked
+
+I looked specifically for a use of one of the three variants that means something *other than*
+"these are fungible concurrent siblings". Findings:
+
+**(a) `RdbmsXxxDbConnectionQueryStream` mints its own identity in the same call that records its
+entry.** `rdbms/mod.rs:322-329`: `begin_durable_function(&WriteRemoteBatched(None))` on line 322-324
+immediately followed by `Durability::<T::ConnQueryStream>::new(ctx,
+WriteRemoteBatched(Some(begin_index)))` on line 325-329. Unlike pollables (created before `ready()`),
+RPC futures (created in `async_invoke_and_await`, §8.8) and HTTP streams (opened in `handle()`), this
+identity does not exist before its own entry does — so a `ConnQueryStream` entry can never
+*legitimately* be a stray for someone else's scan. Under the `open_batches` registry it would
+nonetheless become deferrable (registration happens on the immediately preceding line). Traced
+through: **not unsound** — if a sibling's scan defers it, the owner's own generalized replay finds it
+in the cache under the identical key. It is dead machinery for that function, not wrong machinery.
+Worth a code comment so a future reader does not mistake it for an oversight.
+
+**(b) The same function is sometimes tracked and sometimes not.**
+`db_result_stream_durable_get_columns`/`get_next` (`rdbms/mod.rs:432-437`, `506-511`) pick
+`WriteRemoteTransaction(Some(idx))` when the stream is inside a transaction and
+`WriteRemoteBatched(Some(idx))` otherwise. So participation is a property of the *entry*, not of the
+*function*. This is not unsound (the transactional case simply does not participate, conservatively),
+but it means the design's own framing must be "any **entry** tagged with one of these variants", not
+"any **function** tagged with one of these variants". Stated here so the invariant is not
+mis-transcribed later.
+
+**(c) `WriteRemoteTransaction(Some(_))` is a fourth variant of identical structural shape.**
+`raw_types.rs:343-344`; used at `rdbms/mod.rs:627/696/755` and the two sites in (b). Deliberately
+left out. Reasoning: transactional RDBMS operations are serialized within a transaction by
+construction, so the "concurrent siblings" precondition does not hold the way it does for pollables /
+RPC futures / HTTP body streams; and unlike the other three, `no_concurrent_side_effect`
+(`golem-common/src/model/oplog/mod.rs:99-118`) treats it as batch-scoped in the same way — i.e. the
+engine already assumes transactional entries are not interleaved with foreign ones. Adding it should
+require its own live evidence, exactly as §11/§12 required for each HTTP direction. **This is the
+one place where the "recognize any of the tracked variant shapes" rule must remain a deliberate
+three-item list rather than "anything carrying an inner value"** — the list is over *variants*
+(closed, 3 entries, changes only when the enum changes) rather than over *functions* (open, 23 and
+growing), which is the whole point.
+
+**(d) Repeated calls under a single identity, and the implicit FIFO assumption.** `check_write`/
+`write` fire 106 times each under one `begin_index` (§12.2); `StreamGetNext` fires once per row
+chunk under one stream `begin_index`. The cache holds one answer per key, and `StrayEntryScan`
+(`mod.rs:4417-4456`) plus `cached_stray_identities()` (`mod.rs:5389-5414`) bound a scan to one entry
+per identity including already-cached-but-uncollected ones. That machinery transfers verbatim to
+`(function_name, inner_value)` keys — indeed it becomes *more* precise, since today's five-variant
+enum already keys `check_write` and `write` separately and the new key does the same for the other
+18 functions. The bound relies on an assumption worth making explicit: **the first entry deferred
+for key K must be the one K's owner wants next.** That holds because each key corresponds to one
+WASI resource read/written by one guest task in order (WASI resource ownership makes two tasks
+sharing a `Resource<InputStream>` impossible). It would not hold for a hypothetical identity shared
+by two independent consumers — none found.
+
+**(e) `end_durable_function` is skipped on the cache-hit path — a pre-existing asymmetry the
+generalization removes.** Today's three cache-hit paths (`io/streams.rs:133-136` for `read()`,
+`io/streams.rs:396-402` for `check_write()`, `wasm_rpc/mod.rs:928-932` for `get()`) return the cached
+value directly, bypassing `Durability::replay_raw` and therefore its
+`ctx.end_durable_function(&self.function_type, self.begin_index, false)` call
+(`durability.rs:1293-1294`). For `WriteRemoteBatched(Some(_))` `end_function` itself is a no-op
+(`mod.rs:1379`), but the `DurabilityHost` wrapper additionally performs
+`commit_oplog_and_update_state(CommitLevel::DurableOnly)` for any `WriteRemoteBatched(_)`
+(`durability.rs:817-828`), which the cache-hit path therefore skips. I did not find a failure mode
+this causes on the replay path (it commits already-persisted state), so this is recorded as an
+inconsistency rather than a bug — but note that pushing the mechanism *inside* `Durability::replay()`
+(§14.9) makes the cache hit go through the same tail and removes the asymmetry for free.
+
+**No case was found in which deferring a tracked-shape entry is semantically wrong.** The dangers are
+all about *identity resolution* (a) — (d) and *coverage* (§14.6), not about deferral itself.
+
+### 14.8 Question 4 answered: §13.7.2's own-entry predicates generalize too
+
+Yes — and to a single function with a three-row table, not one predicate per consumer.
+
+The three predicates in the code today:
+
+| Consumer | Predicate | Own-identity test | Legacy allowance |
+|---|---|---|---|
+| `ready()` | inline, `io/poll.rs:119-134` | `(IoPollReady, ReadLocalPollable(seq))`, `seq == my_seq` | `(IoPollReady, ReadLocal)` |
+| `get()` | `is_own_invoke_result_entry`, `mod.rs:4376-4390` | `(GolemRpcFutureInvokeResultGet, WriteRemoteConcurrent(seq))`, `seq == my_seq` | `(GolemRpcFutureInvokeResultGet, WriteRemote)` |
+| `poll()` | `is_own_poll_entry`, `mod.rs:4395-4403` | `(IoPollPoll, *)` | n/a |
+
+All three are the same shape: *same function name* AND *(same identity value OR an untagged legacy
+predecessor of the same variant family)*. The general form:
+
+```rust
+/// Does this entry positively identify as the caller's own? The §13.7.2 invariant, expressed once.
+/// `expected` is the caller's own DurableFunctionType — the exact value it tags its LIVE entry with
+/// — so the identity comparison needs no per-call-site code.
+pub fn is_own_host_call_entry(
+    entry: &OplogEntry,
+    expected_fn: &HostFunctionName,
+    expected: &DurableFunctionType,
+) -> bool {
+    let OplogEntry::HostCall { function_name, durable_function_type, .. } = entry else {
+        return false;
+    };
+    function_name == expected_fn
+        && (durable_function_type == expected
+            || is_legacy_untagged_predecessor(durable_function_type, expected))
+}
+
+/// Pre-tagging oplogs recorded these entries with the untagged parent variant. Closed 3-row table,
+/// keyed on the ENUM, so it changes only when DurableFunctionType changes — never per function.
+fn is_legacy_untagged_predecessor(actual: &DurableFunctionType, expected: &DurableFunctionType) -> bool {
+    matches!(
+        (actual, expected),
+        (DurableFunctionType::ReadLocal,   DurableFunctionType::ReadLocalPollable(_))
+      | (DurableFunctionType::WriteRemote, DurableFunctionType::WriteRemoteConcurrent(_))
+    )
+}
+```
+
+Checked against each existing predicate:
+
+- **`ready()`**: `expected = ReadLocalPollable(my_seq)`, `expected_fn = IoPollReady` → identical
+  behaviour including the legacy `ReadLocal` arm. ✔
+- **`get()`**: `expected = WriteRemoteConcurrent(my_seq)` → identical including the legacy
+  `WriteRemote` arm. ✔
+- **`poll()`**: `expected = ReadLocal` (the value `io/poll.rs:277-278` tags its live entry with — the
+  only production `IoPollPoll` site, verified by grep). The general form additionally requires
+  `durable_function_type == ReadLocal`, i.e. it is strictly *stricter* than
+  `is_own_poll_entry`'s function-name-only match. Since no other `DurableFunctionType` has ever been
+  used for `IoPollPoll`, the two are equivalent on all real oplogs. ✔
+- **`WriteRemoteBatched(Some(_))` needs no legacy row**: verified that no production
+  `Durability::<_>::new` site ever passes `WriteRemoteBatched(None)` (the census in §14.2 found zero;
+  `None` appears only at `begin_durable_function`/`end_durable_function` call sites —
+  `http/mod.rs:31`, `outgoing_http.rs:235,414`, `rdbms/mod.rs:323,380,602`), so every persisted
+  `WriteRemoteBatched` HostCall entry has always carried `Some(idx)`.
+
+**Bonus, and this is the substantive part:** because `Durability<Pair>` already holds both halves —
+`Pair::HOST_FUNCTION_NAME` (a const, `payload/mod.rs:441`) and `self.function_type`
+(`durability.rs:1037`) — this predicate can be applied *inside* `Durability::replay()` with **no
+argument from the call site at all**. That is what turns the fix from "five call sites" into "all 92".
+
+### 14.9 Concrete design
+
+Five pieces. (1)–(3) are the catalog elimination; (4) is the payoff; (5) is staging.
+
+**1. `golem-common`:** add `Eq, Hash` to the `HostFunctionName` derive (`oplog_macro.rs:326`) and
+`Hash` to `DurableFunctionType` (`raw_types.rs:308-317`). No behavioural change; both are required
+purely to use them as `HashMap` keys.
+
+**2. `durable_host/mod.rs`:** replace `StrayEntryIdentity` (5 variants, `mod.rs:4321-4327`) and
+`stray_entry_identity()` (5 arms, `mod.rs:4331-4365`) with the struct + 3-arm shape match of §14.4.
+Replace the five `pre_resolved_*` maps (`mod.rs:4145`, `4176`, `4189`, `4197`, `4205`) and their ten
+`record_/take_` accessors (`mod.rs:5049-5248`) with one `pre_resolved_stray:
+HashMap<StrayEntryIdentity, HostResponse>` and one `record_/take_` pair. Replace
+`decode_and_cache_stray_entry()`'s 5 arms (`mod.rs:5421-5549`, ~130 lines) with the 8-line generic
+download-and-store of §14.4. `cached_stray_identities()` (`mod.rs:5389-5414`) collapses to
+`self.pre_resolved_stray.keys().cloned().collect()`. `is_stray_concurrent_entry`
+(`mod.rs:4291-4312`) keeps its structure but takes `exclude: Option<&StrayEntryIdentity>` instead of
+the two ad-hoc `exclude_invoke_result_seq` / `exclude_http_begin_idx` parameters, and consults a
+`tracked` set of `IdentityNamespace` values rather than three typed sets.
+
+**3. `tracked_concurrent_op_seqs()`** (`mod.rs:5373-5383`) returns a single
+`HashSet<IdentityNamespace>` built from `pollable_seq.values()`, `invoke_result_seq.values()`, and
+the new `open_batches` registry (§14.6) — the last replacing the `open_http_requests`-derived set,
+maintained in `begin_function` (`mod.rs:1219-1228`) / `end_function` (`mod.rs:1365-1376`).
+`is_pollable_pre_resolved_ready` (`mod.rs:5258-5272`), used by `poll()`'s synthesis path, rewrites
+against the single map with `StrayEntryIdentity { function_name: IoPollReady, .. }` /
+`{ function_name: GolemRpcFutureInvokeResultGet, .. }` lookups.
+
+**4. Push the whole protocol into `Durability::replay()`** — the reason to do any of this. Add three
+methods to the `DurabilityHost` trait (`durability.rs:501-545`, and to `MockDurabilityHost`,
+`durability.rs:1669+`):
+
+```rust
+async fn consume_and_cache_stray_entries(&mut self, exclude: Option<&StrayEntryIdentity>)
+    -> Result<(), WorkerExecutorError>;
+fn take_pre_resolved_stray(&mut self, id: &StrayEntryIdentity) -> Option<HostResponse>;
+async fn try_read_own_host_call(&mut self, fname: &HostFunctionName, dft: &DurableFunctionType)
+    -> Result<Option<PersistedDurableFunctionInvocation>, WorkerExecutorError>;
+```
+
+and restructure `Durability::replay_raw` (`durability.rs:1270-1296`):
+
+```rust
+pub async fn replay_raw(&self, ctx: &mut impl DurabilityHost) -> Result<HostResponse, WorkerExecutorError> {
+    // ... unchanged PersistNothing warning ...
+    let identity = stray_identity_of(Pair::HOST_FUNCTION_NAME, &self.function_type);
+
+    let response = match &identity {
+        // 1. Untracked function type — unchanged legacy path, byte for byte.
+        None => {
+            let e = ctx.read_persisted_durable_function_invocation().await?;
+            Self::validate_oplog_entry(&e, Pair::FQFN, self.begin_index)?;
+            e.response
+        }
+        Some(id) => {
+            // 2. A sibling's scan may already hold my answer.
+            if let Some(cached) = ctx.take_pre_resolved_stray(id) {
+                cached
+            } else {
+                // 3. Defer past strays belonging to OTHER tracked operations.
+                ctx.consume_and_cache_stray_entries(Some(id)).await?;
+                // 4. §13.7.2: consume only a positively-identified own entry.
+                match ctx.try_read_own_host_call(&Pair::HOST_FUNCTION_NAME, &self.function_type).await? {
+                    Some(e) => e.response,
+                    // 5. Generic default: non-destructive error. Call sites with a legal
+                    //    "not yet" answer override via replay_or(not_yet) — see below.
+                    None => return Err(WorkerExecutorError::unexpected_oplog_entry(
+                        Pair::FQFN, "no matching entry at cursor")),
+                }
+            }
+        }
+    };
+    ctx.end_durable_function(&self.function_type, self.begin_index, false).await?;
+    Ok(response)
+}
+
+/// Opt-in for host functions that have a legal "not yet" answer (§13.7.2, §14.5.3):
+/// `HttpTypesFutureIncomingResponseGet` -> SerializableHttpResponse::Pending,
+/// `HttpTypesFutureTrailersGet` -> Ok(None), RPC get() -> SerializableInvokeResult::Pending, ...
+pub async fn replay_or(&self, ctx: &mut impl DurabilityHost, not_yet: Pair::Resp)
+    -> Result<Pair::Resp, WorkerExecutorError> { /* as above, returning not_yet at step 5 */ }
+```
+
+With this, **all 92 `durability.replay(...)` / `replay_raw(...)` call sites in the crate get the
+mechanism at once**, and the five bespoke cache-then-scan-then-fallback blocks currently hand-written
+at `io/streams.rs:133-148`, `io/streams.rs:396-415`, `io/streams.rs:~520-545` (`write`),
+`wasm_rpc/mod.rs:926-985` and `io/poll.rs:394-470` collapse to `durability.replay(self)` /
+`durability.replay_or(self, Pending)`. Note `poll()` and `ready()` cannot go through
+`Durability::replay()` as written (both hand-roll their reads and `ready()` never constructs a
+`Durability` on the replay path, `io/poll.rs:112-167`) — they keep their bespoke code, but consume
+the same three shared primitives.
+
+`http/types.rs:1212`'s raw `get_oplog_entry!(.., OplogEntry::HostCall)` (§14.2.1) is the one site
+that must be converted by hand rather than inherited, since it never used `Durability` in the first
+place. Converting it to a `Durability::<HttpTypesFutureIncomingResponseGet>` + `replay_or(self,
+HostResponseHttpResponse { response: SerializableHttpResponse::Pending })` closes the single
+highest-risk latent gap found in this investigation.
+
+**5. Staging.** Land in three separately-falsifiable commits, not one: (i) key/cache unification
+(pure refactor — all existing `stray_entry_tests` (`mod.rs:4458-4790`) and `replay_state.rs` scan
+tests must pass **unmodified**, which is the falsification bar: the refactor is correct iff it is
+invisible); (ii) the `open_batches` registry replacing `http_begin_indexes` (same bar, plus a new
+test that an RDBMS-shaped `begin_index` is now tracked); (iii) `Durability::replay()` integration
+plus the `http/types.rs:1212` conversion (the behavioural change; needs its own before/after
+falsification pair per §12.7/§13.8's pattern, seeded from the `future_incoming_response::get` shape).
+
+### 14.10 Verdict
+
+**The generalization is sound and worth building, with one correction and one caveat.**
+
+- **Correction:** identity must be `(function_name, inner_value)`, not `(variant_kind, inner_value)`.
+  The function-name-blind form is falsified by 13 HTTP host functions sharing one `begin_index` across
+  8 response types (§14.3) — adopting it would be a correctness regression, not a generalization.
+- **Caveat:** the *catalog of functions* is fully eliminable; the *list of participating
+  `DurableFunctionType` variants* is not, and should not be — it stays a deliberate 3-row match over
+  a closed enum (`WriteRemoteTransaction` is excluded on purpose, §14.7(c)). That list changes only
+  when the enum changes, which is a compiler-visible event, unlike a function catalog.
+- The tracked-identity guard must be kept, not dropped (§14.6, counterexample in `check_write`'s two
+  non-participating replay branches) — but its source generalizes to an `open_batches` registry
+  maintained at the single `begin_function`/`end_function` pair, after which a new
+  `WriteRemoteBatched` host function needs *zero* engine changes to participate.
+- The one genuinely irreducible per-type fact is the legal "not yet" answer (§14.5.3), and it has a
+  safe generic default (non-destructive error) that is strictly better than today's
+  consume-then-fail.
+
+**What was verified by reading code vs. inferred.** Verified by reading: the full census in §14.2
+(mechanical extraction over 94 `Durability::new` sites plus a raw-`add_host_call` grep); the 13
+functions / 8 response types sharing one HTTP `begin_index` (`payload/mod.rs:493-505` cross-referenced
+with `HttpRequestState.begin_index`, `mod.rs:3913-3917`); the `HostResponse` download/narrow
+separation and its `TryFrom` (`oplog_macro.rs:264-274`, `mod.rs:5433-5440`, `durability.rs:1260-1268`);
+the missing `Eq`/`Hash` derives (`oplog_macro.rs:326`, `raw_types.rs:308-317`); `begin_function`'s
+unconditional `BeginRemoteWrite` for `WriteRemoteBatched(None)` on both live and replay
+(`mod.rs:1212-1228`); `check_write`'s three replay branches and which consult the cache
+(`io/streams.rs:397-465`); `future_incoming_response::get`'s unconditional
+`get_oplog_entry!(.., HostCall)` and its `Pending` arm (`http/types.rs:1212`, `:1251`); the
+equivalence of all three existing own-entry predicates to the general form (§14.8). Inferred, not
+proven: that `future_incoming_response::get` is *live*-reachable as a trap (no capture yet — the
+argument is structural, at the same evidence standard §11 used to correctly predict §12's
+output-stream trap); that the `end_durable_function` cache-hit asymmetry (§14.7(e)) is harmless; and
+that the RDBMS result-stream family is a real-world concurrency risk at all (it has the shape, but
+no observed concurrent-query-stream workload).
+
+### 14.11 Test plan sketch
+
+- **Falsification of §14.3's counterexample (must exist before the refactor lands):** a test that
+  builds a `check_write` and a `write` entry sharing one `begin_idx`, runs a scan, and asserts *both*
+  are deferred and each is returned to its own consumer narrowed correctly. Under the rejected
+  function-name-blind key this test cannot pass — that is the permanent proof the correction was
+  necessary.
+- **Refactor-invisibility (the bar for staging step (i)):** every existing test in
+  `mod.rs`'s `stray_entry_tests` (`mod.rs:4458-4790`) and `replay_state.rs`'s scan tests passes with
+  **zero edits** beyond the mechanical `StrayEntryIdentity` constructor change.
+- **New-function-participates-for-free:** a test that constructs an oplog entry for a function *not*
+  named anywhere in the engine's stray code (e.g. `HttpTypesOutgoingBodyStreamFlush`), tagged
+  `WriteRemoteBatched(Some(tracked_idx))`, and asserts `stray_entry_identity` recognizes it and
+  `decode_and_cache_stray_entry` caches it. This is the test that proves the catalog is gone.
+- **Tracked-guard preserved:** the same entry with `tracked_idx` *not* in `open_batches` must be
+  rejected — the §14.6 counterexample, as a regression test.
+- **`open_batches` lifecycle:** register on `begin_function(WriteRemoteBatched(None))`, deregister on
+  `end_function`, symmetric live/replay; plus the negative case (mid-request snapshot → empty set →
+  nothing deferred, matching §11's documented scope).
+- **`future_incoming_response::get` before/after pair**, seeded from the shape in §14.2.1: two
+  concurrent requests' `HttpTypesFutureIncomingResponseGet` entries with swapped order. *Before*:
+  assert the current `get_oplog_entry!` path silently returns request B's response to request A
+  (the silent-misattribution failure mode). *After*: assert A defers B's entry, caches it, and reads
+  its own.
+- **Legacy-oplog byte-identity:** untagged `WriteRemote`-typed `GolemRpcFutureInvokeResultGet` and
+  `ReadLocal`-typed `IoPollReady` entries still consumed by their owners via
+  `is_legacy_untagged_predecessor` (§14.8).
+- **Full regression sweep** at the §7/§11/§12.7/§13.8 bar: full `--lib`, `durable_host::`, and the
+  `rpc.rs` / `durability.rs` integration suites.
+
+### 14.12 Status
+
+**Design only.** Nothing implemented, nothing committed, no build run. Ready for review.
+
+### 14.13 Implementation status — what actually landed
+
+Status: **IMPLEMENTED.** Branch `hrapp/finding-b-general-mechanism-design`, five commits on top of
+`2b873f4b9`. `cargo build --release -p golem-worker-executor` clean;
+`cargo test -p golem-worker-executor --lib --release` = **488 passed, 0 failed, 0 ignored, 0
+filtered** (461 before this work, +27 new).
+
+**Landed as designed:**
+
+| §14 proposal | Landed |
+|---|---|
+| `Eq`/`Hash` on `HostFunctionName` (`oplog_macro.rs:326`) | yes — `Hash` on `DurableFunctionType` turned out unnecessary (see below) |
+| `StrayEntryIdentity = (HostFunctionName, IdentityNamespace)` | yes, verbatim |
+| `stray_entry_identity()` → 3-arm shape match, no per-function arms | yes |
+| Five typed `pre_resolved_*` maps → one `HashMap<StrayEntryIdentity, HostResponse>` | yes |
+| `decode_and_cache_stray_entry()`'s five arms (~130 lines) → generic download-and-store | yes |
+| `cached_stray_identities()` → `keys().cloned()` | yes |
+| `open_batches` registry in `begin_function`/`end_function` | yes |
+| Tracked-identity guard kept (§14.6 counterexample) | yes, with a dedicated regression test each side |
+| Push the protocol into `Durability::replay_raw` (§14.9 item 4) | yes — see scope note below |
+| `http/types.rs`'s raw `get_oplog_entry!` converted by hand | yes |
+
+**Three deliberate deviations, each with its reason:**
+
+1. **`Hash` on `DurableFunctionType` was not needed.** §14.9 item 1 called for it, but the identity
+   is keyed on the purpose-built `IdentityNamespace` (which carries only `u32`/`OplogIndex`), not on
+   `DurableFunctionType` itself. Adding a derive to a `golem-common` wire type with no consumer would
+   have been dead API surface, so it was dropped. `Eq`/`Hash` on `HostFunctionName` — the half that
+   *is* a map key — landed as proposed.
+
+2. **§14.9's steps 4–5 (`try_read_own_host_call` + the non-destructive-miss default, and
+   `replay_or`) were NOT adopted.** `replay_raw`'s integration is cache → scan → **the existing,
+   unchanged** `read_persisted_durable_function_invocation()` + `validate_oplog_entry()`. Reasoning,
+   arrived at in the code rather than from the design:
+   - The scan alone is *sufficient* for every gap §14.2 catalogued, including §14.2.1's silent
+     misdelivery: request A's scan recognizes and defers B's `future_incoming_response::get` entry
+     before A reads, so A reads its own. The regression test
+     `concurrent_future_response_entries_reach_their_own_callers` asserts exactly that, on payload
+     content, not merely "no trap".
+   - Making the final read identity-strict across all ~92 sites would newly *reject* any entry whose
+     `durable_function_type` differs from what the replaying call computes, where today only the
+     function name is validated. That is a behaviour change on paths with no evidence of a problem —
+     the opposite of the "no behaviour change expected on already-fixed call sites" bar §14.11 set.
+   - The non-destructive miss additionally needs a legal "not yet" answer per function (§14.5.3) and,
+     where none exists, risks converting a trap into an unbounded guest retry loop. `poll()` needed a
+     whole bounded-miss mechanism (`record_poll_replay_miss`) to make that safe for ONE call site;
+     generalising it to 92 is a separate change with its own risk budget.
+
+   §13.7.2's non-destructive reads therefore stay exactly where they already are — `poll()`,
+   `ready()`, RPC `get()` — and are unchanged by this work. Extending them is tracked as follow-on,
+   not silently skipped.
+
+3. **`read` and `blocking_read` now carry SEPARATE identities.** The prior point-fix folded
+   `HttpTypesIncomingBodyStreamBlockingRead` into `read`'s identity because the cache was typed by
+   response shape and both produce `StreamChunk`. With the cache keyed by function name that hack is
+   unnecessary and strictly worse: replay re-executes the same guest code and therefore the same
+   variant, so the per-function key is the correct one, and a scan can now defer one entry of each
+   instead of one in total.
+
+**One semantic widening worth flagging, because it changed an existing test.** Exclusion is now
+per-*identity*, where §12.5 made it per-*request*: a `read()` on request A now defers A's own
+`check_write`/`write` entries instead of refusing them. This is safe and strictly better — under the
+old rule such an entry fell through to `read()`'s own oplog read and trapped on the function-name
+mismatch; now it is cached under its own key and collected by the call that owns it, which only works
+because `Durability::replay_raw` makes *every* consumer a collector. The old test
+(`excludes_own_http_request_identity_across_both_directions`) was rewritten as
+`exclusion_is_per_identity_not_per_request`, with `each_deferred_entry_is_returned_to_its_own_owner`
+added as the §14.3-counterexample proof that the three functions sharing one `begin_index` each get
+their own answer back, narrowed to their own type.
+
+**Audit of the 18 gaps against real code, as §14 required — all confirmed to have the bug pattern
+before the fix, none excluded:** all sixteen `Durability`-based ones
+(`skip`/`blocking_skip`/`blocking_read`, `flush`/`blocking_flush`/`write_zeroes`/`splice`/
+`blocking_splice`, `future_trailers::get`, and `DbConnectionQueryStream`/`DbResultStreamGetColumns`/
+`DbResultStreamGetNext` × 3 dialects) had a bare `durability.replay(ctx)` on their replay branch —
+unconditional positional consumption, no identity check — and all sixteen are fixed by the
+`replay_raw` change alone, with no per-function work. `future_incoming_response::get` had the raw
+`get_oplog_entry!` and needed the hand conversion. The RDBMS transaction family
+(`WriteRemoteTransaction(Some(_))`) remains deliberately out of scope per §14.7(c), pinned by
+`transactional_entries_never_participate`.
+
+**Tests added (27):** the §14.3 counterexample; catalog-elimination across all nineteen
+previously-uncovered `HostFunctionName`s; the tracked-guard both ways; consumer-side vs entry-side
+identity agreement plus the closed three-variant list; transactional exclusion; the §14.2.1
+silent-misdelivery before/after pair on payload content; and one cursor-level deferral regression per
+newly-wired family (outgoing stream, incoming stream, trailers, RDBMS). Every pre-existing
+`stray_entry_tests` and `replay_state::tests` case survives with only the mechanical identity-
+constructor change, except the one documented above.

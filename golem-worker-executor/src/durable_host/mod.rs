@@ -100,12 +100,10 @@ use golem_common::model::invocation_context::{
     AttributeValue, InvocationContextSpan, InvocationContextStack, SpanId,
 };
 use golem_common::model::oplog::host_functions::HostFunctionName;
-use golem_common::model::oplog::types::SerializableInvokeResult;
 use golem_common::model::oplog::{
     AgentError, AgentResourceId, DurableFunctionType, HostRequestHttpRequest, HostResponse,
-    HostResponseGolemRpcInvokeGet, HostResponsePollReady, HostResponseStreamChunk, LogLevel,
-    OplogEntry, OplogIndex, PersistenceLevel, RawSnapshotData, TimestampedUpdateDescription,
-    UpdateDescription,
+    HostResponsePollReady, LogLevel, OplogEntry, OplogIndex, PersistenceLevel, RawSnapshotData,
+    TimestampedUpdateDescription, UpdateDescription,
 };
 use golem_common::model::regions::{DeletedRegions, DeletedRegionsBuilder, OplogRegion};
 use golem_common::model::retry_policy::NamedRetryPolicy;
@@ -1317,6 +1315,20 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
 
             // The current retry point will point to the BeginRemoteWrite entry
             self.state.current_retry_point = result;
+
+            // Register the batch as open so entries tagged `WriteRemoteBatched(Some(result))`
+            // are recognized as belonging to a currently-live operation — the generalized
+            // source of the stray-entry mechanism's tracked-identity guard, replacing the
+            // HTTP-specific `open_http_requests` derivation (FINDING_B_FIX_DESIGN.md §14.6).
+            // Only batched writes get an entry here: `WriteRemote` (the other branch condition)
+            // never tags follow-up entries with an index, so it has no identity to track.
+            if matches!(
+                *function_type,
+                DurableFunctionType::WriteRemoteBatched(None)
+            ) {
+                self.state.open_batches.insert(result);
+            }
+
             Ok(result)
         } else {
             // When there is no BeginRemoteWrite entry, the current retry point can only
@@ -1363,6 +1375,14 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
                 DurableFunctionType::WriteRemoteBatched(None)
             )
         {
+            // Symmetric close of the `open_batches` registration made in `begin_function`.
+            if matches!(
+                *function_type,
+                DurableFunctionType::WriteRemoteBatched(None)
+            ) {
+                self.state.open_batches.remove(&begin_index);
+            }
+
             if self.is_live() {
                 self.state
                     .oplog
@@ -4131,18 +4151,42 @@ struct PrivateDurableWorkerState {
     /// (wasmtime resource-table slot reuse) gets a fresh sequence number rather than wrongly
     /// inheriting the dropped pollable's identity.
     pollable_seq: HashMap<u32, u32>,
-    /// REPLAY-ONLY cache of pollable seqs whose `IoPollReady(seq)=<result>` entry was consumed
-    /// by a DIFFERENT `poll()` call's replay logic, because it appeared in the oplog before the
-    /// guest's replayed structural check order reached that pollable's own `ready()` call (see
-    /// FINDING_B_FIX_DESIGN.md: `wstd`'s `Reactor` batches concurrently-pending pollables via a
-    /// `HashMap`-keyed waker set whose iteration order is per-process-randomized, so the guest's
-    /// structural `ready()` check order among a batch's members is not guaranteed to match
-    /// live's real completion order). `io/poll.rs`'s `Host::poll` replay branch populates this;
-    /// `HostPollable::ready`'s replay branch consults it FIRST (removing the entry) before
-    /// falling back to its own oplog lookup — the oplog itself has nothing left to find for a
-    /// seq recorded here, since `poll()` already durably consumed it. Always empty on the live
-    /// path.
-    pre_resolved_pollable_ready: HashMap<u32, bool>,
+    /// REPLAY-ONLY cache: answers consumed early by a DIFFERENT concurrently-tracked
+    /// operation's stray-scan, held here for their real owner to collect. The single cache
+    /// replacing the five typed `pre_resolved_*` maps this mechanism used to carry, one per
+    /// hand-cataloged entry kind (FINDING_B_FIX_DESIGN.md §14.4).
+    ///
+    /// The value is the UNDECODED `HostResponse` enum. `Oplog::download_payload` already
+    /// returns it un-narrowed, and every consumer already narrows it to its own
+    /// `HostPayloadPair::Resp` at its own call site (`Durability::replay`) — so caching the
+    /// enum removes a premature narrowing rather than adding machinery, and is what lets the
+    /// decode step be entirely generic. Keyed by `StrayEntryIdentity`, i.e. by
+    /// `(function_name, namespace)`: keying by the identity VALUE alone would hand a
+    /// `check_write` payload to a `write` consumer, since one HTTP request's `begin_index` is
+    /// shared by thirteen host functions across eight response shapes (§14.3).
+    ///
+    /// Populated by `decode_and_cache_stray_entry`, drained by `take_pre_resolved_stray`.
+    /// Always empty on the live path.
+    pre_resolved_stray: HashMap<StrayEntryIdentity, HostResponse>,
+
+    /// Every currently-open batched-remote-write region, by its `BeginRemoteWrite` oplog index
+    /// — the `IdentityNamespace::Batch` half of `tracked_concurrent_op_seqs`.
+    ///
+    /// Maintained at the single authoritative pair of points: `begin_function` inserts when a
+    /// `WriteRemoteBatched(None)` call mints an index, `end_function` removes when the matching
+    /// `EndRemoteWrite` is written (live) or consumed (replay). That branch runs
+    /// unconditionally, independent of `assume_idempotence`, and mints the identical index on
+    /// both paths — so the registry is live/replay-symmetric, which is exactly the property
+    /// RPC's rejected `begin_index` identity lacked (FINDING_B_FIX_DESIGN.md §8.2.1, §14.6).
+    ///
+    /// Generalizes what used to be derived from `open_http_requests` alone: a new
+    /// `WriteRemoteBatched` host function (RDBMS result streams, any future one) is tracked
+    /// with zero registry work. Scope is unchanged from the `open_http_requests`-derived set —
+    /// repopulated by a full replay that re-executes the region's opening call, NOT repopulated
+    /// when resuming past a snapshot taken mid-region (in which case `begin_function` is not
+    /// re-executed either, so nothing defers those entries and the bare reads in
+    /// `check_write`'s post-snapshot branch keep working — see `TrackedConcurrentOpSeqs`).
+    open_batches: HashSet<OplogIndex>,
     /// Next value to assign in `pollable_seq`. Semantically: "how many distinct pollables has
     /// this WORKER (not this in-memory instance) observed via `ready()` since the very first
     /// time it ever ran" — a value that must stay consistent with what's already been persisted,
@@ -4169,24 +4213,15 @@ struct PrivateDurableWorkerState {
     /// diverge whenever a hint entry like `Log` lands between two dispatches). Cleared on the
     /// resource's drop, same rep-reuse rationale as `pollable_seq`.
     invoke_result_seq: HashMap<u32, u32>,
-    /// REPLAY-ONLY cache, symmetric with `pre_resolved_pollable_ready`: a stray
-    /// `GolemRpcFutureInvokeResultGet` entry's decoded result, consumed early by a DIFFERENT
-    /// call's stray-scan, cached here (keyed by `invoke_result_seq`) for the owning `get()`
-    /// call to consult first.
-    pre_resolved_invoke_result: HashMap<u32, SerializableInvokeResult>,
     /// Next value to assign in `invoke_result_seq` — same semantics and same snapshot-recovery
     /// requirement as `next_pollable_seq` (see its doc comment above); recovered via
     /// `recover_next_invoke_result_seq()`.
     next_invoke_result_seq: u32,
 
-    /// REPLAY-ONLY cache, symmetric with `pre_resolved_pollable_ready`/`pre_resolved_invoke_result`:
-    /// a stray `HttpTypesIncomingBodyStreamRead` entry's decoded result, consumed early by a
-    /// DIFFERENT concurrent stream's stray-scan, cached here (keyed by the request's own
-    /// `begin_index` — no new counter needed, unlike pollables/RPC calls: HTTP requests already
-    /// carry a sound, snapshot-recovery-free identity, see `tracked_concurrent_op_seqs`'s doc
-    /// comment and FINDING_B_FIX_DESIGN.md §8.7) for the owning stream's `read()` call to
-    /// consult first.
-    pre_resolved_http_stream_chunk: HashMap<OplogIndex, HostResponseStreamChunk>,
+    /// Bookkeeping for `poll()`'s bounded replay-miss fallback (see `record_poll_replay_miss`).
+    /// `(replay cursor at the time of the first miss at that position, number of consecutive
+    /// misses observed at that same, unmoved cursor)`.
+    poll_replay_miss: Option<(OplogIndex, u32)>,
 
     // ResourceIds of all DynPollables that are backed by GetPromiseResultEntries
     promise_backed_pollables: TRwLock<HashMap<u32, GetPromiseResultEntry>>,
@@ -4230,177 +4265,405 @@ struct PrivateDurableWorkerState {
     resource_limit_entry: Arc<AtomicResourceEntry>,
 }
 
-/// Owned snapshot of currently-tracked pollable/invoke-result/HTTP-request identities — see
-/// `PrivateDurableWorkerState::tracked_concurrent_op_seqs`. Taken as owned values so
-/// `is_stray_concurrent_entry`'s predicate closure doesn't need to borrow `self.state` while
+/// Owned snapshot of every concurrently-tracked operation identity currently live on this
+/// worker — see `PrivateDurableWorkerState::tracked_concurrent_op_seqs`. Taken as owned values
+/// so `is_stray_concurrent_entry`'s predicate closure doesn't need to borrow `self.state` while
 /// `self.state.replay_state.consume_stray_entries` holds its own `&mut` borrow.
+///
+/// Keeping this guard (rather than treating ANY entry carrying a tracked-shape
+/// `DurableFunctionType` as deferrable) is load-bearing, not conservatism:
+/// `HostOutputStream::check_write`'s `replaying_http_batch` and post-snapshot-restore branches
+/// (`io/streams.rs`) do their own bare oplog reads without consulting the stray cache, and are
+/// reached exactly when no batch is open — i.e. exactly when this set is empty and nothing can
+/// defer their entries out from under them. See FINDING_B_FIX_DESIGN.md §14.6.
 pub struct TrackedConcurrentOpSeqs {
-    pollable_seqs: HashSet<u32>,
-    invoke_result_seqs: HashSet<u32>,
-    /// HTTP requests' own `begin_index` (a real `BeginRemoteWrite` entry position — always
-    /// written unconditionally for `WriteRemoteBatched(None)`, unlike RPC's rejected
-    /// `begin_index` identity, see FINDING_B_FIX_DESIGN.md §8.7). Only populated when
-    /// `open_http_requests` itself is populated — see `tracked_concurrent_op_seqs`'s doc
-    /// comment for the scope this covers and doesn't.
-    http_begin_indexes: HashSet<OplogIndex>,
+    namespaces: HashSet<IdentityNamespace>,
+}
+
+impl TrackedConcurrentOpSeqs {
+    pub fn new(namespaces: HashSet<IdentityNamespace>) -> Self {
+        Self { namespaces }
+    }
+
+    fn contains(&self, namespace: &IdentityNamespace) -> bool {
+        self.namespaces.contains(namespace)
+    }
+}
+
+/// Which identity namespace a concurrently-tracked operation lives in, plus its value.
+///
+/// The list of participating `DurableFunctionType` variants is a deliberate, closed three-row
+/// match over an enum — NOT a catalog of host functions. It changes only when
+/// `DurableFunctionType` itself changes (a compiler-visible event), whereas a per-function
+/// catalog is open-ended and silently incomplete (FINDING_B_FIX_DESIGN.md §14.2 found 18
+/// uncovered functions accumulated that way). `WriteRemoteTransaction(Some(_))` has the same
+/// structural shape but is deliberately excluded: transactional operations are serialized
+/// within their transaction, so the "concurrent fungible siblings" precondition does not hold
+/// (§14.7(c)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IdentityNamespace {
+    /// From `DurableFunctionType::ReadLocalPollable(seq)` — one WASI pollable, identified by
+    /// its call-order-derived logical sequence number (`pollable_seq`).
+    Pollable(u32),
+    /// From `DurableFunctionType::WriteRemoteConcurrent(seq)` — one in-flight RPC
+    /// future-invoke-result, identified by its dispatch-order sequence (`invoke_result_seq`).
+    InvokeResult(u32),
+    /// From `DurableFunctionType::WriteRemoteBatched(Some(begin_idx))` — one open batched
+    /// remote-write region, identified by its `BeginRemoteWrite` oplog position. Covers HTTP
+    /// requests (both directions plus the response and trailers futures) and RDBMS result
+    /// streams alike; see `open_batches`.
+    Batch(OplogIndex),
+}
+
+/// Which concurrently-tracked operation an oplog entry belongs to.
+///
+/// Derived structurally, with no per-function knowledge: the `DurableFunctionType` variant says
+/// which identity NAMESPACE the entry lives in and carries the identity VALUE, and the function
+/// name distinguishes operations that legitimately share one value. Both halves are required —
+/// a single outgoing HTTP request has exactly ONE `begin_index`, shared by thirteen host
+/// functions spanning eight distinct response payload shapes, so a value-only key would hand a
+/// `check_write` answer to a `write` consumer (FINDING_B_FIX_DESIGN.md §14.3). RDBMS reproduces
+/// the same shape: one result stream's `begin_index` is shared by `query-stream`,
+/// `get-columns` and `get-next`.
+///
+/// `is_stray_concurrent_entry` (recognition), `StrayEntryScan` (per-scan de-duplication),
+/// `decode_and_cache_stray_entry` (cache the undecoded answer) and `Durability::replay_raw`
+/// (collect it again) are all expressed in terms of this one type, so they cannot drift apart.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StrayEntryIdentity {
+    pub function_name: HostFunctionName,
+    pub namespace: IdentityNamespace,
+}
+
+impl StrayEntryIdentity {
+    pub fn new(function_name: HostFunctionName, namespace: IdentityNamespace) -> Self {
+        Self {
+            function_name,
+            namespace,
+        }
+    }
+}
+
+/// Maps a `DurableFunctionType` onto the identity namespace it denotes, or `None` if this
+/// variant takes no part in the stray-entry mechanism (see `IdentityNamespace`).
+pub fn identity_namespace(function_type: &DurableFunctionType) -> Option<IdentityNamespace> {
+    match function_type {
+        DurableFunctionType::ReadLocalPollable(seq) => Some(IdentityNamespace::Pollable(*seq)),
+        DurableFunctionType::WriteRemoteConcurrent(seq) => {
+            Some(IdentityNamespace::InvokeResult(*seq))
+        }
+        DurableFunctionType::WriteRemoteBatched(Some(idx)) => Some(IdentityNamespace::Batch(*idx)),
+        _ => None,
+    }
+}
+
+/// The identity a replay consumer claims for itself, built from the two halves it already has
+/// at compile/call time: its `HostPayloadPair::HOST_FUNCTION_NAME` and the exact
+/// `DurableFunctionType` it tags its own LIVE entry with. Used by `Durability::replay_raw` so no
+/// call site has to pass anything, and by the bespoke consumers (`poll()`, `ready()`, RPC
+/// `get()`) that never construct a `Durability` on their replay path.
+pub fn stray_identity_of(
+    function_name: HostFunctionName,
+    function_type: &DurableFunctionType,
+) -> Option<StrayEntryIdentity> {
+    identity_namespace(function_type)
+        .map(|namespace| StrayEntryIdentity::new(function_name, namespace))
+}
+
+/// Extracts the concurrently-tracked identity an oplog entry belongs to, or `None` if this entry
+/// takes no part in the stray-entry mechanism (see `StrayEntryIdentity`).
+///
+/// Note the invariant is per-ENTRY, not per-FUNCTION: `db-result-stream.get-next` records
+/// `WriteRemoteBatched(Some(_))` outside a transaction and `WriteRemoteTransaction(Some(_))`
+/// inside one, so the same function participates or not depending on the entry it wrote
+/// (FINDING_B_FIX_DESIGN.md §14.7(b)).
+pub fn stray_entry_identity(entry: &OplogEntry) -> Option<StrayEntryIdentity> {
+    let OplogEntry::HostCall {
+        function_name,
+        durable_function_type,
+        ..
+    } = entry
+    else {
+        return None;
+    };
+    stray_identity_of(function_name.clone(), durable_function_type)
 }
 
 /// Recognizes a "stray" oplog entry — one belonging to a DIFFERENT concurrently-tracked
-/// operation than the one currently being resolved, of any kind this mechanism knows about
-/// (`IoPollReady` for pollables, `GolemRpcFutureInvokeResultGet` for RPC future-invoke-
-/// results, `HttpTypesIncomingBodyStreamRead` for concurrent HTTP body-stream reads) — the
-/// shared identity check behind the fix for a class of bug (`FINDING_B_FIX_DESIGN.md`) where
-/// positional/unconditional replay consumption can find such an entry sitting where its own
-/// next entry was expected, because real-world completion order among concurrently in-flight
-/// operations doesn't have to match the guest's replayed structural check order.
+/// operation than the one currently being resolved — the shared identity check behind the fix
+/// for a class of bug (`FINDING_B_FIX_DESIGN.md`) where positional/unconditional replay
+/// consumption can find such an entry sitting where its own next entry was expected, because
+/// real-world completion order among concurrently in-flight operations doesn't have to match
+/// the guest's replayed structural check order.
 ///
-/// `exclude_invoke_result_seq`/`exclude_http_begin_idx`: a caller's OWN identity, if it is
-/// itself an RPC `get()` call or an HTTP stream read — sibling calls of either kind share the
-/// same `function_name` (unlike `poll()`/`ready()`, naturally distinguishable), so a caller
-/// must exclude its own identity or this would wrongly recognize its own genuine entry as a
-/// stray. `poll()` passes `None` for both (it has no RPC-call or HTTP-request identity of its
-/// own to exclude).
+/// `exclude` is the caller's OWN identity, if it has one: sibling calls of the same kind share
+/// their `function_name`, so a caller must exclude itself or it would swallow its own genuine
+/// entry. Callers with no identity of their own (e.g. `poll()`, whose `IoPollPoll` entry is
+/// tagged plain `ReadLocal`) pass `None`.
+///
+/// The exclusion is per-*identity*, i.e. per `(function_name, namespace)` pair — deliberately
+/// narrower than the previous per-*request* HTTP exclusion. A `read()` on request A now defers
+/// A's own `check_write` entry too, which is safe (and strictly better than trapping on it)
+/// precisely because every `Durability::replay` consumer collects its own cached answer by the
+/// same key: the entry is never lost, only handed to the call that actually owns it.
 pub fn is_stray_concurrent_entry(
     entry: &OplogEntry,
     tracked: &TrackedConcurrentOpSeqs,
-    exclude_invoke_result_seq: Option<u32>,
-    exclude_http_begin_idx: Option<OplogIndex>,
+    exclude: Option<&StrayEntryIdentity>,
 ) -> bool {
-    match entry {
-        OplogEntry::HostCall {
-            function_name: HostFunctionName::IoPollReady,
-            durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
-            ..
-        } => tracked.pollable_seqs.contains(seq),
+    match stray_entry_identity(entry) {
+        Some(identity) => Some(&identity) != exclude && tracked.contains(&identity.namespace),
+        None => false,
+    }
+}
 
+/// Does this oplog entry positively identify as the `get()` call whose `invoke_result_seq` is
+/// `my_invoke_result_seq`?
+///
+/// A replay consumer may only consume an entry it has positively identified as its own
+/// (FINDING_B_FIX_DESIGN.md §13.7.2) — a read that consumes first and validates afterwards
+/// destroys structural entries (`FinishSpan`, `EndAtomicRegion`, ...) it had no business
+/// reading, turning any identity drift into a permanent trap. Legacy untagged entries
+/// (`WriteRemote`, recorded before per-call tagging existed) carry no identity and are still
+/// consumed positionally, exactly as before.
+pub fn is_own_invoke_result_entry(entry: &OplogEntry, my_invoke_result_seq: u32) -> bool {
+    match entry {
         OplogEntry::HostCall {
             function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
             durable_function_type: DurableFunctionType::WriteRemoteConcurrent(seq),
             ..
-        } => {
-            Some(*seq) != exclude_invoke_result_seq && tracked.invoke_result_seqs.contains(seq)
-        }
-
+        } => *seq == my_invoke_result_seq,
         OplogEntry::HostCall {
-            function_name: HostFunctionName::HttpTypesIncomingBodyStreamRead,
-            durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
+            function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
+            durable_function_type: DurableFunctionType::WriteRemote,
             ..
-        } => {
-            Some(*begin_idx) != exclude_http_begin_idx
-                && tracked.http_begin_indexes.contains(begin_idx)
-        }
-
+        } => true,
         _ => false,
+    }
+}
+
+/// Does this oplog entry positively identify as a `poll()` call's own entry? Same invariant as
+/// `is_own_invoke_result_entry`; `poll()` has no per-call identity beyond the entry kind, since
+/// only one `poll()` can be in flight per agent at a time.
+pub fn is_own_poll_entry(entry: &OplogEntry) -> bool {
+    matches!(
+        entry,
+        OplogEntry::HostCall {
+            function_name: HostFunctionName::IoPollPoll,
+            ..
+        }
+    )
+}
+
+/// Stateful predicate driving one `consume_stray_entries` walk.
+///
+/// Recognition alone (`is_stray_concurrent_entry`) is not a safe consumption rule: every
+/// pre-resolved cache holds at most ONE pending answer per identity, so consuming a second entry
+/// for an identity whose answer is already held would silently destroy the first. That is not
+/// hypothetical — an ordinary `fetch()` with a multi-chunk body records `check_write`/`write`
+/// pairs for the SAME request back to back (106 of each in the capture behind
+/// FINDING_B_FIX_DESIGN.md §12), so a scan that only checked recognition would run away through
+/// an entire write cluster and keep only the last entry of each kind.
+///
+/// This bounds the walk to at most one entry per distinct identity: the second occurrence stops
+/// the scan and is left at the cursor for its owner's own replay to consume.
+pub struct StrayEntryScan {
+    tracked: TrackedConcurrentOpSeqs,
+    exclude: Option<StrayEntryIdentity>,
+    consumed: HashSet<StrayEntryIdentity>,
+}
+
+impl StrayEntryScan {
+    /// `already_cached` are identities whose pre-resolved answer is still waiting to be
+    /// collected by its owner — treated exactly like "already consumed by this scan".
+    pub fn new(
+        tracked: TrackedConcurrentOpSeqs,
+        exclude: Option<StrayEntryIdentity>,
+        already_cached: HashSet<StrayEntryIdentity>,
+    ) -> Self {
+        Self {
+            tracked,
+            exclude,
+            consumed: already_cached,
+        }
+    }
+
+    /// Decides whether the entry at the replay cursor may be consumed as a stray by this scan.
+    pub fn accept(&mut self, entry: &OplogEntry) -> bool {
+        if !is_stray_concurrent_entry(entry, &self.tracked, self.exclude.as_ref()) {
+            return false;
+        }
+        match stray_entry_identity(entry) {
+            Some(identity) => self.consumed.insert(identity),
+            None => false,
+        }
     }
 }
 
 #[cfg(test)]
 mod stray_entry_tests {
     use super::*;
+    use golem_common::model::oplog::types::SerializableInvokeResult;
     use golem_common::model::oplog::{
         HostRequest, HostRequestNoInput, HostRequestPollCount, HostResponse,
-        HostResponsePollReady, HostResponsePollResult, OplogPayload,
+        HostResponseGolemRpcInvokeGet, HostResponsePollReady, HostResponsePollResult,
+        HostResponseStreamCheckWrite, HostResponseStreamChunk, HostResponseStreamSkip,
+        HostResponseStreamWriteResult, HostResponseStreamWriteWithBytes, OplogPayload,
     };
     use test_r::test;
 
-    fn io_poll_ready(seq: u32) -> OplogEntry {
+    /// Builds a `HostCall` entry with an arbitrary function name / function type / response —
+    /// the generalized mechanism is response-shape-agnostic, so tests exercise it the same way.
+    fn host_call(
+        function_name: HostFunctionName,
+        durable_function_type: DurableFunctionType,
+        response: HostResponse,
+    ) -> OplogEntry {
         OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
-            function_name: HostFunctionName::IoPollReady,
+            function_name,
             request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
-            response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
-                HostResponsePollReady { result: Ok(true) },
-            ))),
-            durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
+            response: OplogPayload::Inline(Box::new(response)),
+            durable_function_type,
         }
+    }
+
+    fn io_poll_ready(seq: u32) -> OplogEntry {
+        host_call(
+            HostFunctionName::IoPollReady,
+            DurableFunctionType::ReadLocalPollable(seq),
+            HostResponse::PollReady(HostResponsePollReady { result: Ok(true) }),
+        )
     }
 
     fn io_poll_poll() -> OplogEntry {
         OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollPoll,
-            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
-                HostRequestPollCount { count: 2 },
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(HostRequestPollCount {
+                count: 2,
+            }))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
-                HostResponsePollResult { result: Ok(vec![0]) },
+                HostResponsePollResult {
+                    result: Ok(vec![0]),
+                },
             ))),
             durable_function_type: DurableFunctionType::ReadLocal,
         }
     }
 
     fn golem_rpc_invoke_get(seq: u32) -> OplogEntry {
-        OplogEntry::HostCall {
-            timestamp: Timestamp::now_utc(),
-            function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
-            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
-            response: OplogPayload::Inline(Box::new(HostResponse::GolemRpcInvokeGet(
-                HostResponseGolemRpcInvokeGet {
-                    result: SerializableInvokeResult::Pending,
-                },
-            ))),
-            durable_function_type: DurableFunctionType::WriteRemoteConcurrent(seq),
-        }
+        host_call(
+            HostFunctionName::GolemRpcFutureInvokeResultGet,
+            DurableFunctionType::WriteRemoteConcurrent(seq),
+            HostResponse::GolemRpcInvokeGet(HostResponseGolemRpcInvokeGet {
+                result: SerializableInvokeResult::Pending,
+            }),
+        )
+    }
+
+    fn batched(
+        function_name: HostFunctionName,
+        begin_idx: OplogIndex,
+        response: HostResponse,
+    ) -> OplogEntry {
+        host_call(
+            function_name,
+            DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
+            response,
+        )
     }
 
     fn http_stream_read(begin_idx: OplogIndex) -> OplogEntry {
-        OplogEntry::HostCall {
-            timestamp: Timestamp::now_utc(),
-            function_name: HostFunctionName::HttpTypesIncomingBodyStreamRead,
-            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
-            response: OplogPayload::Inline(Box::new(HostResponse::StreamChunk(
-                HostResponseStreamChunk { result: Ok(vec![]) },
-            ))),
-            durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
-        }
+        batched(
+            HostFunctionName::HttpTypesIncomingBodyStreamRead,
+            begin_idx,
+            HostResponse::StreamChunk(HostResponseStreamChunk { result: Ok(vec![]) }),
+        )
+    }
+
+    fn http_stream_check_write(begin_idx: OplogIndex) -> OplogEntry {
+        batched(
+            HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+            begin_idx,
+            HostResponse::StreamCheckWrite(HostResponseStreamCheckWrite {
+                result: Ok(1048576),
+            }),
+        )
+    }
+
+    fn http_stream_write(begin_idx: OplogIndex) -> OplogEntry {
+        batched(
+            HostFunctionName::HttpTypesOutgoingBodyStreamWrite,
+            begin_idx,
+            HostResponse::StreamWriteWithBytes(HostResponseStreamWriteWithBytes {
+                result: Ok(vec![]),
+            }),
+        )
+    }
+
+    fn tracked(namespaces: impl IntoIterator<Item = IdentityNamespace>) -> TrackedConcurrentOpSeqs {
+        TrackedConcurrentOpSeqs::new(namespaces.into_iter().collect())
     }
 
     fn empty_tracked() -> TrackedConcurrentOpSeqs {
-        TrackedConcurrentOpSeqs {
-            pollable_seqs: HashSet::new(),
-            invoke_result_seqs: HashSet::new(),
-            http_begin_indexes: HashSet::new(),
-        }
+        tracked([])
+    }
+
+    fn pollable_identity(seq: u32) -> StrayEntryIdentity {
+        StrayEntryIdentity::new(
+            HostFunctionName::IoPollReady,
+            IdentityNamespace::Pollable(seq),
+        )
+    }
+
+    fn invoke_identity(seq: u32) -> StrayEntryIdentity {
+        StrayEntryIdentity::new(
+            HostFunctionName::GolemRpcFutureInvokeResultGet,
+            IdentityNamespace::InvokeResult(seq),
+        )
+    }
+
+    fn batch_identity(
+        function_name: HostFunctionName,
+        begin_idx: OplogIndex,
+    ) -> StrayEntryIdentity {
+        StrayEntryIdentity::new(function_name, IdentityNamespace::Batch(begin_idx))
     }
 
     /// Tenth capture's exact shape (FINDING_B_FIX_DESIGN.md): a stray `IoPollReady(seq=154)`
     /// recognized when 154 is a currently-tracked pollable seq.
     #[test]
     fn recognizes_tracked_pollable_stray() {
-        let tracked = TrackedConcurrentOpSeqs {
-            pollable_seqs: HashSet::from([150, 154]),
-            ..empty_tracked()
-        };
+        let tracked = tracked([
+            IdentityNamespace::Pollable(150),
+            IdentityNamespace::Pollable(154),
+        ]);
         assert!(is_stray_concurrent_entry(
             &io_poll_ready(154),
             &tracked,
-            None,
             None
         ));
         assert!(
-            !is_stray_concurrent_entry(&io_poll_ready(999), &tracked, None, None),
+            !is_stray_concurrent_entry(&io_poll_ready(999), &tracked, None),
             "an untracked seq must never be recognized as a stray"
         );
         assert!(
-            !is_stray_concurrent_entry(&io_poll_poll(), &tracked, None, None),
+            !is_stray_concurrent_entry(&io_poll_poll(), &tracked, None),
             "poll()'s own entry type must never be recognized as a stray"
         );
     }
 
     /// Eleventh capture's exact shape: a stray `GolemRpcFutureInvokeResultGet` recognized when
     /// its seq is a currently-tracked invoke_result_seq — confirming poll() (which has no RPC
-    /// identity of its own, `exclude_invoke_result_seq: None`) recognizes it too, not just
-    /// same-kind pollable strays.
+    /// identity of its own, `exclude: None`) recognizes it too, not just same-kind pollable
+    /// strays.
     #[test]
     fn recognizes_tracked_invoke_result_stray_from_poll_context() {
-        let tracked = TrackedConcurrentOpSeqs {
-            invoke_result_seqs: HashSet::from([5]),
-            ..empty_tracked()
-        };
+        let tracked = tracked([IdentityNamespace::InvokeResult(5)]);
         assert!(is_stray_concurrent_entry(
             &golem_rpc_invoke_get(5),
             &tracked,
-            None,
             None
         ));
     }
@@ -4410,23 +4673,21 @@ mod stray_entry_tests {
     /// `GolemRpcFutureInvokeResultGet`/`WriteRemoteConcurrent` shape a sibling's would.
     #[test]
     fn excludes_own_invoke_result_identity() {
-        let tracked = TrackedConcurrentOpSeqs {
-            invoke_result_seqs: HashSet::from([5, 7]),
-            ..empty_tracked()
-        };
+        let tracked = tracked([
+            IdentityNamespace::InvokeResult(5),
+            IdentityNamespace::InvokeResult(7),
+        ]);
         // A sibling's entry (seq 7) is still a stray from seq 5's perspective.
         assert!(is_stray_concurrent_entry(
             &golem_rpc_invoke_get(7),
             &tracked,
-            Some(5),
-            None
+            Some(&invoke_identity(5))
         ));
         // My own entry (seq 5) must never be recognized as a stray of itself.
         assert!(!is_stray_concurrent_entry(
             &golem_rpc_invoke_get(5),
             &tracked,
-            Some(5),
-            None
+            Some(&invoke_identity(5))
         ));
     }
 
@@ -4436,39 +4697,451 @@ mod stray_entry_tests {
     fn excludes_own_http_request_identity() {
         let a = OplogIndex::from_u64(10);
         let b = OplogIndex::from_u64(20);
-        let tracked = TrackedConcurrentOpSeqs {
-            http_begin_indexes: HashSet::from([a, b]),
-            ..empty_tracked()
-        };
+        let tracked = tracked([IdentityNamespace::Batch(a), IdentityNamespace::Batch(b)]);
+        let own = batch_identity(HostFunctionName::HttpTypesIncomingBodyStreamRead, a);
         assert!(is_stray_concurrent_entry(
             &http_stream_read(b),
             &tracked,
-            None,
-            Some(a)
+            Some(&own)
         ));
         assert!(!is_stray_concurrent_entry(
             &http_stream_read(a),
             &tracked,
-            None,
-            Some(a)
+            Some(&own)
         ));
     }
 
+    /// Twelfth/thirteenth capture's shape (FINDING_B_FIX_DESIGN.md §12): an outgoing-body
+    /// `check_write`/`write` entry recognized as a stray from a `poll()` context (no identity
+    /// of its own to exclude) whenever its batch is currently open. Without this, one ordinary
+    /// multi-chunk `fetch()` traps replay with "expected io::poll::poll, got
+    /// http::types::outgoing_body_stream::check_write".
+    #[test]
+    fn recognizes_tracked_http_outgoing_write_strays_from_poll_context() {
+        let a = OplogIndex::from_u64(42);
+        let tracked = tracked([IdentityNamespace::Batch(a)]);
+        assert!(is_stray_concurrent_entry(
+            &http_stream_check_write(a),
+            &tracked,
+            None
+        ));
+        assert!(is_stray_concurrent_entry(
+            &http_stream_write(a),
+            &tracked,
+            None
+        ));
+        // An entry for a batch that is not open is never a stray.
+        let other = OplogIndex::from_u64(99);
+        assert!(!is_stray_concurrent_entry(
+            &http_stream_check_write(other),
+            &tracked,
+            None
+        ));
+    }
+
+    /// Exclusion is per-IDENTITY, i.e. per `(function_name, namespace)` — NOT per-request, as
+    /// it was while each response shape had its own typed cache (§12.5).
+    ///
+    /// A `read()` on request A now DOES defer A's own `check_write`/`write` entries. That is a
+    /// deliberate widening, and it is strictly better than the old refusal: previously such an
+    /// entry fell through to `read()`'s own oplog read and trapped on the function-name
+    /// mismatch; now it is cached under its own key and collected by the `check_write()` call
+    /// that actually owns it (see `each_deferred_entry_is_returned_to_its_own_owner`).
+    #[test]
+    fn exclusion_is_per_identity_not_per_request() {
+        let a = OplogIndex::from_u64(10);
+        let b = OplogIndex::from_u64(20);
+        let tracked = tracked([IdentityNamespace::Batch(a), IdentityNamespace::Batch(b)]);
+        let own_read = batch_identity(HostFunctionName::HttpTypesIncomingBodyStreamRead, a);
+
+        for entry in [http_stream_check_write(a), http_stream_write(a)] {
+            assert!(
+                is_stray_concurrent_entry(&entry, &tracked, Some(&own_read)),
+                "my own request's OTHER-function entry is deferrable — its owner collects it \
+                 from the cache under its own key"
+            );
+        }
+        assert!(
+            !is_stray_concurrent_entry(&http_stream_read(a), &tracked, Some(&own_read)),
+            "my own exact identity must never be deferred"
+        );
+        for entry in [http_stream_check_write(b), http_stream_write(b)] {
+            assert!(
+                is_stray_concurrent_entry(&entry, &tracked, Some(&own_read)),
+                "a concurrent request's entry is still a stray"
+            );
+        }
+    }
+
+    /// FINDING_B_FIX_DESIGN.md §14.3's counterexample, as a permanent regression: thirteen host
+    /// functions share ONE HTTP request's `begin_index` across eight response shapes, so an
+    /// identity keyed on the value alone would hand a `check_write` answer to a `write`
+    /// consumer. Each deferred entry must come back to the consumer that owns it, narrowed to
+    /// that consumer's own response type.
+    #[test]
+    fn each_deferred_entry_is_returned_to_its_own_owner() {
+        let a = OplogIndex::from_u64(42);
+        let mut cache: HashMap<StrayEntryIdentity, HostResponse> = HashMap::new();
+        for entry in [
+            http_stream_check_write(a),
+            http_stream_write(a),
+            http_stream_read(a),
+        ] {
+            let identity = stray_entry_identity(&entry).expect("tracked shape");
+            let OplogEntry::HostCall { response, .. } = entry else {
+                unreachable!()
+            };
+            let OplogPayload::Inline(boxed) = response else {
+                unreachable!("test entries are built inline")
+            };
+            assert!(
+                cache.insert(identity, *boxed).is_none(),
+                "each function must occupy its own cache slot under one shared begin_index"
+            );
+        }
+        assert_eq!(cache.len(), 3);
+
+        let check_write: HostResponseStreamCheckWrite = cache
+            .remove(&batch_identity(
+                HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+                a,
+            ))
+            .expect("check_write answer present")
+            .try_into()
+            .expect("check_write consumer narrows to its own type");
+        assert_eq!(check_write.result, Ok(1048576));
+
+        let write: HostResponseStreamWriteWithBytes = cache
+            .remove(&batch_identity(
+                HostFunctionName::HttpTypesOutgoingBodyStreamWrite,
+                a,
+            ))
+            .expect("write answer present")
+            .try_into()
+            .expect("write consumer narrows to its own type");
+        assert_eq!(write.result, Ok(vec![]));
+
+        let chunk: HostResponseStreamChunk = cache
+            .remove(&batch_identity(
+                HostFunctionName::HttpTypesIncomingBodyStreamRead,
+                a,
+            ))
+            .expect("read answer present")
+            .try_into()
+            .expect("read consumer narrows to its own type");
+        assert_eq!(chunk.result, Ok(vec![]));
+    }
+
+    /// The scan bound (§12.6 fallout): `check_write`/`write` occur in lockstep, many times per
+    /// request, so recognition alone would let one scan run away through a whole write cluster
+    /// and keep only the last answer of each kind (the cache holds one answer per identity).
+    /// A scan must accept at most ONE entry per identity and stop at the second.
+    #[test]
+    fn scan_accepts_at_most_one_entry_per_identity() {
+        let a = OplogIndex::from_u64(42);
+        let mut scan =
+            StrayEntryScan::new(tracked([IdentityNamespace::Batch(a)]), None, HashSet::new());
+
+        assert!(scan.accept(&http_stream_check_write(a)));
+        // Different identity (same request, other function) — still acceptable.
+        assert!(scan.accept(&http_stream_write(a)));
+        // Second occurrence of an identity already consumed by this scan: refused, so the
+        // entry stays at the cursor for its owner instead of overwriting the cached answer.
+        assert!(!scan.accept(&http_stream_check_write(a)));
+        assert!(!scan.accept(&http_stream_write(a)));
+    }
+
+    /// Same bound, sourced from the cache rather than from this scan: an identity whose
+    /// pre-resolved answer has not been collected by its owner yet must not have a second
+    /// entry consumed on top of it.
+    #[test]
+    fn scan_refuses_identities_whose_answer_is_already_cached() {
+        let mut scan = StrayEntryScan::new(
+            tracked([IdentityNamespace::Pollable(7)]),
+            None,
+            HashSet::from([pollable_identity(7)]),
+        );
+        assert!(!scan.accept(&io_poll_ready(7)));
+    }
+
+    /// `stray_entry_identity` is the single source of truth the recognition predicate, the scan
+    /// bound and the decode all read from — assert it maps every supported entry shape.
+    #[test]
+    fn identity_covers_every_supported_entry_kind() {
+        let idx = OplogIndex::from_u64(3);
+        assert_eq!(
+            stray_entry_identity(&io_poll_ready(9)),
+            Some(pollable_identity(9))
+        );
+        assert_eq!(
+            stray_entry_identity(&golem_rpc_invoke_get(4)),
+            Some(invoke_identity(4))
+        );
+        assert_eq!(
+            stray_entry_identity(&http_stream_read(idx)),
+            Some(batch_identity(
+                HostFunctionName::HttpTypesIncomingBodyStreamRead,
+                idx
+            ))
+        );
+        assert_eq!(
+            stray_entry_identity(&http_stream_check_write(idx)),
+            Some(batch_identity(
+                HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+                idx
+            ))
+        );
+        assert_eq!(
+            stray_entry_identity(&http_stream_write(idx)),
+            Some(batch_identity(
+                HostFunctionName::HttpTypesOutgoingBodyStreamWrite,
+                idx
+            ))
+        );
+        assert_eq!(stray_entry_identity(&io_poll_poll()), None);
+    }
+
+    /// THE test that proves the catalog is gone (FINDING_B_FIX_DESIGN.md §14.11): every one of
+    /// the eighteen host functions §14.2's census found uncovered — none of which is named
+    /// anywhere in the stray-entry code — participates purely by virtue of tagging its entry
+    /// with a tracked `DurableFunctionType`, across all their differing response shapes.
+    #[test]
+    fn previously_uncatalogued_functions_participate_without_a_catalog() {
+        let idx = OplogIndex::from_u64(7);
+        let tracked_set = tracked([IdentityNamespace::Batch(idx)]);
+
+        let no_bytes =
+            HostResponse::StreamWriteResult(HostResponseStreamWriteResult { result: Ok(()) });
+        let skip = HostResponse::StreamSkip(HostResponseStreamSkip { result: Ok(0) });
+        let chunk = HostResponse::StreamChunk(HostResponseStreamChunk { result: Ok(vec![]) });
+
+        let uncovered = [
+            // HTTP response / trailers completion futures — §14.2.1's silent-misdelivery risk.
+            (
+                HostFunctionName::HttpTypesFutureIncomingResponseGet,
+                chunk.clone(),
+            ),
+            (HostFunctionName::HttpTypesFutureTrailersGet, chunk.clone()),
+            // Incoming body stream.
+            (
+                HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::HttpTypesIncomingBodyStreamSkip,
+                skip.clone(),
+            ),
+            (
+                HostFunctionName::HttpTypesIncomingBodyStreamBlockingSkip,
+                skip.clone(),
+            ),
+            // Outgoing body stream.
+            (
+                HostFunctionName::HttpTypesOutgoingBodyStreamFlush,
+                no_bytes.clone(),
+            ),
+            (
+                HostFunctionName::HttpTypesOutgoingBodyStreamBlockingFlush,
+                no_bytes.clone(),
+            ),
+            (
+                HostFunctionName::HttpTypesOutgoingBodyStreamWriteZeroes,
+                no_bytes.clone(),
+            ),
+            (
+                HostFunctionName::HttpTypesOutgoingBodyStreamSplice,
+                skip.clone(),
+            ),
+            (
+                HostFunctionName::HttpTypesOutgoingBodyStreamBlockingSplice,
+                skip.clone(),
+            ),
+            // RDBMS result streams, all three dialects.
+            (
+                HostFunctionName::RdbmsMysqlDbConnectionQueryStream,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsMysqlDbResultStreamGetColumns,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsMysqlDbResultStreamGetNext,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsPostgresDbConnectionQueryStream,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsPostgresDbResultStreamGetColumns,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsPostgresDbResultStreamGetNext,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsIgnite2DbConnectionQueryStream,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsIgnite2DbResultStreamGetColumns,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsIgnite2DbResultStreamGetNext,
+                chunk.clone(),
+            ),
+        ];
+
+        let mut scan = StrayEntryScan::new(
+            tracked([IdentityNamespace::Batch(idx)]),
+            None,
+            HashSet::new(),
+        );
+        for (function_name, response) in uncovered {
+            let entry = batched(function_name.clone(), idx, response);
+            assert_eq!(
+                stray_entry_identity(&entry),
+                Some(batch_identity(function_name.clone(), idx)),
+                "{function_name:?} must derive an identity with no per-function arm"
+            );
+            assert!(
+                is_stray_concurrent_entry(&entry, &tracked_set, None),
+                "{function_name:?} must be recognized as a stray of an open batch"
+            );
+            assert!(
+                scan.accept(&entry),
+                "{function_name:?} occupies its own cache slot under the shared begin_index"
+            );
+        }
+    }
+
+    /// The tracked-identity guard must be KEPT, not dropped (§14.6): `check_write`'s
+    /// `replaying_http_batch` and post-snapshot-restore branches do their own bare oplog reads
+    /// without consulting the cache, and are reached exactly when no batch is open. An entry
+    /// whose batch is not registered must therefore never be deferred out from under them.
+    #[test]
+    fn untracked_batch_entries_are_never_deferred() {
+        let idx = OplogIndex::from_u64(7);
+        for entry in [
+            http_stream_check_write(idx),
+            http_stream_write(idx),
+            http_stream_read(idx),
+            batched(
+                HostFunctionName::HttpTypesFutureIncomingResponseGet,
+                idx,
+                HostResponse::StreamChunk(HostResponseStreamChunk { result: Ok(vec![]) }),
+            ),
+        ] {
+            assert!(
+                stray_entry_identity(&entry).is_some(),
+                "the entry does carry an identity — only the tracked-set guard rejects it"
+            );
+            assert!(!is_stray_concurrent_entry(&entry, &empty_tracked(), None));
+        }
+    }
+
+    /// `WriteRemoteTransaction(Some(_))` has the same structural shape as
+    /// `WriteRemoteBatched(Some(_))` but is deliberately excluded (§14.7(c)): transactional
+    /// operations are serialized within their transaction, so the "concurrent fungible
+    /// siblings" precondition does not hold. The same RDBMS function therefore participates or
+    /// not depending on the ENTRY it wrote, not on the function (§14.7(b)).
+    #[test]
+    fn transactional_entries_never_participate() {
+        let idx = OplogIndex::from_u64(7);
+        let transactional = host_call(
+            HostFunctionName::RdbmsPostgresDbResultStreamGetNext,
+            DurableFunctionType::WriteRemoteTransaction(Some(idx)),
+            HostResponse::StreamChunk(HostResponseStreamChunk { result: Ok(vec![]) }),
+        );
+        assert_eq!(stray_entry_identity(&transactional), None);
+        assert!(!is_stray_concurrent_entry(
+            &transactional,
+            &tracked([IdentityNamespace::Batch(idx)]),
+            None
+        ));
+
+        // ... while the very same function's non-transactional entry does participate.
+        let batched_entry = batched(
+            HostFunctionName::RdbmsPostgresDbResultStreamGetNext,
+            idx,
+            HostResponse::StreamChunk(HostResponseStreamChunk { result: Ok(vec![]) }),
+        );
+        assert!(is_stray_concurrent_entry(
+            &batched_entry,
+            &tracked([IdentityNamespace::Batch(idx)]),
+            None
+        ));
+    }
+
+    /// `stray_identity_of` is what `Durability::replay_raw` calls with its own
+    /// `HOST_FUNCTION_NAME` + `function_type`; it must agree exactly with what
+    /// `stray_entry_identity` derives from the entry that call persisted, or a consumer would
+    /// look up a key nothing was ever cached under. Also pins the three-variant list: no other
+    /// `DurableFunctionType` participates.
+    #[test]
+    fn consumer_side_identity_matches_entry_side_identity() {
+        let idx = OplogIndex::from_u64(11);
+        let cases = [
+            (
+                HostFunctionName::IoPollReady,
+                DurableFunctionType::ReadLocalPollable(3),
+            ),
+            (
+                HostFunctionName::GolemRpcFutureInvokeResultGet,
+                DurableFunctionType::WriteRemoteConcurrent(3),
+            ),
+            (
+                HostFunctionName::HttpTypesOutgoingBodyStreamFlush,
+                DurableFunctionType::WriteRemoteBatched(Some(idx)),
+            ),
+        ];
+        for (function_name, function_type) in cases {
+            let entry = host_call(
+                function_name.clone(),
+                function_type.clone(),
+                HostResponse::StreamWriteResult(HostResponseStreamWriteResult { result: Ok(()) }),
+            );
+            assert_eq!(
+                stray_identity_of(function_name.clone(), &function_type),
+                stray_entry_identity(&entry),
+                "consumer-side and entry-side identity derivation must not drift"
+            );
+        }
+
+        for function_type in [
+            DurableFunctionType::ReadLocal,
+            DurableFunctionType::WriteLocal,
+            DurableFunctionType::ReadRemote,
+            DurableFunctionType::WriteRemote,
+            DurableFunctionType::WriteRemoteBatched(None),
+            DurableFunctionType::WriteRemoteTransaction(Some(idx)),
+            DurableFunctionType::WriteRemoteTransaction(None),
+        ] {
+            assert_eq!(
+                stray_identity_of(HostFunctionName::IoPollPoll, &function_type),
+                None,
+                "{function_type:?} must not take part in the stray-entry mechanism"
+            );
+        }
+    }
+
     /// A genuinely unrelated/unrecognized entry must never be swallowed — this mechanism's
-    /// scope is exactly "same-kind concurrent strays," not "anything unexpected."
+    /// scope is exactly "same-shape concurrent strays," not "anything unexpected."
     #[test]
     fn rejects_unrelated_entry_kinds() {
-        let tracked = TrackedConcurrentOpSeqs {
-            pollable_seqs: HashSet::from([1]),
-            invoke_result_seqs: HashSet::from([1]),
-            http_begin_indexes: HashSet::from([OplogIndex::from_u64(1)]),
-        };
+        let tracked = tracked([
+            IdentityNamespace::Pollable(1),
+            IdentityNamespace::InvokeResult(1),
+            IdentityNamespace::Batch(OplogIndex::from_u64(1)),
+        ]);
         assert!(!is_stray_concurrent_entry(
             &OplogEntry::NoOp {
                 timestamp: Timestamp::now_utc(),
             },
             &tracked,
-            None,
             None
         ));
     }
@@ -4608,12 +5281,12 @@ impl PrivateDurableWorkerState {
             runtime_retry_policy_mutations: std::collections::BTreeMap::new(),
             rpc_pollable_to_parent: HashMap::new(),
             pollable_seq: HashMap::new(),
-            pre_resolved_pollable_ready: HashMap::new(),
             next_pollable_seq,
             invoke_result_seq: HashMap::new(),
-            pre_resolved_invoke_result: HashMap::new(),
             next_invoke_result_seq,
-            pre_resolved_http_stream_chunk: HashMap::new(),
+            pre_resolved_stray: HashMap::new(),
+            open_batches: HashSet::new(),
+            poll_replay_miss: None,
             shard_service,
             promise_backed_pollables: TRwLock::new(HashMap::new()),
             promise_dyn_pollables: TRwLock::new(HashMap::new()),
@@ -4666,7 +5339,10 @@ impl PrivateDurableWorkerState {
 
     /// Same mechanism as `recover_next_pollable_seq` immediately above, for
     /// `next_invoke_result_seq` — see that function's doc comment for the full rationale.
-    async fn recover_next_invoke_result_seq(oplog: &Arc<dyn Oplog>, snapshot_idx: OplogIndex) -> u32 {
+    async fn recover_next_invoke_result_seq(
+        oplog: &Arc<dyn Oplog>,
+        snapshot_idx: OplogIndex,
+    ) -> u32 {
         match oplog.read(snapshot_idx).await {
             OplogEntry::Snapshot {
                 next_invoke_result_seq,
@@ -4720,35 +5396,45 @@ impl PrivateDurableWorkerState {
         );
     }
 
-    /// Records that `seq`'s `IoPollReady` confirmation was consumed early, by a `poll()` call's
-    /// replay, on behalf of a pollable whose own `ready()` call hasn't replayed yet — see
-    /// `pre_resolved_pollable_ready`'s field doc comment for the full mechanism
-    /// (FINDING_B_FIX_DESIGN.md).
-    pub fn record_pre_resolved_pollable_ready(&mut self, seq: u32, ready: bool) {
+    /// Records an answer consumed early by a DIFFERENT operation's stray-scan, for
+    /// `identity`'s real owner to collect — see `pre_resolved_stray`'s field doc comment.
+    /// The payload is stored undecoded; the owner narrows it to its own response type.
+    pub fn record_pre_resolved_stray(
+        &mut self,
+        identity: StrayEntryIdentity,
+        response: HostResponse,
+    ) {
         debug!(
             agent_id = %self.owned_agent_id,
-            seq,
-            ready,
-            "POLLSEQ_TRACE record_pre_resolved_pollable_ready"
+            ?identity,
+            "STRAY_TRACE record_pre_resolved_stray"
         );
-        self.pre_resolved_pollable_ready.insert(seq, ready);
+        self.pre_resolved_stray.insert(identity, response);
     }
 
-    /// Takes (removes) a pre-resolved answer for `seq`, if `poll()`'s replay already consumed
-    /// its entry on this pollable's behalf. Consulted by `ready()`'s replay BEFORE its own
-    /// `try_get_oplog_entry` lookup — if present, the oplog has nothing left to find for this
-    /// seq (already durably consumed), so this is the only remaining source of the answer.
-    pub fn take_pre_resolved_pollable_ready(&mut self, seq: u32) -> Option<bool> {
-        let taken = self.pre_resolved_pollable_ready.remove(&seq);
-        if let Some(ready) = taken {
+    /// Takes (removes) the pre-resolved answer for `identity`, if a sibling operation's
+    /// stray-scan already consumed its entry on its behalf. Consulted BEFORE any oplog read: if
+    /// present, the oplog has nothing left to find for this identity (already durably
+    /// consumed), so this is the only remaining source of the answer.
+    pub fn take_pre_resolved_stray(
+        &mut self,
+        identity: &StrayEntryIdentity,
+    ) -> Option<HostResponse> {
+        let taken = self.pre_resolved_stray.remove(identity);
+        if taken.is_some() {
             debug!(
                 agent_id = %self.owned_agent_id,
-                seq,
-                ready,
-                "POLLSEQ_TRACE take_pre_resolved_pollable_ready"
+                ?identity,
+                "STRAY_TRACE take_pre_resolved_stray"
             );
         }
         taken
+    }
+
+    /// Non-consuming peek used by `poll()`'s ready-set synthesis: is a pre-resolved answer
+    /// waiting for this identity? The answer stays in the cache for its owner to take.
+    pub fn has_pre_resolved_stray(&self, identity: &StrayEntryIdentity) -> bool {
+        self.pre_resolved_stray.contains_key(identity)
     }
 
     /// Returns the logical sequence number for `rep` (a `FutureInvokeResult` resource),
@@ -4793,179 +5479,213 @@ impl PrivateDurableWorkerState {
         self.invoke_result_seq.get(&rep).copied()
     }
 
-    /// Records that `seq`'s `GolemRpcFutureInvokeResultGet` confirmation was consumed early, by
-    /// a DIFFERENT call's stray-scan, on behalf of a `get()` call that hasn't replayed yet — RPC
-    /// analog of `record_pre_resolved_pollable_ready`.
-    pub fn record_pre_resolved_invoke_result(&mut self, seq: u32, result: SerializableInvokeResult) {
-        debug!(
-            agent_id = %self.owned_agent_id,
-            seq,
-            "INVOKESEQ_TRACE record_pre_resolved_invoke_result"
-        );
-        self.pre_resolved_invoke_result.insert(seq, result);
-    }
-
-    /// Takes (removes) a pre-resolved answer for `seq`, if a sibling call's replay already
-    /// consumed its entry on this call's behalf. RPC analog of
-    /// `take_pre_resolved_pollable_ready`.
-    pub fn take_pre_resolved_invoke_result(&mut self, seq: u32) -> Option<SerializableInvokeResult> {
-        let taken = self.pre_resolved_invoke_result.remove(&seq);
-        if taken.is_some() {
-            debug!(
-                agent_id = %self.owned_agent_id,
-                seq,
-                "INVOKESEQ_TRACE take_pre_resolved_invoke_result"
-            );
-        }
-        taken
-    }
-
-    /// Records that `begin_idx`'s `HttpTypesIncomingBodyStreamRead` confirmation was consumed
-    /// early, by a DIFFERENT stream's stray-scan, on behalf of a `read()` call that hasn't
-    /// replayed yet — HTTP analog of `record_pre_resolved_invoke_result`.
-    pub fn record_pre_resolved_http_stream_chunk(
-        &mut self,
-        begin_idx: OplogIndex,
-        chunk: HostResponseStreamChunk,
-    ) {
-        debug!(
-            agent_id = %self.owned_agent_id,
-            %begin_idx,
-            "HTTPSTRAY_TRACE record_pre_resolved_http_stream_chunk"
-        );
-        self.pre_resolved_http_stream_chunk.insert(begin_idx, chunk);
-    }
-
-    /// Takes (removes) a pre-resolved answer for `begin_idx`, if a sibling stream's replay
-    /// already consumed its entry on this stream's behalf. HTTP analog of
-    /// `take_pre_resolved_invoke_result`.
-    pub fn take_pre_resolved_http_stream_chunk(
-        &mut self,
-        begin_idx: OplogIndex,
-    ) -> Option<HostResponseStreamChunk> {
-        let taken = self.pre_resolved_http_stream_chunk.remove(&begin_idx);
-        if taken.is_some() {
-            debug!(
-                agent_id = %self.owned_agent_id,
-                %begin_idx,
-                "HTTPSTRAY_TRACE take_pre_resolved_http_stream_chunk"
-            );
-        }
-        taken
-    }
-
-    /// Snapshots the currently-tracked pollable/invoke-result/HTTP-request identities into
-    /// owned sets, for use with `is_stray_concurrent_entry` — taken as owned values (not
-    /// borrowed from `self`) so the resulting predicate closure doesn't alias `self.state`
-    /// while `self.state.replay_state`'s `consume_stray_entries` needs its own `&mut` borrow.
+    /// Does the pollable at `rep` already have a "ready" answer waiting in a pre-resolved cache
+    /// — either its own `IoPollReady` answer, or (for a pollable subscribed to a
+    /// `FutureInvokeResult`) its parent future's `get()` answer?
     ///
-    /// `open_http_requests` is populated symmetrically on live AND replay for the common case
-    /// (a full oplog replay that re-executes `outgoing_handler::handle()` itself, which inserts
-    /// into it unconditionally — matching both the Tenth and Eleventh captures' actual shape:
-    /// one long invocation, single snapshot near genesis). It is NOT repopulated when resuming
-    /// past a snapshot taken mid-HTTP-request (a narrower, already-special-cased recovery path,
-    /// `replaying_http_batch`) — in that scenario this returns an empty HTTP set, and HTTP
-    /// stray-recognition simply doesn't fire, matching today's status quo for that specific
-    /// sub-case (not a regression — just not newly covered). See FINDING_B_FIX_DESIGN.md §8.7.
-    pub fn tracked_concurrent_op_seqs(&self) -> TrackedConcurrentOpSeqs {
-        TrackedConcurrentOpSeqs {
-            pollable_seqs: self.pollable_seq.values().copied().collect(),
-            invoke_result_seqs: self.invoke_result_seq.values().copied().collect(),
-            http_begin_indexes: self
-                .open_http_requests
-                .values()
-                .map(|r| r.begin_index)
-                .collect(),
-        }
+    /// Non-consuming: the answers stay in their caches for their owners' own replay to take.
+    /// Used by `poll()`'s replay to synthesize a ready-set when its own `IoPollPoll` entry is
+    /// not at the cursor — reporting these is not a guess, it is replaying an already-recorded
+    /// answer to the pollable it was actually recorded for.
+    pub fn is_pollable_pre_resolved_ready(&self, rep: u32) -> bool {
+        let own_ready = self
+            .pollable_seq
+            .get(&rep)
+            .map(|seq| {
+                StrayEntryIdentity::new(
+                    HostFunctionName::IoPollReady,
+                    IdentityNamespace::Pollable(*seq),
+                )
+            })
+            .and_then(|identity| self.pre_resolved_stray.get(&identity))
+            .map(|response| {
+                matches!(
+                    response,
+                    HostResponse::PollReady(HostResponsePollReady { result: Ok(true) })
+                )
+            })
+            .unwrap_or(false);
+        own_ready
+            || self
+                .rpc_pollable_to_parent
+                .get(&rep)
+                .and_then(|parent_rep| self.invoke_result_seq.get(parent_rep))
+                .map(|seq| {
+                    self.has_pre_resolved_stray(&StrayEntryIdentity::new(
+                        HostFunctionName::GolemRpcFutureInvokeResultGet,
+                        IdentityNamespace::InvokeResult(*seq),
+                    ))
+                })
+                .unwrap_or(false)
     }
 
-    /// Decodes and caches one stray entry (as recognized by `is_stray_concurrent_entry`) —
-    /// shared decode+cache logic used by every `consume_stray_entries` caller (`poll()`'s and
-    /// `get()`'s replay branches), so there is exactly one place that knows how to turn a
-    /// stray `IoPollReady`/`GolemRpcFutureInvokeResultGet` entry into a cached answer, rather
-    /// than duplicating the match-and-decode at each call site.
+    /// Records a `poll()` replay miss (its own `IoPollPoll` entry was not at the cursor) and
+    /// returns whether the caller should give up and fall back to the original unconditional
+    /// read (restoring the previous, diagnosable failure) rather than retry again.
+    ///
+    /// This bounds §13.7.2's "synthesize instead of consume" fallback: turning a permanent trap
+    /// into a retry is the whole point, but a retry that can never make progress would be an
+    /// unbounded spin — `wstd`'s reactor genuinely can re-call `poll()` in a tight loop with
+    /// nothing else interleaved, so an unbounded synthesize-and-retry is a real hang, not a
+    /// hypothetical one.
+    ///
+    /// The bound is *not* an arbitrary constant. Any forward movement of the replay cursor
+    /// (whether from this call's own stray-entry scan or from a completely different,
+    /// interleaved call site elsewhere in the guest's control flow — e.g. a `ready()`/`get()`
+    /// for a different concurrently-tracked region) resets the streak: only *consecutive misses
+    /// at the exact same, unmoved cursor position* count against the bound. The bound itself is
+    /// the number of oplog entries still ahead of that cursor (`replay_target() -
+    /// last_replayed_index()`), not a flat guess: at most one *other* consumer's turn can ever
+    /// move the cursor per entry that still exists in this replay pass, so once the number of
+    /// misses at a fixed position exceeds the number of entries left to be claimed by anyone,
+    /// it is structurally certain — not merely likely — that nothing further will ever consume
+    /// that position (the entries that could have moved it have run out). A larger remaining
+    /// window correctly earns more patience (more entries exist for other consumers to still
+    /// claim); a near-exhausted one gives up almost immediately.
+    pub fn record_poll_replay_miss(&mut self) -> bool {
+        let cursor = self.replay_state.last_replayed_index();
+        let count = match self.poll_replay_miss {
+            Some((at, count)) if at == cursor => count + 1,
+            _ => 1,
+        };
+        self.poll_replay_miss = Some((cursor, count));
+
+        let remaining = self
+            .replay_state
+            .replay_target()
+            .distance_from(cursor)
+            .max(0) as u64;
+        (count as u64) > remaining
+    }
+
+    /// Clears the `poll()` replay-miss streak — called whenever a `poll()` replay does consume
+    /// its own entry.
+    pub fn reset_poll_replay_miss(&mut self) {
+        self.poll_replay_miss = None;
+    }
+
+    /// Builds the stateful predicate for one stray-entry walk — see `StrayEntryScan`.
+    pub fn stray_entry_scan(&self, exclude: Option<StrayEntryIdentity>) -> StrayEntryScan {
+        StrayEntryScan::new(
+            self.tracked_concurrent_op_seqs(),
+            exclude,
+            // Pre-seeded with identities whose answer is already cached and uncollected — see
+            // `cached_stray_identities`.
+            self.cached_stray_identities(),
+        )
+    }
+
+    /// Walks the replay cursor past every stray entry belonging to a DIFFERENT concurrently-
+    /// tracked operation, decoding and caching each one for its real owner — the single entry
+    /// point every replay consumer uses, so the scan bound in `StrayEntryScan` and the decode
+    /// in `decode_and_cache_stray_entry` are applied identically everywhere rather than
+    /// re-assembled per call site.
+    ///
+    /// Reached from `Durability::replay_raw` (covering every `Durability`-based host function
+    /// at once) and from the three bespoke consumers that never construct a `Durability` on
+    /// their replay path: `poll()`, `ready()` and RPC `get()`.
+    pub async fn consume_and_cache_stray_entries(
+        &mut self,
+        exclude: Option<StrayEntryIdentity>,
+    ) -> Result<(), WorkerExecutorError> {
+        let mut scan = self.stray_entry_scan(exclude);
+        let mut strays = Vec::new();
+        self.replay_state
+            .consume_stray_entries(
+                |entry| scan.accept(entry),
+                |idx, entry| strays.push((idx, entry)),
+            )
+            .await?;
+        for (idx, entry) in strays {
+            self.decode_and_cache_stray_entry(idx, entry).await?;
+        }
+        Ok(())
+    }
+
+    /// Snapshots every currently-tracked operation identity into owned values, for use with
+    /// `is_stray_concurrent_entry` — taken as owned (not borrowed from `self`) so the resulting
+    /// predicate closure doesn't alias `self.state` while `self.state.replay_state`'s
+    /// `consume_stray_entries` needs its own `&mut` borrow.
+    ///
+    /// Three sources, one per `IdentityNamespace` variant: `pollable_seq`, `invoke_result_seq`
+    /// and `open_batches`. The last is shape-derived rather than HTTP-specific, so adding a new
+    /// `WriteRemoteBatched` host function requires no work here (FINDING_B_FIX_DESIGN.md §14.6).
+    ///
+    /// Scope caveat, unchanged from the previous `open_http_requests`-derived set: none of the
+    /// three is repopulated when resuming past a snapshot taken mid-operation, so in that
+    /// narrower recovery path this returns an empty set and stray-recognition simply doesn't
+    /// fire — which is also what keeps `check_write`'s cache-blind post-snapshot branch correct.
+    pub fn tracked_concurrent_op_seqs(&self) -> TrackedConcurrentOpSeqs {
+        let mut namespaces: HashSet<IdentityNamespace> = HashSet::new();
+        namespaces.extend(
+            self.pollable_seq
+                .values()
+                .copied()
+                .map(IdentityNamespace::Pollable),
+        );
+        namespaces.extend(
+            self.invoke_result_seq
+                .values()
+                .copied()
+                .map(IdentityNamespace::InvokeResult),
+        );
+        namespaces.extend(
+            self.open_batches
+                .iter()
+                .copied()
+                .map(IdentityNamespace::Batch),
+        );
+        TrackedConcurrentOpSeqs::new(namespaces)
+    }
+
+    /// The identities whose pre-resolved answer is already held in the cache and has not been
+    /// collected by its owner yet — treated by `StrayEntryScan` exactly like "already consumed
+    /// during this scan", since the cache holds one answer per identity and a second
+    /// consumption could only overwrite the first.
+    fn cached_stray_identities(&self) -> HashSet<StrayEntryIdentity> {
+        self.pre_resolved_stray.keys().cloned().collect()
+    }
+
+    /// Decodes and caches one stray entry (as recognized by `is_stray_concurrent_entry`).
+    ///
+    /// Fully generic: the identity comes from the entry's own shape and the payload is stored
+    /// undecoded, so a host function that is not named anywhere in this mechanism participates
+    /// automatically the moment it tags an entry with one of the three tracked
+    /// `DurableFunctionType` variants. This replaces five hand-written per-function match arms
+    /// that had to be extended reactively each time a live trap discovered another uncovered
+    /// function (FINDING_B_FIX_DESIGN.md §14.4).
     pub async fn decode_and_cache_stray_entry(
         &mut self,
         idx: OplogIndex,
         entry: OplogEntry,
     ) -> Result<(), WorkerExecutorError> {
-        match entry {
-            OplogEntry::HostCall {
-                function_name: HostFunctionName::IoPollReady,
-                durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
-                response,
-                ..
-            } => {
-                let host_response: HostResponse = self
-                    .oplog
-                    .download_payload(response)
-                    .await
-                    .map_err(WorkerExecutorError::runtime)?;
-                let payload: HostResponsePollReady = host_response
-                    .try_into()
-                    .map_err(WorkerExecutorError::runtime)?;
-                debug!(
-                    agent_id = %self.owned_agent_id,
-                    seq,
-                    matched_oplog_index = %idx,
-                    ready = ?payload.result,
-                    "POLLSEQ_TRACE decode_and_cache_stray_entry: IoPollReady"
-                );
-                self.record_pre_resolved_pollable_ready(seq, payload.result.unwrap_or(false));
-                Ok(())
-            }
-            OplogEntry::HostCall {
-                function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
-                durable_function_type: DurableFunctionType::WriteRemoteConcurrent(seq),
-                response,
-                ..
-            } => {
-                let host_response: HostResponse = self
-                    .oplog
-                    .download_payload(response)
-                    .await
-                    .map_err(WorkerExecutorError::runtime)?;
-                let payload: HostResponseGolemRpcInvokeGet = host_response
-                    .try_into()
-                    .map_err(WorkerExecutorError::runtime)?;
-                debug!(
-                    agent_id = %self.owned_agent_id,
-                    seq,
-                    matched_oplog_index = %idx,
-                    "INVOKESEQ_TRACE decode_and_cache_stray_entry: GolemRpcFutureInvokeResultGet"
-                );
-                self.record_pre_resolved_invoke_result(seq, payload.result);
-                Ok(())
-            }
-            OplogEntry::HostCall {
-                function_name: HostFunctionName::HttpTypesIncomingBodyStreamRead,
-                durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
-                response,
-                ..
-            } => {
-                let host_response: HostResponse = self
-                    .oplog
-                    .download_payload(response)
-                    .await
-                    .map_err(WorkerExecutorError::runtime)?;
-                let payload: HostResponseStreamChunk = host_response
-                    .try_into()
-                    .map_err(WorkerExecutorError::runtime)?;
-                debug!(
-                    agent_id = %self.owned_agent_id,
-                    %begin_idx,
-                    matched_oplog_index = %idx,
-                    "HTTPSTRAY_TRACE decode_and_cache_stray_entry: HttpTypesIncomingBodyStreamRead"
-                );
-                self.record_pre_resolved_http_stream_chunk(begin_idx, payload);
-                Ok(())
-            }
-            other => Err(WorkerExecutorError::runtime(format!(
-                "consume_stray_entries matched an entry decode_and_cache_stray_entry doesn't \
-                 know how to decode (is_stray_concurrent_entry and decode_and_cache_stray_entry \
-                 have drifted out of sync): {other:?}"
-            ))),
-        }
+        let identity = stray_entry_identity(&entry).ok_or_else(|| {
+            WorkerExecutorError::runtime(format!(
+                "consume_stray_entries matched an entry carrying no tracked identity \
+                 (is_stray_concurrent_entry and stray_entry_identity have drifted out of \
+                 sync): {entry:?}"
+            ))
+        })?;
+        let OplogEntry::HostCall { response, .. } = entry else {
+            // `stray_entry_identity` only ever returns `Some` for `HostCall`, so this is
+            // structurally unreachable; return an error rather than panicking.
+            return Err(WorkerExecutorError::runtime(
+                "stray_entry_identity returned an identity for a non-HostCall entry",
+            ));
+        };
+        let host_response: HostResponse = self
+            .oplog
+            .download_payload(response)
+            .await
+            .map_err(WorkerExecutorError::runtime)?;
+        debug!(
+            agent_id = %self.owned_agent_id,
+            ?identity,
+            matched_oplog_index = %idx,
+            "STRAY_TRACE decode_and_cache_stray_entry"
+        );
+        self.record_pre_resolved_stray(identity, host_response);
+        Ok(())
     }
 
     /// Returns the agent-config-derived retry policies (cached, cheap).

@@ -20,7 +20,7 @@ use crate::durable_host::http::{continue_http_request, end_http_request};
 use crate::durable_host::io::{ManagedStdErr, ManagedStdOut};
 use crate::durable_host::{
     Durability, DurabilityHost, DurableWorkerCtx, HttpOutputStreamState, HttpRequestCloseOwner,
-    PendingFilesystemReservation, is_stray_concurrent_entry,
+    PendingFilesystemReservation,
 };
 use crate::model::event::InternalWorkerEvent;
 use crate::services::oplog::OplogOps;
@@ -112,38 +112,11 @@ impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
                         },
                     )
                     .await
-            } else if let Some(cached) =
-                self.state.take_pre_resolved_http_stream_chunk(begin_idx)
-            {
-                // A sibling concurrent stream's stray-scan already consumed this entry on our
-                // behalf (FINDING_B_FIX_DESIGN.md §8.7) — use it directly, oplog untouched.
-                Ok(cached)
             } else {
-                // Scan past any stray entries belonging to OTHER tracked concurrent operations
-                // (excluding this stream's own begin_idx), caching each for its real owner —
-                // same shared mechanism as poll()/get() (FINDING_B_FIX_DESIGN.md).
-                let tracked = self.state.tracked_concurrent_op_seqs();
-                let mut strays = Vec::new();
-                self.state
-                    .replay_state
-                    .consume_stray_entries(
-                        |entry| {
-                            is_stray_concurrent_entry(entry, &tracked, None, Some(begin_idx))
-                        },
-                        |idx, entry| strays.push((idx, entry)),
-                    )
-                    .await
-                    .map_err(|e| StreamError::Trap(wasmtime::Error::from_anyhow(e.into())))?;
-                for (idx, entry) in strays {
-                    self.state
-                        .decode_and_cache_stray_entry(idx, entry)
-                        .await
-                        .map_err(|e| StreamError::Trap(wasmtime::Error::from_anyhow(e.into())))?;
-                }
-
-                // Unchanged existing fallback — whatever's left must be mine (every other known
-                // identity has been filtered out) or a genuine, still-correctly-crashing
-                // mismatch.
+                // Cache-then-scan-then-read now lives inside `Durability::replay_raw`, keyed by
+                // this call's own `(function_name, begin_index)` identity — see
+                // FINDING_B_FIX_DESIGN.md §14.9. Every HTTP stream operation gets it, not just
+                // the handful that were retrofitted individually.
                 durability.replay(self).await
             }?;
 
@@ -215,6 +188,11 @@ impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
+                // `read` and `blocking_read` now carry SEPARATE identities (they record under
+                // separate `HostFunctionName`s), rather than sharing one cache as they did when
+                // the cache was typed by response shape. Replay re-executes the same guest code
+                // and therefore the same variant, so the more precise key is also the correct
+                // one — and it lets a scan defer one entry of each, instead of one in total.
                 durability.replay(self).await
             }?;
 
@@ -346,7 +324,10 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
     async fn check_write(&mut self, self_: Resource<OutputStream>) -> Result<u64, StreamError> {
         let rep = self_.rep();
         let is_http = is_outgoing_http_body_stream(self, rep);
-        let open_reps: Vec<_> = self.state.open_http_requests.iter()
+        let open_reps: Vec<_> = self
+            .state
+            .open_http_requests
+            .iter()
             .map(|(k, v)| (*k, v.output_stream_rep))
             .collect();
         tracing::trace!(
@@ -393,6 +374,10 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
+                // Cache-then-scan-then-read is applied inside `Durability::replay_raw`. Without
+                // it, an ordinary single fetch() with a multi-chunk request body is enough to
+                // strand a check_write entry at the cursor and trap a later poll() with
+                // "expected io::poll::poll, got http::types::outgoing_body_stream::check_write".
                 durability.replay(self).await
             }
             .map_err(StreamError::from)?;
@@ -424,7 +409,8 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                         matches!(
                             entry,
                             OplogEntry::HostCall {
-                                function_name: HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+                                function_name:
+                                    HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
                                 ..
                             }
                         )
@@ -510,6 +496,9 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
+                // `write` and `check_write` occur 1:1 in lockstep on every body chunk, so both
+                // must participate or the identical trap simply relocates one call later
+                // (FINDING_B_FIX_DESIGN.md §12.6). Both do, via `Durability::replay_raw`.
                 let replayed = durability.replay(self).await;
                 mark_replayed_body_write(self, state.request_handle);
                 replayed
@@ -649,6 +638,9 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
+                // Records under the same `HostFunctionName` and the same response shape as
+                // write(), so it resolves to the same stray identity and consults the same
+                // cached answer — a stray-scan cannot tell the two apart, nor does it need to.
                 let replayed = durability.replay(self).await;
                 mark_replayed_body_write(self, state.request_handle);
                 replayed

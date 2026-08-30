@@ -2747,3 +2747,138 @@ silent-misdelivery before/after pair on payload content; and one cursor-level de
 newly-wired family (outgoing stream, incoming stream, trailers, RDBMS). Every pre-existing
 `stray_entry_tests` and `replay_state::tests` case survives with only the mechanical identity-
 constructor change, except the one documented above.
+
+## 15. RCA of `character_sheet`'s residual `blocking_read`/`poll` trap — the "app-level reset non-determinism" hypothesis is refuted
+
+`oplog-backups/README.md`'s "Tracked follow-up" note (end of the Fourteenth-capture entry) flagged a
+candidate explanation for `WorkerAgent("workspace-smoketest@1.0", "...@character_sheet")`'s residual
+trap after §14 merged: the agent's log shows `run: injecting 1 correction line(s) from prior reset`
+immediately before the trapping region, so an app-level `reset()` call rewriting the agent's
+conversation state was suspected of making the LLM "decide differently" on a later replay than it did
+live — i.e. genuine guest-side non-determinism, not an engine gap. This was explicitly marked
+"not yet confirmed." This section closes that out with direct evidence from
+`oplog-backups/2026-08-30_WorkerAgent_workspace-smoketest_3e0f1d89-character_sheet_POSTFIX_CHECKWRITE-FIXED_BLOCKINGREAD-TRAP.oplog`:
+**the hypothesis is refuted. The trap is an engine-side replay gap, not app-level non-determinism.**
+
+### 15.1 What `reset()` actually does (video-harness, `src/worker/worker-agent.ts`)
+
+`reset()` (line ~2083) is a plain externally-invoked method: it zeroes the task's attempt budget,
+clears artifact status, wipes the sub-task/artifact/policy maps the worker created, and stashes any
+`instructions` it was called with in `this.pendingCorrection` (a durable instance field, restored via
+snapshot/replay like any other). It also cancels an open HITL request via a fresh (never cached)
+`this.hitlManager()` proxy — consistent with this repo's WasmRpc proxy rules — and calls
+`pushAgentState()`, a KV write. Every branch inside `reset()` is driven only by instance fields and the
+method's own (recorded) parameters — no `fetch()`, no `Date.now()`-driven branching, nothing
+data-dependent on a non-deterministic value. `run()` (line ~1965) later reads `pendingCorrection`, and
+if set, pushes one `user` message onto `this.client.messages` before the reasoning loop's first LLM
+call — logging `run: injecting N correction line(s) from prior reset` right before doing so. Both
+methods are ordinary recorded invocations: nothing about them bypasses normal oplog replay, and
+nothing in either reads a live clock, a live RPC result, or any other value that could differ between
+a live run and a later replay of the *same* recorded invocation.
+
+### 15.2 What the oplog actually shows: three stale reset+run retries queued behind an unrelated, already-fixed trap, then a genuinely new run
+
+The file's `ENQUEUED INVOCATION` entries show only 8 top-level invocations for this agent instance:
+the original `run()` (#1), one `wakeUp`, then three `reset()`→`run()` pairs enqueued at 05:43, 05:48,
+and 05:53 (oplog #00611–#00618). All three pairs were the *workspace manager's watchdog* retrying a
+worker it believed stuck — every one of them, on dispatch, immediately re-hit the **already-diagnosed
+and by-then-fixed `check_write` bug** at oplog index 605 (`ERROR ... retry from: 605`, same message
+each time), because resuming the worker at all requires replaying from the start, and that replay
+couldn't get past 605 until the engine fix landed. None of the three reset/run pairs' bodies had
+executed yet at that point — they were inert, queued behind a permanently-blocked resume.
+
+Once the engine fix let replay pass entry 605 (captured live at 07:19 in this same file), what
+actually happened, in order, was:
+
+1. The **original** `run()` (still in-flight, suspended on `awaitPromise` since before any reset)
+   resumed, received its already-completed render promise result, ran its reasoning loop to
+   completion, published the artifact, and reported success to the manager (`#01038`–`#01401`,
+   `LLM loop done: 9 steps (task_complete)` → `reporting success to manager`) — **before any reset()
+   had executed.**
+2. Only *then* did the queue advance to the first stale `reset()` (#00611, silent — it has no log
+   line) followed by `run()` (#00612, logs `run() invoked` again at oplog #01428 and `run: injecting 1
+   correction line(s) from prior reset` shortly after). This is the one that produced the log line the
+   "Tracked follow-up" note keyed on.
+3. This second `run()` is a **new, real reasoning-loop execution against a task that had already
+   succeeded one step earlier** — a stale watchdog retry firing after its own trigger condition
+   (worker apparently stuck) had already resolved itself. It genuinely re-runs the LLM loop from
+   scratch and drives two brand-new `POST https://ollama.com/api/chat` round trips (`#02190`–`#02257`
+   and `#02258`–`#02320`).
+
+This redundant-rerun-of-an-already-succeeded-task is a real, if minor, app-level artifact of a stale
+watchdog retry surviving an engine outage — worth a follow-up (§15.5) — but it is **not** the cause of
+the trap, per §15.3.
+
+### 15.3 The trap position is perfectly reproducible across independent replay attempts — this rules out "the LLM decided differently"
+
+The file's own final entry:
+
+```
+ERROR
+  retry from:        2253
+  error:             Unexpected oplog entry during replay: expected io::poll::poll,
+                      got http::types::incoming_body_stream::blocking_read
+```
+
+Entry `#02253` (`http::types::future_incoming_response::get`) sits inside the **first** of the two new
+chat round trips (`#02190`–`#02257`) — the earlier, already-fully-recorded one. Critically, this
+capture shows replay reproducing that exact same trap position (`2253`) **after** live execution had
+already progressed well past it in an earlier session within this same file — all the way through a
+second, brand-new HTTP round trip (`#02258`–`#02320`, itself containing genuinely new content, e.g. a
+fresh `sandbox_exec` tool-call result). No matter how much further live execution got in between
+crashes, every cold replay of the *history up to that point* traps at the identical entry — matching
+the independent second-cold-restart trap the README's Fourteenth-capture entry separately recorded at
+the same `begin_index: 2253`. Two independent replay attempts (this file's own internal resume-after-605,
+and the separately-documented second cold-restart) agree on the exact same position.
+
+This is decisive: if the divergence were caused by the LLM "deciding differently" between a live run
+and a later replay, the trap position would not be exactly reproducible — the content and length of
+whatever the LLM decided differently would shift where the mismatch first appears, if it appeared at
+all (durable replay does not re-call the LLM API for an already-recorded response — see the RCA
+prompt's own framing, confirmed correct here). A trap that lands on the identical oplog entry number
+across multiple independent replay attempts, of a request/response pair that was itself already fully
+recorded before any of those replays began, is the signature of a **replay mechanism issue reading an
+already-fixed, byte-identical recorded sequence** — not of guest control flow legitimately diverging
+because upstream state (correction text, message history) differed.
+
+### 15.4 Conclusion: this is the already-tracked `future_incoming_response::get`/`blocking_read` sibling-identity gap, not a new bug and not app-level
+
+§14.2.1 already flagged `http::types::future_incoming_response::get` as "the strongest latent gap" and
+§14.13 confirms it was hand-converted into the general `replay_raw` mechanism. The residual trap here
+is the specific case that mechanism's own designed limit does not cover: per the README's
+`STRAY_TRACE` evidence, entry `#02254` (`blocking_read`) is correctly recognized and cached as a
+stray, but a **second** `blocking_read` sharing the identical `(function_name, identity)` key
+(`#02255`) cannot be told apart from the first by the identity scheme alone — the deliberate
+one-cached-answer-per-identity bound (§12, kept to stop a scan draining an entire same-identity
+cluster) correctly declines to guess which of the two indistinguishable siblings is being asked for,
+and whatever host call comes next (`poll()`, per replay's guest) has nothing left to consume. This is
+exactly the "no legal non-destructive miss answer" limitation §14.13 flagged when explicitly declining
+to generalize §13.7.2's positional-miss handling beyond `poll()`/`ready()`/RPC `get()` ("generalising
+it to 92 is a separate change with its own risk budget"). **Two (or more) same-identity entries with
+no ordinal tiebreak is a known, explicitly out-of-scope gap in the landed design — not a new
+mechanism, and not caused by `reset()`.**
+
+**Verdict: (b) — a golem engine replay-matching gap**, specifically the untracked case of multiple
+oplog entries sharing one `StrayEntryIdentity` with no way to distinguish which is "next." It is the
+same family as everything else in this document, already named as a known limitation in §14.13's
+deviation #2, not a new mechanism requiring separate discovery. The `reset()`/correction-injection
+hypothesis in the Fourteenth-capture "Tracked follow-up" note is refuted by §15.3's evidence and can be
+retired.
+
+**What a fix would need**: an ordinal tiebreak *within* one `StrayEntryIdentity` bucket — e.g. key the
+stray-entry cache on `(StrayEntryIdentity, occurrence_index)` where `occurrence_index` counts prior
+entries of the same identity already produced within the same `begin_index`/batch, rather than a
+single cached answer per identity. This directly extends §14.9's design without reopening the
+positional-miss-handling scope §14.13 deliberately deferred.
+
+### 15.5 Separate, minor app-level finding (video-harness, not golem) — not a determinism bug, tracked here for visibility only
+
+The stale watchdog retry described in §15.2 (a `reset()`+`run()` pair dispatched by
+`WorkspaceAgent` while a worker appeared stuck, which only actually executes *after* that same worker
+independently resolved and reported success) causes a real, successfully-completed task to be silently
+reset back to `ready` and fully redone. This wastes an LLM round trip and sandbox work but is not a
+correctness or determinism bug — `reset()`/`run()` remain individually replay-safe regardless. A
+hardening opportunity (not implemented here): `WorkerAgent.reset()` could no-op if `this.taskData?.status
+=== "success"` and the triggering watchdog call is older than the completion, but this is a
+video-harness application concern, tracked here only because it was the visible trigger that led this
+investigation to the actual (engine-side) trap.

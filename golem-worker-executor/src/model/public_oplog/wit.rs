@@ -1132,6 +1132,15 @@ impl TryFrom<oplog::OplogEntry> for golem_common::model::oplog::OplogEntry {
                 timestamp: timestamp_from_datetime(params.timestamp),
                 data: oplog_payload_from_wit(params.data),
                 mime_type: params.mime_type,
+                // The `raw-snapshot-parameters` WIT type (a separately-defined .wit interface,
+                // not auto-derived from the raw{} DSL block) has no next-pollable-seq field, and
+                // deliberately wasn't extended to add one (see the field's doc comment,
+                // base_model/oplog/mod.rs): it is engine-internal bookkeeping, not part of the
+                // cross-language WIT-facing surface. Safe: this conversion is for WIT/API
+                // interop, never on the engine's own snapshot-take/resume path
+                // (recover_next_pollable_seq, durable_host/mod.rs, reads the native Rust
+                // OplogEntry directly from local storage).
+                next_pollable_seq: 0,
             }),
             oplog::OplogEntry::OplogProcessorCheckpoint(params) => {
                 Ok(Self::OplogProcessorCheckpoint {

@@ -15,14 +15,16 @@
 use crate::Tracing;
 use golem_common::base_model::agent::{ComponentModelElementValue, ElementValue};
 use golem_common::model::agent::{DataValue, ElementValues};
-use golem_common::model::oplog::OplogIndex;
+use golem_common::model::oplog::{OplogIndex, PublicOplogEntry};
 use golem_common::model::{AgentStatus, PromiseId};
 use golem_common::{agent_id, data_value};
 use golem_test_framework::dsl::TestDsl;
 use golem_wasm::analysis::analysed_type;
-use golem_wasm::{FromValue, UuidRecord, Value, ValueAndType};
+use golem_wasm::{FromValue, IntoValue, IntoValueAndType, UuidRecord, Value, ValueAndType};
+use golem_worker_executor::services::golem_config::SnapshotPolicy;
 use golem_worker_executor_test_utils::{
     LastUniqueId, PrecompiledComponent, TestContext, WorkerExecutorTestDependencies, start,
+    start_with_snapshot_policy,
 };
 use pretty_assertions::assert_eq;
 use std::time::Duration;
@@ -1096,6 +1098,548 @@ async fn ts_cancel_survives_executor_restart(
         .into_return_value()
         .expect("Expected a single return value from getCompletedCount");
     assert_eq!(count_value, Value::F64(1.0));
+
+    Ok(())
+}
+
+/// Round nine: real two-agent-RPC variant of round eight's
+/// `sequential_atomic_rpc_region_survives_cold_replay_after_suspend` (see
+/// `ROUND_EIGHT_FINDINGS.md`), which used a plain `atomically()`-wrapped WASI HTTP call and
+/// passed clean, falsifying the generic "atomic region + cold replay-after-suspend" hypothesis.
+/// This test swaps the atomic region's content for a REAL cross-agent RPC call — `RpcCaller`
+/// (this file's `agent_rpc_rust` component) constructing a fresh `RpcCounterClient::get(...)`
+/// proxy and calling `inc_by(1)` inside `atomically_async()`, matching the production
+/// `WorkerAgent.workflowToolStart()` → `atomicRpcCall()` → `WorkflowAgent.get(...).run(...)`
+/// shape's actual host-call sequence (`get_agent_type` x2, two tracing spans,
+/// `future-invoke-result::get`) rather than the WASI-HTTP `check_write`/`write` path round
+/// eight exercised. Same suspend + cold-restart-with-no-snapshot shape as round eight.
+#[test]
+#[tracing::instrument]
+async fn sequential_atomic_rpc_call_region_survives_cold_replay_after_suspend(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("agent_rpc_rust")] agent_rpc_rust: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let component = executor
+        .component_dep(&context.default_environment_id, agent_rpc_rust)
+        .store()
+        .await?;
+
+    let agent_id = agent_id!("RpcCaller", "round9-atomic-rpc-1");
+    let worker_id = executor
+        .start_agent(&component.id, agent_id.clone())
+        .await?;
+
+    // ONE atomically_async()-wrapped real cross-agent RPC call (RpcCounterClient::get(...).
+    // inc_by(1).await), then create_promise() (not awaited yet). Matches production's
+    // atomic-region shape exactly: get_agent_type x2, rpc-connection span, rpc-invocation span,
+    // io::poll::poll, io::poll::pollable::ready, future-invoke-result::get, FINISH SPAN.
+    let promise_id_value = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_calls_then_promise_init",
+            data_value!(1u32),
+        )
+        .await?
+        .into_return_value()
+        .ok_or_else(|| anyhow::anyhow!("expected a PromiseId return value"))?;
+    let promise_id_vat = ValueAndType::new(promise_id_value.clone(), PromiseId::get_type());
+
+    // Fire-and-forget: the promise is not complete yet, so this invocation genuinely suspends
+    // (matches production's bare SUSPEND entry with no completing IoPollPoll recorded).
+    executor
+        .invoke_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_await",
+            DataValue::Tuple(ElementValues {
+                elements: vec![ElementValue::ComponentModel(ComponentModelElementValue {
+                    value: promise_id_vat.clone(),
+                })],
+            }),
+        )
+        .await?;
+
+    // Give the suspend a moment to actually land before forcing a cold restart.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Force a genuine worker eviction + full oplog replay on a fresh executor/instance, with
+    // the promise STILL incomplete across the restart — no intervening snapshot exists for this
+    // component, so replay must walk the entire history (including the atomic RPC region and
+    // the RpcCounter callee agent's own oplog) from scratch.
+    drop(executor);
+    let executor = start(deps, &context).await?;
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    let Value::Record(fields) = &promise_id_value else {
+        panic!("Expected a record for PromiseId");
+    };
+    let Value::U64(oplog_idx) = fields[1] else {
+        panic!("Expected a u64 for oplog_idx");
+    };
+    executor
+        .complete_promise(
+            &PromiseId {
+                agent_id: worker_id.clone(),
+                oplog_idx: OplogIndex::from_u64(oplog_idx),
+            },
+            b"resumed-ok".to_vec(),
+        )
+        .await?;
+
+    let result = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_await",
+            DataValue::Tuple(ElementValues {
+                elements: vec![ElementValue::ComponentModel(ComponentModelElementValue {
+                    value: promise_id_vat,
+                })],
+            }),
+        )
+        .await?
+        .into_return_value();
+
+    assert_eq!(
+        result,
+        Some(Value::List(b"resumed-ok".iter().map(|b| Value::U8(*b)).collect())),
+        "worker must survive the cold replay of the atomic RPC region + suspend and resolve the \
+         promise correctly — a mismatch or a trap during the preceding atomic RPC call's replay \
+         means the io::poll::poll/pollable::ready replay divergence reproduced"
+    );
+
+    Ok(())
+}
+
+/// Round nine, single-invocation variant: the other untested hypothesis from
+/// `ROUND_EIGHT_FINDINGS.md` — collapse the atomic RPC region and the suspend-inducing await
+/// into ONE external invocation (`sequential_atomic_rpc_calls_then_await`), rather than the
+/// two-invocation split `sequential_atomic_rpc_call_region_survives_cold_replay_after_suspend`
+/// used. Matches production even more closely: `WorkerAgent.advanceReasoningLoop()`'s one round
+/// does the atomic `workflowToolStart()` RPC dispatches AND the `awaitPromise()` suspend
+/// together, never across a separate invocation boundary. The promise itself is still created
+/// via a cheap, separate, non-suspending call (`sequential_atomic_rpc_calls_then_promise_init`
+/// with `n=0` — zero atomic calls, just `create_promise()`) purely so the test can learn its id
+/// to complete it externally later; promise creation is not part of either hypothesis.
+#[test]
+#[tracing::instrument]
+async fn sequential_atomic_rpc_call_and_suspend_single_invocation_survives_cold_replay(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("agent_rpc_rust")] agent_rpc_rust: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let component = executor
+        .component_dep(&context.default_environment_id, agent_rpc_rust)
+        .store()
+        .await?;
+
+    let agent_id = agent_id!("RpcCaller", "round9b-atomic-rpc-1");
+    let worker_id = executor
+        .start_agent(&component.id, agent_id.clone())
+        .await?;
+
+    // Zero atomic calls — just create_promise(), so the test learns the id up front.
+    let promise_id_value = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_calls_then_promise_init",
+            data_value!(0u32),
+        )
+        .await?
+        .into_return_value()
+        .ok_or_else(|| anyhow::anyhow!("expected a PromiseId return value"))?;
+
+    let Value::Record(fields) = &promise_id_value else {
+        panic!("Expected a record for PromiseId");
+    };
+    let Value::U64(oplog_idx) = fields[1] else {
+        panic!("Expected a u64 for oplog_idx");
+    };
+    let promise_id = PromiseId {
+        agent_id: worker_id.clone(),
+        oplog_idx: OplogIndex::from_u64(oplog_idx),
+    };
+    let promise_id_vat = ValueAndType::new(promise_id_value, PromiseId::get_type());
+
+    // ONE invocation: 1 atomically_async()-wrapped RPC call THEN blocking_await_promise —
+    // matches production's single-round shape. Fire-and-forget since it will suspend.
+    executor
+        .invoke_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_calls_then_await",
+            DataValue::Tuple(ElementValues {
+                elements: vec![
+                    ElementValue::ComponentModel(ComponentModelElementValue {
+                        value: 1u32.into_value_and_type(),
+                    }),
+                    ElementValue::ComponentModel(ComponentModelElementValue {
+                        value: promise_id_vat,
+                    }),
+                ],
+            }),
+        )
+        .await?;
+
+    // Give the suspend a moment to actually land before forcing a cold restart.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Force a genuine worker eviction + full oplog replay on a fresh executor/instance, with
+    // the promise STILL incomplete across the restart and the atomic RPC region + suspend both
+    // inside the SAME not-yet-completed invocation's history.
+    drop(executor);
+    let executor = start(deps, &context).await?;
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    executor
+        .complete_promise(&promise_id, b"resumed-ok".to_vec())
+        .await?;
+
+    // If replay trapped, this will time out (worker stuck Failed/never reaching Idle) or the
+    // eventual invoke below will error.
+    executor
+        .wait_for_status(&worker_id, AgentStatus::Idle, Duration::from_secs(20))
+        .await?;
+
+    // Confirm the worker is still genuinely functional post-replay (not just reporting Idle
+    // while wedged) by successfully completing a fresh, independent round trip.
+    let followup = executor
+        .invoke_and_await_agent(&component, &agent_id, "test3", data_value!())
+        .await?
+        .into_return_value();
+    assert_eq!(
+        followup,
+        Some(Value::U64(1)),
+        "worker must remain genuinely functional after the cold replay of the single-invocation \
+         atomic RPC region + suspend — a trap during replay would leave it Failed/wedged instead \
+         of able to complete this independent follow-up RPC call"
+    );
+
+    Ok(())
+}
+
+/// Round nine, n=4 single-invocation variant: identical to
+/// `sequential_atomic_rpc_call_and_suspend_single_invocation_survives_cold_replay` but with
+/// `n=4` instead of `n=1` — matching the ACTUAL byte-traced production `scene_plates` oplog
+/// exactly (4 sequential atomically()-wrapped RPC regions, not 1). The "1 region is sufficient"
+/// simplification used by the other round-nine variants was inferred from a summary of the
+/// SEPARATE `character_sheet` oplog (a different trap shape entirely — a timer-vs-HTTP race,
+/// not an atomic RPC region) rather than personally re-traced from `scene_plates` itself, so it
+/// is untested until this variant.
+#[test]
+#[tracing::instrument]
+async fn sequential_atomic_rpc_call_and_suspend_single_invocation_n4_survives_cold_replay(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("agent_rpc_rust")] agent_rpc_rust: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let component = executor
+        .component_dep(&context.default_environment_id, agent_rpc_rust)
+        .store()
+        .await?;
+
+    let agent_id = agent_id!("RpcCaller", "round9c-atomic-rpc-n4");
+    let worker_id = executor
+        .start_agent(&component.id, agent_id.clone())
+        .await?;
+
+    let promise_id_value = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_calls_then_promise_init",
+            data_value!(0u32),
+        )
+        .await?
+        .into_return_value()
+        .ok_or_else(|| anyhow::anyhow!("expected a PromiseId return value"))?;
+
+    let Value::Record(fields) = &promise_id_value else {
+        panic!("Expected a record for PromiseId");
+    };
+    let Value::U64(oplog_idx) = fields[1] else {
+        panic!("Expected a u64 for oplog_idx");
+    };
+    let promise_id = PromiseId {
+        agent_id: worker_id.clone(),
+        oplog_idx: OplogIndex::from_u64(oplog_idx),
+    };
+    let promise_id_vat = ValueAndType::new(promise_id_value, PromiseId::get_type());
+
+    executor
+        .invoke_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_calls_then_await",
+            DataValue::Tuple(ElementValues {
+                elements: vec![
+                    ElementValue::ComponentModel(ComponentModelElementValue {
+                        value: 4u32.into_value_and_type(),
+                    }),
+                    ElementValue::ComponentModel(ComponentModelElementValue {
+                        value: promise_id_vat,
+                    }),
+                ],
+            }),
+        )
+        .await?;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    drop(executor);
+    let executor = start(deps, &context).await?;
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    executor
+        .complete_promise(&promise_id, b"resumed-ok".to_vec())
+        .await?;
+
+    executor
+        .wait_for_status(&worker_id, AgentStatus::Idle, Duration::from_secs(20))
+        .await?;
+
+    let followup = executor
+        .invoke_and_await_agent(&component, &agent_id, "test3", data_value!())
+        .await?
+        .into_return_value();
+    assert_eq!(
+        followup,
+        Some(Value::U64(1)),
+        "worker must remain genuinely functional after the cold replay of 4 sequential atomic \
+         RPC regions + suspend, matching the byte-traced production scene_plates shape exactly"
+    );
+
+    Ok(())
+}
+
+/// Round ten: real cross-agent RPC variant of `atomic_double_ready_call_then_promise_init`
+/// (durability.rs) — drives the RAW `WasmRpc`/`future-invoke-result` API manually with the
+/// production-matching `ready()` (non-blocking) → `poll()` (blocking) → `ready()` (confirm)
+/// shape, on the actual `golem::rpc::future-invoke-result` pollable (not an HTTP input-stream
+/// pollable). See `/Users/hannes/work/golem/oplog-backups/README.md` "Sixth capture" for the
+/// live-instrumented production trace this reproduces.
+#[test]
+#[tracing::instrument]
+async fn atomic_double_ready_rpc_call_survives_cold_replay_after_suspend(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("agent_rpc_rust")] agent_rpc_rust: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let component = executor
+        .component_dep(&context.default_environment_id, agent_rpc_rust)
+        .store()
+        .await?;
+
+    let agent_id = agent_id!("RpcCaller", "round10-double-ready-rpc-1");
+    let worker_id = executor
+        .start_agent(&component.id, agent_id.clone())
+        .await?;
+
+    let promise_id_value = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "atomic_double_ready_rpc_call_then_promise_init",
+            data_value!("round10_double_ready_rpc_counter".to_string()),
+        )
+        .await?
+        .into_return_value()
+        .ok_or_else(|| anyhow::anyhow!("expected a PromiseId return value"))?;
+    let promise_id_vat = ValueAndType::new(promise_id_value.clone(), PromiseId::get_type());
+
+    executor
+        .invoke_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_await",
+            DataValue::Tuple(ElementValues {
+                elements: vec![ElementValue::ComponentModel(ComponentModelElementValue {
+                    value: promise_id_vat.clone(),
+                })],
+            }),
+        )
+        .await?;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    drop(executor);
+    let executor = start(deps, &context).await?;
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    let Value::Record(fields) = &promise_id_value else {
+        panic!("Expected a record for PromiseId");
+    };
+    let Value::U64(oplog_idx) = fields[1] else {
+        panic!("Expected a u64 for oplog_idx");
+    };
+    executor
+        .complete_promise(
+            &PromiseId {
+                agent_id: worker_id.clone(),
+                oplog_idx: OplogIndex::from_u64(oplog_idx),
+            },
+            b"resumed-ok".to_vec(),
+        )
+        .await?;
+
+    let result = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_await",
+            DataValue::Tuple(ElementValues {
+                elements: vec![ElementValue::ComponentModel(ComponentModelElementValue {
+                    value: promise_id_vat,
+                })],
+            }),
+        )
+        .await?
+        .into_return_value();
+
+    assert_eq!(
+        result,
+        Some(Value::List(b"resumed-ok".iter().map(|b| Value::U8(*b)).collect())),
+        "worker must survive the cold replay of the atomic RPC region + suspend and resolve the \
+         promise correctly — a mismatch or a trap during replay of the preceding double-ready() \
+         atomic RPC call means the io::poll::poll/pollable::ready replay divergence reproduced"
+    );
+
+    Ok(())
+}
+
+/// Regression test for the root cause identified in the Eighth capture
+/// (`INVESTIGATION_SUMMARY.md`): `pollable_seq`'s `next_pollable_seq` counter must be recovered
+/// from the durable oplog on snapshot-based resume, not reset to 0 (fixed in
+/// `PrivateDurableWorkerState::new()`/`recover_next_pollable_seq()`,
+/// `golem-worker-executor/src/durable_host/mod.rs`).
+///
+/// Unlike every prior round's reproduction attempts (all of which used `drop(executor);
+/// start()` with NO periodic snapshotting — replay therefore always started from oplog genesis,
+/// where a fresh 0 counter happens to be correct, which is exactly why none of them reproduced
+/// the trap), this test enables real periodic snapshotting so a snapshot genuinely lands BETWEEN
+/// two atomic-region RPC calls: round 1 (before any snapshot) consumes at least one
+/// `pollable_seq` value; a periodic snapshot then fires while the worker is idle; round 2 (after
+/// the snapshot) consumes another, persisting a `ReadLocalPollable(N)` entry with N > 0 baked in
+/// from the live session's uninterrupted count. A cold restart then forces resume from that
+/// snapshot (not genesis) — the exact shape the fix targets.
+#[test]
+#[tracing::instrument]
+async fn atomic_rpc_call_across_periodic_snapshot_survives_cold_replay(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("agent_rpc_rust")] agent_rpc_rust: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start_with_snapshot_policy(
+        deps,
+        &context,
+        SnapshotPolicy::EveryNInvocation { count: 2 },
+    )
+    .await?;
+
+    let component = executor
+        .component_dep(&context.default_environment_id, agent_rpc_rust)
+        .store()
+        .await?;
+    let agent_id = agent_id!("RpcCaller", "round13-snapshot-then-resume");
+    let worker_id = executor.start_agent(&component.id, agent_id.clone()).await?;
+
+    // Round 1, before any snapshot: several separate invocations (EveryNInvocation{count: 2} is
+    // deterministic — no wall-clock timing dependency like SnapshotPolicy::Periodic — so a
+    // snapshot is guaranteed after the 2nd). Each also consumes a pollable_seq value, matching
+    // production's accumulated-seq-before-the-crash-region shape. Each completes cleanly (no
+    // promise await needed for this test — the bug is about REPLAYING a past completed round's
+    // ReadLocalPollable entry, not about suspension).
+    for _ in 0..3 {
+        executor
+            .invoke_and_await_agent(
+                &component,
+                &agent_id,
+                "sequential_atomic_rpc_calls_then_promise_init",
+                data_value!(1u32),
+            )
+            .await?;
+    }
+
+    let oplog_before_restart = executor.get_oplog(&worker_id, OplogIndex::INITIAL).await?;
+    let snapshot_count = oplog_before_restart
+        .iter()
+        .filter(|entry| matches!(&entry.entry, PublicOplogEntry::Snapshot(_)))
+        .count();
+    assert!(
+        snapshot_count >= 1,
+        "test setup invalid: expected at least one periodic snapshot before round 2, found {snapshot_count}"
+    );
+
+    // Round 2, after the snapshot: consumes another pollable_seq value, persisted as
+    // ReadLocalPollable(N) with N baked in from the live session's uninterrupted count (i.e.
+    // N > 0, since round 1 already consumed at least one value) — recorded AFTER the snapshot,
+    // so it is exactly the entry a naive reset-to-0 replay counter fails to match.
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_calls_then_promise_init",
+            data_value!(1u32),
+        )
+        .await?;
+
+    // Cold restart: forces resume from the snapshot recorded above (not from genesis) on the
+    // next invocation — replaying round 2's atomic region is exactly where the bug traps.
+    drop(executor);
+    let executor = start_with_snapshot_policy(
+        deps,
+        &context,
+        SnapshotPolicy::EveryNInvocation { count: 2 },
+    )
+    .await?;
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    // Round 3: forces replay of the full snapshot-to-tail history (rounds 1 and 2) to
+    // reconstruct state, then does one more atomic RPC call live — if replay traps, this
+    // invocation fails or times out instead of completing normally.
+    let promise_id_value = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "sequential_atomic_rpc_calls_then_promise_init",
+            data_value!(1u32),
+        )
+        .await?
+        .into_return_value();
+
+    assert!(
+        promise_id_value.is_some(),
+        "worker must survive replaying its snapshot-to-tail history (including the \
+         post-snapshot atomic RPC region) after a cold restart and complete a further \
+         invocation normally — a trap here means the pollable_seq counter recovery fix \
+         (recover_next_pollable_seq) did not resolve the Eighth capture's root cause"
+    );
 
     Ok(())
 }

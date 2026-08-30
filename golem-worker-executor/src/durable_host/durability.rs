@@ -1320,11 +1320,13 @@ impl<Pair: HostPayloadPair> Durability<Pair> {
         // those take the unchanged legacy path below, byte for byte.
         //
         // Because this lives here rather than at individual call sites, EVERY `Durability`-based
-        // host function participates in the stray-entry mechanism automatically: HTTP response
-        // and trailers futures, all six incoming/outgoing stream operations that were never
-        // retrofitted by hand, and the RDBMS result-stream family (FINDING_B_FIX_DESIGN.md
-        // §14.2 catalogued 18 such latent gaps, of which the silent-misdelivery risk in
-        // `future_incoming_response::get` was the most severe).
+        // host function participates in the stray-entry mechanism automatically: the HTTP
+        // trailers future, the seven incoming/outgoing body-stream operations that were never
+        // retrofitted by hand, and the RDBMS result-stream family — seventeen of the eighteen
+        // latent gaps FINDING_B_FIX_DESIGN.md §14.2 catalogued. The one remaining gap,
+        // `future_incoming_response::get` — the most severe, since its failure mode is silent
+        // misdelivery rather than a trap — is wired at its own call site, being the only one
+        // that never constructs a `Durability` at all.
         let identity = stray_identity_of(Pair::HOST_FUNCTION_NAME, &self.function_type);
 
         let response = match identity {

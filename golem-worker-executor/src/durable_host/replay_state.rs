@@ -2548,6 +2548,141 @@ mod tests {
         }
     }
 
+    /// FINDING_B_FIX_DESIGN.md §15.6 — the livelock, as the exact live call sequence.
+    ///
+    /// After a scan clears a batch's whole entry run the cursor sits on that batch's
+    /// `EndRemoteWrite`. Three consumers then peek it back to back — `ready()`'s seq predicate,
+    /// `poll()`'s own-entry predicate, and (when the miss bound trips) `poll()`'s fallback
+    /// host-call read — each of which MUST refuse it, MUST leave the cursor unmoved, and none of
+    /// which can ever claim it: its owner is `end_function`, driven by guest control flow.
+    ///
+    /// This is the pattern behind the trace `peeked 2256 EndRemoteWrite matched: false` ×3
+    /// followed by a trap. The three refusals are correct; what was wrong was giving up after
+    /// them. The test pins both halves: all three predicates refuse non-destructively, and the
+    /// entry survives every one of them for its real owner.
+    #[test]
+    async fn ready_then_poll_both_refuse_a_parked_structural_entry_without_consuming_it() {
+        use golem_common::model::oplog::{HostResponse, HostResponseStreamChunk};
+        let begin_idx = OplogIndex::from_u64(2190);
+        let pollable_seq = 503u32;
+
+        // The live window: two same-identity blocking_reads, then the batch's EndRemoteWrite.
+        let read = |bytes: &[u8]| {
+            batched_entry(
+                HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+                begin_idx,
+                HostResponse::StreamChunk(HostResponseStreamChunk {
+                    result: Ok(bytes.to_vec()),
+                }),
+            )
+        };
+        let mut state = replay_state_over(vec![
+            read(b"body"),
+            read(b""),
+            end_remote_write_entry(begin_idx),
+        ])
+        .await;
+
+        // A scan (poll()'s, with no identity of its own) clears the run and parks the cursor.
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::Batch(begin_idx)]));
+        let scan = StrayEntryScan::new(tracked, None);
+        let mut drained = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| drained.push((idx, e)))
+            .await
+            .unwrap();
+        assert_eq!(drained.len(), 2, "both reads defer; the marker stays");
+
+        // Peek 1 — ready()'s seq predicate, and the `cursor_is_host_call` capture it now makes.
+        let mut ready_saw_host_call = true;
+        let ready_peek = state
+            .try_get_oplog_entry(|entry| {
+                ready_saw_host_call = matches!(entry, OplogEntry::HostCall { .. });
+                matches!(
+                    entry,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollReady,
+                        durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
+                        ..
+                    } if *seq == pollable_seq
+                )
+            })
+            .await
+            .unwrap();
+        assert!(ready_peek.is_none(), "ready() must refuse the marker");
+        assert!(
+            !ready_saw_host_call,
+            "ready() must observe a STRUCTURAL cursor — this is what flips its synthesized \
+             answer from `false` (keep waiting forever) to `true` (go make progress)"
+        );
+
+        // Peek 2 — poll()'s own-entry predicate, plus its identical capture.
+        let mut poll_saw_host_call = true;
+        let poll_peek = state
+            .try_get_oplog_entry(|entry| {
+                poll_saw_host_call = matches!(entry, OplogEntry::HostCall { .. });
+                is_own_poll_entry(entry)
+            })
+            .await
+            .unwrap();
+        assert!(poll_peek.is_none(), "poll() must refuse the marker");
+        assert!(
+            !poll_saw_host_call,
+            "poll() must observe a STRUCTURAL cursor — this is what suppresses the \
+             guaranteed-to-fail give-up fallback"
+        );
+
+        // Peek 3 — poll()'s fallback read, i.e. the guarded host-call read. Also refuses.
+        let fallback_peek = state
+            .try_get_oplog_entry(|entry| matches!(entry, OplogEntry::HostCall { .. }))
+            .await
+            .unwrap();
+        assert!(
+            fallback_peek.is_none(),
+            "the fallback read must refuse the marker rather than consume it"
+        );
+
+        // After all three refusals the marker is STILL there, for end_function.
+        let survivor = state
+            .try_get_oplog_entry(|e| matches!(e, OplogEntry::EndRemoteWrite { .. }))
+            .await
+            .unwrap();
+        assert!(
+            survivor.is_some(),
+            "three consecutive refusals must leave the cursor exactly where it was"
+        );
+    }
+
+    /// The other side of the §15.6 rule: while the cursor holds a HOST-CALL entry, `ready()` and
+    /// `poll()` must keep their original "not ready yet" behaviour. That entry has a real
+    /// consumer that will claim it and move the cursor, so waiting is productive and the
+    /// give-up bound's counting argument still holds.
+    #[test]
+    async fn a_host_call_cursor_is_still_reported_as_not_ready() {
+        let begin_idx = OplogIndex::from_u64(2190);
+        let mut state = replay_state_over(vec![
+            outgoing_check_write_entry(begin_idx),
+            end_remote_write_entry(begin_idx),
+        ])
+        .await;
+
+        // No scan this time: a foreign HostCall is sitting at the cursor.
+        let mut saw_host_call = false;
+        let peek = state
+            .try_get_oplog_entry(|entry| {
+                saw_host_call = matches!(entry, OplogEntry::HostCall { .. });
+                is_own_poll_entry(entry)
+            })
+            .await
+            .unwrap();
+        assert!(peek.is_none(), "not poll()'s own entry");
+        assert!(
+            saw_host_call,
+            "a host-call cursor must NOT be treated as parked — its owner can still claim it"
+        );
+    }
+
     /// N=2 is not special-cased: five occurrences of one identity behave identically.
     #[test]
     async fn many_occurrences_of_one_identity_all_replay_in_order() {

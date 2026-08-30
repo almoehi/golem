@@ -126,21 +126,29 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
             // EndRemoteWrite, got CheckWrite".
             // Legacy ReadLocal entries (pre-dating per-pollable tagging) are consumed by any
             // pollable, matching the original (pre-Bug-2-fix) behavior for old oplogs.
+            // Captured from inside the predicate (which sees the entry a refusal never hands
+            // back): is the replay cursor parked on a STRUCTURAL entry — one no host-call
+            // consumer can ever claim? See the miss branch below for why that changes the
+            // answer this call must synthesize.
+            let mut cursor_is_host_call = false;
             let peeked = self
                 .state
                 .replay_state
-                .try_get_oplog_entry(|entry| match entry {
-                    OplogEntry::HostCall {
-                        function_name: HostFunctionName::IoPollReady,
-                        durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
-                        ..
-                    } => *seq == pollable_seq,
-                    OplogEntry::HostCall {
-                        function_name: HostFunctionName::IoPollReady,
-                        durable_function_type: DurableFunctionType::ReadLocal,
-                        ..
-                    } => true,
-                    _ => false,
+                .try_get_oplog_entry(|entry| {
+                    cursor_is_host_call = matches!(entry, OplogEntry::HostCall { .. });
+                    match entry {
+                        OplogEntry::HostCall {
+                            function_name: HostFunctionName::IoPollReady,
+                            durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
+                            ..
+                        } => *seq == pollable_seq,
+                        OplogEntry::HostCall {
+                            function_name: HostFunctionName::IoPollReady,
+                            durable_function_type: DurableFunctionType::ReadLocal,
+                            ..
+                        } => true,
+                        _ => false,
+                    }
                 })
                 .await?;
             match peeked {
@@ -172,13 +180,41 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
                 // with a regression test covering the original "rpc pollable infinite replay loop
                 // after snapshot restore" scenario this fallback used to guard against).
                 _ => {
+                    // "Not ready yet" is the right answer while the cursor still holds host-call
+                    // entries: this pollable's own entry may simply be further along, and some
+                    // other consumer will claim what is here first.
+                    //
+                    // It is the WRONG answer once the cursor is parked on a STRUCTURAL entry
+                    // (`EndRemoteWrite` closing an open batch, `FinishSpan`, ...). No host-call
+                    // consumer can ever claim such an entry; its owner is `end_function`/the
+                    // span machinery, which run from GUEST CONTROL FLOW, not by consuming the
+                    // replay cursor. So the cursor cannot move until the guest stops waiting and
+                    // finishes the operation — and answering `false` here tells it to keep
+                    // waiting, which it can only do forever.
+                    //
+                    // `poll()`'s own synthesis already resolves this the other way: on the same
+                    // miss it reports every input pollable as ready ("wake everything"). The two
+                    // paths contradicting each other is precisely the livelock observed in
+                    // FINDING_B_FIX_DESIGN.md §15.6 — `poll()` says ready, `ready()` says false,
+                    // and the guest spins between them until `record_poll_replay_miss`'s bound
+                    // converts the spin into a trap. Agreeing with `poll()` is what lets the
+                    // guest proceed to the read that collects its (already pre-resolved) answer
+                    // and then drop the resource, which is what finally consumes the marker.
+                    //
+                    // Reporting ready is not a guess about the data: the actual read is itself
+                    // replay-guarded and non-destructive, so a guest that reads on this hint
+                    // either collects a cached answer or is told, correctly, that nothing of
+                    // its own is at the cursor.
+                    let synthesized = !cursor_is_host_call;
                     trace!(
                         agent_id = %self.owned_agent_id,
                         rep = pollable_rep,
                         seq = pollable_seq,
-                        "POLLREADY_TRACE ready() REPLAY no match, synthesizing false"
+                        cursor_is_host_call,
+                        synthesized,
+                        "POLLREADY_TRACE ready() REPLAY no match, synthesizing"
                     );
-                    Ok(false)
+                    Ok(synthesized)
                 }
             }
         }
@@ -420,10 +456,16 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
             // `durability.replay()` read-then-validate would consume whatever sat at the cursor
             // — including a structural entry such as `FinishSpan` — and only then fail, turning
             // any predicate/identity imperfection into a permanent, unrecoverable trap.
+            // Same capture as `ready()`: a refusal never hands the entry back, so record from
+            // inside the predicate whether the cursor is parked on a structural entry.
+            let mut cursor_is_host_call = false;
             let peeked = self
                 .state
                 .replay_state
-                .try_get_oplog_entry(is_own_poll_entry)
+                .try_get_oplog_entry(|entry| {
+                    cursor_is_host_call = matches!(entry, OplogEntry::HostCall { .. });
+                    is_own_poll_entry(entry)
+                })
                 .await?;
 
             match peeked {
@@ -446,14 +488,22 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                         .map_err(|e: String| wasmtime::Error::msg(e))?;
                     Ok(payload)
                 }
-                _ if self.state.record_poll_replay_miss() => {
-                    // Consecutive misses at this exact, unmoved cursor position now exceed the
-                    // number of oplog entries still ahead of it — structurally, not just
-                    // probably, nothing left in this replay pass can ever claim that position
-                    // (see `record_poll_replay_miss`'s doc comment for why that bound is sound,
-                    // not a guess). Synthesizing again could only spin forever; fall back to the
-                    // original unconditional read so the failure is reported (and diagnosed)
-                    // exactly as it was before.
+                // The give-up fallback, but ONLY while the cursor holds a host-call entry.
+                //
+                // `record_poll_replay_miss`'s bound reasons that once consecutive misses at an
+                // unmoved cursor exceed the entries remaining ahead of it, nothing can ever
+                // claim that position. That argument counts oplog CONSUMERS — and it is simply
+                // false for a structural entry: `EndRemoteWrite`'s owner is `end_function`,
+                // driven by guest control flow (the guest dropping the HTTP resource), not by
+                // consuming the replay cursor. Falling back there is guaranteed to fail — the
+                // read can only report "expected HostCall, got EndRemoteWrite" — so it converts
+                // a recoverable state into a trap while diagnosing nothing
+                // (FINDING_B_FIX_DESIGN.md §15.6). With `ready()` now agreeing with this
+                // synthesis, the guest can make the control-flow progress that moves the cursor.
+                _ if cursor_is_host_call && self.state.record_poll_replay_miss() => {
+                    // A host-call entry IS something a `poll()` could legitimately have owned,
+                    // so here the bound's counting argument holds and reporting the original
+                    // failure is the correct, diagnosable outcome.
                     Ok(durability.replay(self).await?)
                 }
                 _ => {

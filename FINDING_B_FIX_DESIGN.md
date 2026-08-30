@@ -3007,3 +3007,108 @@ filtered** (493 after §15.3, +3).
 | `every_structural_variant_is_refused_by_a_host_call_read` | Generality beyond `EndRemoteWrite`: `FinishSpan` (no `begin_index` at all) and `EndAtomicRegion` (has one) are refused identically and carry no stray identity. |
 
 Integration suites remain un-runnable in this worktree for the fixture reason recorded in §15.4.
+
+### 15.6 Live verification round 2 — the §15.5 fix is working; the remaining failure is a LIVELOCK, not a mismatch
+
+`84bbfa915` was live-verified and traps again with near-identical text. Reading the trace against the
+compiled source shows the §15.5 guard is doing exactly its job, and that the residual failure has a
+different cause.
+
+#### 15.6.1 The three peeks, traced to source
+
+```
+ready()  rep 19, seq 503
+  TRYGET peeked 2256 EndRemoteWrite matched: false   -> ready() synthesizes false, returns Ok(false)
+poll()   reps [19]
+  TRYGET peeked 2256 EndRemoteWrite matched: false   (1)
+  TRYGET peeked 2256 EndRemoteWrite matched: false   (2)
+  TRYGET peeked 2256 EndRemoteWrite matched: false   (3)
+  TRAP: expected OplogEntry::HostCall, got EndRemoteWrite{begin_index: 2190}
+```
+
+All three are inside ONE `poll()` call (`io/poll.rs`):
+
+1. `consume_and_cache_stray_entries(None)` — the scan's peek. `EndRemoteWrite` is not a `HostCall`,
+   so `stray_entry_identity` gives `None` and the scan stops having drained **zero** entries.
+2. `try_get_oplog_entry(is_own_poll_entry)` — refuses, cursor unmoved.
+3. `record_poll_replay_miss()` returns `true` → `durability.replay(self)` → `replay_raw`'s
+   **untracked** branch (`IoPollPoll` is tagged `ReadLocal`, so `stray_identity_of` is `None`) →
+   `read_persisted_durable_function_invocation` → `read_host_call_entry` → refuses → `Err`.
+
+Confirmation that this is the new reader and not the old macro: the error reads `expected
+OplogEntry::HostCall`, whereas `get_oplog_entry!`'s `stringify!` form emitted `expected OplogEntry ::
+HostCall |` (with the trailing pipe), which is what the §15.5 capture showed. **The §15.5 fix is
+live and correct — `#02256` is no longer consumed.** Neither hypothesis (a) nor (b) as posed holds:
+there is no unguarded read left on this path (every consumer routes through the guarded reader), and
+nothing is hunting a third occurrence.
+
+#### 15.6.2 What actually fails: a livelock, and a bound whose premise does not hold here
+
+`record_poll_replay_miss`'s bound is `misses > replay_target − cursor`. `replay_target` is the end of
+the whole replay region (~#02900 for this agent) and the cursor is #02255, so the bound is ~645, not
+3 — the three peeks are the FINAL `poll()` call, after roughly that many identical iterations. The
+trap is the bound firing at the end of a spin, not a one-shot mismatch.
+
+The spin is a **contradiction between the two synthesis paths**:
+
+- `poll()`, on a miss, reports every input pollable as ready (`ready = (0..in_.len())`, "wake
+  everything") — telling the guest rep 19 is ready.
+- `ready()`, on the same miss, returns `false` — telling the guest rep 19 is *not* ready.
+
+The guest therefore alternates between them forever. Meanwhile the cursor genuinely cannot move:
+`#02256` is `EndRemoteWrite{begin_index: 2190}`, whose only consumer is `end_function` for that
+still-open batch — and `end_function` is driven by GUEST CONTROL FLOW (the guest dropping the HTTP
+resource), not by consuming the replay cursor. So the one thing that can unblock replay is the guest
+finishing the request, and `ready()`'s `false` is precisely what prevents it from doing so.
+
+This is why the bound's reasoning fails: it counts oplog *consumers* remaining ahead of the cursor as
+a proxy for "someone else's turn will move it". That proxy is valid for host-call entries and invalid
+for structural ones, whose owner needs no oplog entry at all.
+
+§15.3's removal of the per-identity scan bound is what makes this state common rather than rare: a
+scan can now clear a batch's entire remaining run in one call, which parks the cursor on the closing
+marker. The contradiction itself is pre-existing.
+
+#### 15.6.3 Fix
+
+Both synthesis paths now agree, keyed on one fact neither had access to before: **is the replay
+cursor parked on a structural entry?** Captured inside the existing peek predicate (a refusal rewinds
+and never hands the entry back, so it must be recorded from inside) — no extra oplog read.
+
+- **`ready()`**: on a predicate miss, synthesizes `!cursor_is_host_call`. While host-call entries
+  remain at the cursor, `false` ("not ready yet") is still correct — this pollable's entry may be
+  further along and another consumer will claim what is here first. Once the cursor is parked on a
+  structural entry, `false` can only mean "wait forever", so it reports ready, agreeing with
+  `poll()`. This is not a guess about data: the read the guest then performs is itself replay-guarded
+  and non-destructive, so it either collects a pre-resolved answer or is correctly told nothing of
+  its own is at the cursor.
+- **`poll()`**: the give-up fallback is taken only when `cursor_is_host_call`. Against a structural
+  entry the fallback is guaranteed to fail and diagnoses nothing — it can only report "expected
+  HostCall, got EndRemoteWrite" — so it is suppressed and synthesis continues, letting the guest make
+  the control-flow progress that consumes the marker. Against a host-call entry the bound's counting
+  argument does hold and the original diagnosable failure is preserved unchanged.
+
+#### 15.6.4 Test results
+
+Release build and `cargo clippy --release --lib --tests` clean.
+`cargo test -p golem-worker-executor --lib --release` = **498 passed, 0 failed, 0 ignored, 0
+filtered** (496 after §15.5, +2).
+
+| Test | Asserts |
+|---|---|
+| `ready_then_poll_both_refuse_a_parked_structural_entry_without_consuming_it` | The live sequence end to end: a scan clears the two same-identity `blocking_read`s, parking the cursor on the batch's `EndRemoteWrite`; then all three peeks in order — `ready()`'s seq predicate, `poll()`'s own-entry predicate, `poll()`'s fallback host-call read — refuse it, each observes `cursor_is_host_call == false` (the flag that flips `ready()`'s answer and suppresses the fallback), and the marker survives all three for `end_function`. |
+| `a_host_call_cursor_is_still_reported_as_not_ready` | The converse: a foreign `HostCall` at the cursor is NOT treated as parked, so `ready()` keeps returning "not ready yet" and the give-up bound stays armed. |
+
+#### 15.6.5 Residual uncertainty, stated plainly
+
+The failure mode this converts is a spin, so the honest expectation is: replay either proceeds past
+`#02256` (the guest reads, collects its pre-resolved answers, drops the resource, `end_function`
+consumes the marker), or it makes no progress and **hangs instead of trapping**. A hang would prove
+the guest's blocker is something other than `ready()`'s answer, and would be strictly more
+informative than the current identical trap.
+
+If it does not clear, the evidence needed next is the trace window BEFORE the spin — specifically the
+`STRAY_TRACE record_pre_resolved_stray` lines for `Batch(2190)` (which consumer drained `#02254`/
+`#02255`, and whether their answers were ever collected by a `take_pre_resolved_stray`), plus the
+first `POLLCALL_TRACE ... synthesizing` after the cursor reached #02255. The oplog itself is not the
+limiting evidence here; the consumer ordering is.

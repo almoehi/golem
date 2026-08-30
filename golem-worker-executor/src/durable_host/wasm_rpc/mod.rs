@@ -70,6 +70,33 @@ use golem_common::model::worker::AgentConfigEntryDto;
 use golem_service_base::error::worker_executor::WorkerExecutorError;
 use golem_wasm::json::ValueAndTypeJsonExtensions;
 
+/// Deletes a `FutureInvokeResult` from the wasmtime resource table AND clears its
+/// `invoke_result_seq` assignment, as one indivisible step.
+///
+/// These two facts must never be separated: `invoke_result_seq` is keyed by the wasmtime `rep`,
+/// and wasmtime hands a freed `rep` back out to the next resource pushed. A stale entry left
+/// behind makes `invoke_result_seq()`'s `or_insert_with` HIT for the new future — which silently
+/// gives two distinct RPC calls one identity and skips a bump of `next_invoke_result_seq`,
+/// leaving the counter permanently offset and the identity that `is_stray_concurrent_entry`
+/// relies on no longer live/replay-stable.
+///
+/// Both deletion paths go through here — the immediate one in `HostFutureInvokeResult::drop` and
+/// the deferred one in `HostPollable::drop` (`io/poll.rs`), which finishes a deletion that
+/// `drop` had to postpone because the future still had live child pollables
+/// (`ResourceTableError::HasChildren`). The deferred path used to free the rep without clearing
+/// the seq; see FINDING_B_FIX_DESIGN.md §13.5/§13.7.1.
+pub(crate) fn delete_future_invoke_result<Ctx: WorkerCtx>(
+    ctx: &mut DurableWorkerCtx<Ctx>,
+    this: Resource<FutureInvokeResultEntry>,
+) -> Result<FutureInvokeResultEntry, ResourceTableError> {
+    let rep = this.rep();
+    let result = ctx.table().delete(this);
+    if result.is_ok() {
+        ctx.state.clear_invoke_result_seq(rep);
+    }
+    result
+}
+
 fn classify_rpc_error(err: &InternalRpcError) -> HostFailureKind {
     match err {
         InternalRpcError::ProtocolError { .. }
@@ -1136,14 +1163,15 @@ impl<Ctx: WorkerCtx> HostFutureInvokeResult for DurableWorkerCtx<Ctx> {
         self.observe_function_call("golem::rpc::future-invoke-result", "drop");
         let future_rep = this.rep();
 
-        match self.table().delete(this) {
+        // delete_future_invoke_result also clears the rep's invoke_result_seq, but only when the
+        // rep is truly freed back to the resource table — not on the deferred HasChildren branch
+        // below, where the rep is still occupied and the seq must survive until `HostPollable::
+        // drop` finishes the deletion (through the same helper).
+        match delete_future_invoke_result(self, this) {
             Ok(entry) => {
                 for child_rep in &entry.child_pollables {
                     self.state.rpc_pollable_to_parent.remove(child_rep);
                 }
-                // Only once the rep is truly freed back to the resource table (not deferred by
-                // HasChildren below) — same rep-reuse rationale as clear_pollable_seq.
-                self.state.clear_invoke_result_seq(future_rep);
             }
             Err(ResourceTableError::HasChildren) => {
                 let parent: Resource<FutureInvokeResult> = Resource::new_borrow(future_rep);

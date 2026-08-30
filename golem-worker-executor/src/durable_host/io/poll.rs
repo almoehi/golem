@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::durable_host::durability::InFunctionRetryHost;
+use crate::durable_host::wasm_rpc::delete_future_invoke_result;
 use crate::durable_host::{
     Durability, DurabilityHost, DurableWorkerCtx, SuspendForSleep, is_stray_concurrent_entry,
 };
@@ -209,7 +210,13 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
             if should_delete {
                 let parent_owned: Resource<golem_wasm::FutureInvokeResultEntry> =
                     Resource::new_own(parent_rep);
-                if let Err(err) = self.table().delete(parent_owned) {
+                // Must go through delete_future_invoke_result, not table().delete() directly:
+                // this is the point where the deferred half of HostFutureInvokeResult::drop's
+                // HasChildren branch finally frees the rep, so this is where the rep's
+                // invoke_result_seq assignment must be cleared too. Doing only the former leaked
+                // the seq, letting the next future that reuses this rep inherit a stale identity
+                // (FINDING_B_FIX_DESIGN.md §13.5).
+                if let Err(err) = delete_future_invoke_result(self, parent_owned) {
                     debug!(
                         parent_rep,
                         error = %err,

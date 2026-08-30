@@ -1896,6 +1896,30 @@ predicate perfection. That dependency is the design smell worth removing: §8.3'
 own identity or this would wrongly consume its own genuine entry" is a correctness precondition enforced
 only by a `!=` on a value that §13.5 proves is not replay-stable.
 
+**Post-implementation refinement — bounding (b)'s retry with the actual remaining oplog size, not a flat
+constant.** The first implementation of (b) bounded the "synthesize and retry" loop with a flat
+`MAX_POLL_REPLAY_MISSES = 64`, reverting to the unconditional read after 64 consecutive misses at an
+unmoved cursor. Reviewed and replaced: `64` is an arbitrary number with no relationship to the actual
+problem size — it is exactly the kind of guessed constant this document's own rigor bar (§7, §11, §12.4)
+rejects elsewhere. This directly implements what this section already gestured at above ("bounded by the
+existing replay-target… machinery") rather than a round number.
+
+The principled bound: replay operates over a fixed, already-recorded oplog for the duration of one replay
+pass (it does not grow mid-replay), so the cursor can advance from position `K` to `replay_target()` only
+by *someone* consuming one of the entries still between them — and there are at most
+`replay_target() - K` such entries, hence at most that many distinct "someone else made progress" events
+before the pass provably has nothing left to give. `record_poll_replay_miss()` now recomputes this
+remaining-entry count on every miss (`replay_target().distance_from(cursor)`) and gives up once the
+consecutive-miss streak at that fixed cursor exceeds it, instead of comparing against a flat constant.
+This is not merely a larger or smaller number than 64 in practice — it is a *different kind* of bound: it
+scales down to near-zero patience when almost nothing is left to replay (where 64 retries would have been
+pure waste against a pass that's already nearly live), and scales up without an artificial ceiling for a
+long remaining history where genuine cross-region interleaving (§13.4's `count: 1 → 2` batch growth is
+exactly this) could still legitimately resolve it. The cursor-movement-resets-the-streak behavior is
+unchanged — this only replaces the "how many chances" number with one tied to the problem's own bounded
+state instead of a guess. Implemented in `record_poll_replay_miss()` (`durable_host/mod.rs`) and its call
+site in `io/poll.rs`.
+
 #### 13.7.3 Optional depth: make `IoPollPoll`'s recorded result identity-based, not positional
 
 `HostResponsePollResult { result: Ok(vec![u32]) }` stores indices into the guest's `in_` list. That list's

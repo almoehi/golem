@@ -4205,7 +4205,8 @@ struct PrivateDurableWorkerState {
     pre_resolved_http_stream_write: HashMap<OplogIndex, HostResponseStreamWriteWithBytes>,
 
     /// Bookkeeping for `poll()`'s bounded replay-miss fallback (see `record_poll_replay_miss`).
-    /// `(replay cursor at the time of the miss, number of consecutive misses at that cursor)`.
+    /// `(replay cursor at the time of the first miss at that position, number of consecutive
+    /// misses observed at that same, unmoved cursor)`.
     poll_replay_miss: Option<(OplogIndex, u32)>,
 
     // ResourceIds of all DynPollables that are backed by GetPromiseResultEntries
@@ -5271,21 +5272,42 @@ impl PrivateDurableWorkerState {
     }
 
     /// Records a `poll()` replay miss (its own `IoPollPoll` entry was not at the cursor) and
-    /// returns how many consecutive misses have now occurred *without the replay cursor moving
-    /// at all*. Any forward progress by any consumer resets the count.
+    /// returns whether the caller should give up and fall back to the original unconditional
+    /// read (restoring the previous, diagnosable failure) rather than retry again.
     ///
     /// This bounds §13.7.2's "synthesize instead of consume" fallback: turning a permanent trap
     /// into a retry is the whole point, but a retry that can never make progress would be an
-    /// unbounded spin. After the bound is exceeded the caller reverts to the original
-    /// unconditional read, restoring the previous (diagnosable) failure instead of hanging.
-    pub fn record_poll_replay_miss(&mut self) -> u32 {
+    /// unbounded spin — `wstd`'s reactor genuinely can re-call `poll()` in a tight loop with
+    /// nothing else interleaved, so an unbounded synthesize-and-retry is a real hang, not a
+    /// hypothetical one.
+    ///
+    /// The bound is *not* an arbitrary constant. Any forward movement of the replay cursor
+    /// (whether from this call's own stray-entry scan or from a completely different,
+    /// interleaved call site elsewhere in the guest's control flow — e.g. a `ready()`/`get()`
+    /// for a different concurrently-tracked region) resets the streak: only *consecutive misses
+    /// at the exact same, unmoved cursor position* count against the bound. The bound itself is
+    /// the number of oplog entries still ahead of that cursor (`replay_target() -
+    /// last_replayed_index()`), not a flat guess: at most one *other* consumer's turn can ever
+    /// move the cursor per entry that still exists in this replay pass, so once the number of
+    /// misses at a fixed position exceeds the number of entries left to be claimed by anyone,
+    /// it is structurally certain — not merely likely — that nothing further will ever consume
+    /// that position (the entries that could have moved it have run out). A larger remaining
+    /// window correctly earns more patience (more entries exist for other consumers to still
+    /// claim); a near-exhausted one gives up almost immediately.
+    pub fn record_poll_replay_miss(&mut self) -> bool {
         let cursor = self.replay_state.last_replayed_index();
         let count = match self.poll_replay_miss {
             Some((at, count)) if at == cursor => count + 1,
             _ => 1,
         };
         self.poll_replay_miss = Some((cursor, count));
-        count
+
+        let remaining = self
+            .replay_state
+            .replay_target()
+            .distance_from(cursor)
+            .max(0) as u64;
+        (count as u64) > remaining
     }
 
     /// Clears the `poll()` replay-miss streak — called whenever a `poll()` replay does consume

@@ -37,13 +37,6 @@ use wasmtime::component::Resource;
 use wasmtime_wasi::IoView as _;
 use wasmtime_wasi::p2::bindings::io::poll::{Host, HostPollable, Pollable};
 
-/// How many consecutive `poll()` replay misses *at the same, unmoving replay cursor* are
-/// tolerated before reverting to the original unconditional read (see the call site). The
-/// synthesized "not ready yet" answer is self-correcting only while some other consumer can
-/// still claim the entry at the cursor; if nothing does across this many attempts, nothing ever
-/// will, and spinning is strictly worse than the diagnosable failure this restores.
-const MAX_POLL_REPLAY_MISSES: u32 = 64;
-
 impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
     async fn ready(&mut self, self_: Resource<Pollable>) -> wasmtime::Result<bool> {
         self.observe_function_call("io::poll:pollable", "ready");
@@ -441,11 +434,14 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                         .map_err(|e: String| wasmtime::Error::msg(e))?;
                     Ok(payload)
                 }
-                _ if self.state.record_poll_replay_miss() > MAX_POLL_REPLAY_MISSES => {
-                    // The cursor has not moved across this many consecutive poll() misses, so
-                    // no other consumer is claiming the entry sitting there either. Synthesizing
-                    // again could only spin forever; fall back to the original unconditional
-                    // read so the failure is reported (and diagnosed) exactly as it was before.
+                _ if self.state.record_poll_replay_miss() => {
+                    // Consecutive misses at this exact, unmoved cursor position now exceed the
+                    // number of oplog entries still ahead of it — structurally, not just
+                    // probably, nothing left in this replay pass can ever claim that position
+                    // (see `record_poll_replay_miss`'s doc comment for why that bound is sound,
+                    // not a guess). Synthesizing again could only spin forever; fall back to the
+                    // original unconditional read so the failure is reported (and diagnosed)
+                    // exactly as it was before.
                     Ok(durability.replay(self).await?)
                 }
                 _ => {

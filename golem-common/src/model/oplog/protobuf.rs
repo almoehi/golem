@@ -2442,6 +2442,15 @@ impl TryFrom<PublicOplogEntry> for OplogEntry {
                     timestamp: p.timestamp,
                     data: OplogPayload::Inline(Box::new(data)),
                     mime_type,
+                    // next_pollable_seq is deliberately engine-internal-only (see the raw{}
+                    // field's doc comment in base_model/oplog/mod.rs) and has no counterpart in
+                    // PublicOplogEntry, so there is no real value to carry across this
+                    // public->raw conversion. This path reconstructs an OplogEntry from its
+                    // already-public representation (e.g. API/import tooling), never from a
+                    // live snapshot-take, so the actual snapshot-resume recovery path
+                    // (recover_next_pollable_seq, durable_host/mod.rs) never reads an entry
+                    // that went through here.
+                    next_pollable_seq: 0,
                 })
             }
             PublicOplogEntry::OplogProcessorCheckpoint(p) => {
@@ -3539,6 +3548,15 @@ impl TryFrom<golem_api_grpc::proto::golem::worker::RawOplogEntry> for OplogEntry
                     timestamp,
                     data,
                     mime_type: p.mime_type,
+                    // The RawSnapshotParameters proto message has no next_pollable_seq field
+                    // (deliberately not added — see the field's doc comment in
+                    // base_model/oplog/mod.rs), so there is nothing to read from `p` here. Safe:
+                    // golem-worker-executor's own Oplog/OplogService implementations
+                    // (services/oplog/{primary,multilayer,rate_limited,ephemeral,plugin}.rs) are
+                    // all direct/local storage, never a gRPC-proto-mediated client, so the
+                    // snapshot-take/resume path this field exists for never round-trips through
+                    // this proto conversion at all.
+                    next_pollable_seq: 0,
                 })
             }
             Entry::OplogProcessorCheckpoint(p) => {

@@ -793,6 +793,9 @@ impl PublicOplogEntryOps for PublicOplogEntry {
                 timestamp,
                 data,
                 mime_type,
+                // next_pollable_seq is engine-internal-only, deliberately absent from
+                // PublicOplogEntry (see the field's doc comment, base_model/oplog/mod.rs).
+                ..
             } => {
                 let bytes: Vec<u8> = oplog_service
                     .download_payload(owned_agent_id, agent_mode, data)

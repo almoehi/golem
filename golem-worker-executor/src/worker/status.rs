@@ -2160,6 +2160,7 @@ mod test {
                     timestamp,
                     data: OplogPayload::Inline(Box::new(vec![])),
                     mime_type: "application/octet-stream".to_string(),
+                    next_pollable_seq: 0, // unused by these status-tracking-only tests
                 },
                 move |mut status| {
                     status.last_automatic_snapshot_index = Some(oplog_idx);

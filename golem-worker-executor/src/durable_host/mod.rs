@@ -103,7 +103,6 @@ use golem_common::model::oplog::{
     AgentError, AgentResourceId, DurableFunctionType, HostRequestHttpRequest, LogLevel, OplogEntry,
     OplogIndex, PersistenceLevel, RawSnapshotData, TimestampedUpdateDescription, UpdateDescription,
 };
-use golem_common::model::oplog::host_functions::HostFunctionName;
 use golem_common::model::regions::{DeletedRegions, DeletedRegionsBuilder, OplogRegion};
 use golem_common::model::retry_policy::NamedRetryPolicy;
 use golem_common::model::worker::TypedAgentConfigEntry;
@@ -590,6 +589,16 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
 
     pub fn created_by(&self) -> AccountId {
         self.state.created_by
+    }
+
+    /// The current value of the `pollable_seq` counter (see its field doc comment,
+    /// `PrivateDurableWorkerState`). Read-only — unlike `pollable_seq(rep)`, does not assign or
+    /// consume a value. Used by the periodic/automatic snapshot-save flow
+    /// (`worker/invocation_loop.rs`) to embed the counter's exact value into the `Snapshot`
+    /// oplog entry at the instant it is taken, so a future resume from that snapshot can read it
+    /// back directly instead of reconstructing it (`recover_next_pollable_seq`).
+    pub fn next_pollable_seq(&self) -> u32 {
+        self.state.next_pollable_seq
     }
 
     pub fn parsed_agent_id(&self) -> Option<ParsedAgentId> {
@@ -4187,9 +4196,9 @@ struct PrivateDurableWorkerState {
     /// session prior to that snapshot could have observed any number of pollables, and each one
     /// is baked into a persisted `ReadLocalPollable(N)` entry after the snapshot that replay must
     /// still match by exact value. `new()` calls `recover_next_pollable_seq()` to derive the
-    /// correct baseline for that case by scanning the durably-persisted oplog rather than
-    /// resetting to 0 unconditionally — see that function's doc comment for the full mechanism
-    /// and its own scan-cost tradeoff.
+    /// correct baseline for that case by reading it directly out of the `Snapshot` oplog entry
+    /// (captured there at snapshot-take time, see `next_pollable_seq()` below) rather than
+    /// resetting to 0 unconditionally — see that function's doc comment for the full mechanism.
     next_pollable_seq: u32,
 
     // ResourceIds of all DynPollables that are backed by GetPromiseResultEntries
@@ -4314,7 +4323,9 @@ impl PrivateDurableWorkerState {
         // that snapshot skips replaying everything before it (the entire point of snapshotting),
         // so a naive reset-to-0 silently diverges from the value already baked into every
         // `ReadLocalPollable(N)` entry persisted after the snapshot. Recover the correct starting
-        // value by scanning for the highest such `N` at or before the snapshot boundary.
+        // value directly from the snapshot entry itself (`recover_next_pollable_seq`), which
+        // embeds it precisely because reconstructing it from anything else would be lossy or
+        // costly — see that function's doc comment.
         let next_pollable_seq = match last_snapshot_index {
             Some(snapshot_idx) => Self::recover_next_pollable_seq(&oplog, snapshot_idx).await,
             None => 0,
@@ -4397,45 +4408,39 @@ impl PrivateDurableWorkerState {
     /// Recovers the correct starting value for `next_pollable_seq` when constructing an instance
     /// that will resume from `snapshot_idx` rather than from oplog genesis (see the call site in
     /// `new()` and the `pollable_seq`/`next_pollable_seq` field doc comments for the full
-    /// rationale). Scans the oplog from genesis through `snapshot_idx` inclusive — the exact
-    /// range that snapshot-based resume otherwise never re-reads — for `io::poll::pollable::ready`
-    /// `HostCall` entries tagged `ReadLocalPollable(N)`, and returns one past the highest `N`
-    /// found (or `0` if none — a worker whose history before the snapshot never recorded a
-    /// tagged pollable genuinely does start fresh).
+    /// rationale). Reads the exact value embedded in the `Snapshot` oplog entry at
+    /// `snapshot_idx` — captured by the periodic/automatic snapshot-save flow
+    /// (`worker/invocation_loop.rs`, via `next_pollable_seq()` below) at the instant the
+    /// snapshot was taken — rather than reconstructing an approximation from what happens to be
+    /// durably recorded elsewhere.
     ///
-    /// Deliberately does NOT scan only since the second-most-recent snapshot and add to a cached
-    /// prior count: no such checkpoint is persisted anywhere (that omission is the root cause
-    /// this recovers from), so reconstructing the true value requires the full range regardless
-    /// of how many snapshot generations lie within it. This is a bounded, one-time cost paid only
-    /// when a worker actually resumes from a snapshot (not on every invocation), using the same
-    /// chunked-read pattern `ReplayState`'s own oplog scans use elsewhere in this file; a worker
-    /// so long-lived and snapshot-heavy that this scan becomes a practical bottleneck would need
-    /// an engine-level fix that persists the counter as part of the snapshot itself (see
-    /// `INVESTIGATION_SUMMARY.md`'s "Eighth capture" fix direction (a)) rather than deriving it.
+    /// A single O(1) read: `snapshot_idx` always names a `Snapshot` entry (set only from
+    /// `last_automatic_snapshot_index`, which is only ever populated with the index of a
+    /// just-written one — see `RunningWorker::create_instance`, `worker/mod.rs`), so this reads
+    /// exactly one entry regardless of the worker's total oplog size or how many snapshot
+    /// generations preceded it. This replaced an earlier O(N) approach that scanned every entry
+    /// from genesis through `snapshot_idx` looking for the highest recorded
+    /// `ReadLocalPollable(N)` tag — correct, but a cost proportional to the *entire* oplog
+    /// prefix before the snapshot on every resume, reintroducing exactly the cost snapshotting
+    /// exists to avoid for long-lived, snapshot-heavy workers. See
+    /// `POLLABLE_SEQ_RECOVERY_DESIGN_OPTIONS.md` ("Option 2") for the full comparison.
     async fn recover_next_pollable_seq(oplog: &Arc<dyn Oplog>, snapshot_idx: OplogIndex) -> u32 {
-        const CHUNK_SIZE: u64 = 1024;
-        let mut max_seq: Option<u32> = None;
-        let mut idx = OplogIndex::INITIAL;
-        while idx.as_u64() <= snapshot_idx.as_u64() {
-            let remaining = snapshot_idx.as_u64() - idx.as_u64() + 1;
-            let n = remaining.min(CHUNK_SIZE);
-            let entries = oplog.read_many(idx, n).await;
-            if entries.is_empty() {
-                break;
+        match oplog.read(snapshot_idx).await {
+            OplogEntry::Snapshot {
+                next_pollable_seq, ..
+            } => next_pollable_seq,
+            other => {
+                // Should be unreachable given the invariant above; falling back to 0 mirrors
+                // try_load_snapshot()'s own fallback when it can't find a Snapshot entry where
+                // expected ("... falling back to full replay") rather than introducing a new
+                // failure mode.
+                warn!(
+                    "Expected a Snapshot entry at oplog index {snapshot_idx} to recover \
+                     next_pollable_seq, found {other:?}; falling back to 0"
+                );
+                0
             }
-            for entry in entries.values() {
-                if let OplogEntry::HostCall {
-                    function_name: HostFunctionName::IoPollReady,
-                    durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
-                    ..
-                } = entry
-                {
-                    max_seq = Some(max_seq.map_or(*seq, |m| m.max(*seq)));
-                }
-            }
-            idx = idx.range_end(n).next();
         }
-        max_seq.map_or(0, |m| m + 1)
     }
 
     /// Returns the logical sequence number for `rep`, assigning a fresh one (via

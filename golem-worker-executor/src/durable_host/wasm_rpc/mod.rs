@@ -14,9 +14,9 @@
 
 use crate::durable_host::durability::{ClassifiedHostError, HostFailureKind, InFunctionRetryHost};
 use crate::durable_host::{
-    Durability, DurabilityHost, DurableWorkerCtx, InternalRetryResult, is_stray_concurrent_entry,
+    Durability, DurabilityHost, DurableWorkerCtx, IdentityNamespace, InternalRetryResult,
+    StrayEntryIdentity, is_own_invoke_result_entry,
 };
-use crate::get_oplog_entry;
 use crate::preview2::golem::agent::host::{
     CancellationToken, FutureInvokeResult, HostCancellationToken, HostFutureInvokeResult,
     HostWasmRpc, RpcError,
@@ -39,7 +39,7 @@ use golem_common::model::invocation_context::{AttributeValue, InvocationContextS
 use golem_common::model::oplog::host_functions::{
     GolemRpcCancellationTokenCancel, GolemRpcFutureInvokeResultCancel,
     GolemRpcFutureInvokeResultGet, GolemRpcWasmRpcInvoke, GolemRpcWasmRpcInvokeAndAwaitResult,
-    GolemRpcWasmRpcScheduleInvocation,
+    GolemRpcWasmRpcScheduleInvocation, HostFunctionName,
 };
 use golem_common::model::oplog::types::{SerializableInvokeResult, SerializableScheduleId};
 use golem_common::model::oplog::{
@@ -71,6 +71,33 @@ use wasmtime_wasi::runtime::AbortOnDropJoinHandle;
 use golem_common::model::worker::AgentConfigEntryDto;
 use golem_service_base::error::worker_executor::WorkerExecutorError;
 use golem_wasm::json::ValueAndTypeJsonExtensions;
+
+/// Deletes a `FutureInvokeResult` from the wasmtime resource table AND clears its
+/// `invoke_result_seq` assignment, as one indivisible step.
+///
+/// These two facts must never be separated: `invoke_result_seq` is keyed by the wasmtime `rep`,
+/// and wasmtime hands a freed `rep` back out to the next resource pushed. A stale entry left
+/// behind makes `invoke_result_seq()`'s `or_insert_with` HIT for the new future — which silently
+/// gives two distinct RPC calls one identity and skips a bump of `next_invoke_result_seq`,
+/// leaving the counter permanently offset and the identity that `is_stray_concurrent_entry`
+/// relies on no longer live/replay-stable.
+///
+/// Both deletion paths go through here — the immediate one in `HostFutureInvokeResult::drop` and
+/// the deferred one in `HostPollable::drop` (`io/poll.rs`), which finishes a deletion that
+/// `drop` had to postpone because the future still had live child pollables
+/// (`ResourceTableError::HasChildren`). The deferred path used to free the rep without clearing
+/// the seq; see FINDING_B_FIX_DESIGN.md §13.5/§13.7.1.
+pub(crate) fn delete_future_invoke_result<Ctx: WorkerCtx>(
+    ctx: &mut DurableWorkerCtx<Ctx>,
+    this: Resource<FutureInvokeResultEntry>,
+) -> Result<FutureInvokeResultEntry, ResourceTableError> {
+    let rep = this.rep();
+    let result = ctx.table().delete(this);
+    if result.is_ok() {
+        ctx.state.clear_invoke_result_seq(rep);
+    }
+    result
+}
 
 fn classify_rpc_error(err: &InternalRpcError) -> HostFailureKind {
     match err {
@@ -902,44 +929,45 @@ impl<Ctx: WorkerCtx> HostFutureInvokeResult for DurableWorkerCtx<Ctx> {
 
             // 1. Check the cache first — a sibling poll()/get() call's stray-scan may already
             //    have consumed my own entry on my behalf (see FINDING_B_FIX_DESIGN.md).
-            let serialized_invoke_result = if let Some(cached) = self
-                .state
-                .take_pre_resolved_invoke_result(my_invoke_result_seq)
+            let my_identity = StrayEntryIdentity::new(
+                HostFunctionName::GolemRpcFutureInvokeResultGet,
+                IdentityNamespace::InvokeResult(my_invoke_result_seq),
+            );
+            let serialized_invoke_result = if let Some(cached) =
+                self.state.take_pre_resolved_stray(&my_identity)
             {
-                cached
+                let payload: HostResponseGolemRpcInvokeGet = cached
+                    .try_into()
+                    .map_err(|e: String| WorkerExecutorError::runtime(e))?;
+                payload.result
             } else {
                 // 2. Scan past any stray entries belonging to OTHER tracked operations
                 //    (excluding my own invoke_result_seq), caching each for its real owner.
-                let tracked = self.state.tracked_concurrent_op_seqs();
-                let mut strays = Vec::new();
                 self.state
-                    .replay_state
-                    .consume_stray_entries(
-                        |entry| {
-                            is_stray_concurrent_entry(
-                                entry,
-                                &tracked,
-                                Some(my_invoke_result_seq),
-                                None,
-                            )
-                        },
-                        |idx, entry| strays.push((idx, entry)),
-                    )
+                    .consume_and_cache_stray_entries(Some(my_identity.clone()))
                     .await?;
-                for (idx, entry) in strays {
-                    self.state.decode_and_cache_stray_entry(idx, entry).await?;
-                }
 
-                // 3. Unchanged existing fallback — whatever's left must be mine (every other
-                //    known identity has been filtered out) or a genuine, still-correctly-
-                //    crashing mismatch. Propagate WorkerExecutorError via `?` (From) so the
-                //    downcast survives the anyhow::Error chain — TrapType::from_error
-                //    classifies UnexpectedOplogEntry as non-retriable.
-                let (_, oplog_entry) =
-                    get_oplog_entry!(self.state.replay_state, OplogEntry::HostCall)?;
+                // 3. Consume whatever's left ONLY if it positively identifies as this call's
+                //    own entry (FINDING_B_FIX_DESIGN.md §13.7.2). The previous unconditional
+                //    `get_oplog_entry!(.., OplogEntry::HostCall)` consumed first and validated
+                //    second, so a cursor parked on a structural entry (`FinishSpan`,
+                //    `EndAtomicRegion`, ...) was destroyed before any identity check could run —
+                //    turning any drift in `invoke_result_seq` into a permanent, unrecoverable
+                //    trap ("expected OplogEntry :: HostCall |, got FinishSpan"). On a miss the
+                //    entry is left in place and this call reports `Pending`, which is an
+                //    already-handled outcome below (`Ok(None)`, no `end_function`, no
+                //    `finish_span`), so the guest simply polls again — the same self-correcting
+                //    loop `ready()` relies on.
+                let peeked = self
+                    .state
+                    .replay_state
+                    .try_get_oplog_entry(|entry| {
+                        is_own_invoke_result_entry(entry, my_invoke_result_seq)
+                    })
+                    .await?;
 
-                match oplog_entry {
-                    OplogEntry::HostCall { response, .. } => {
+                match peeked {
+                    Some((_, OplogEntry::HostCall { response, .. })) => {
                         let response =
                             self.state
                                 .oplog
@@ -965,17 +993,7 @@ impl<Ctx: WorkerCtx> HostFutureInvokeResult for DurableWorkerCtx<Ctx> {
                             }
                         }
                     }
-                    // The macro above already guarantees `OplogEntry::HostCall`, so
-                    // this arm is structurally unreachable. We still return an
-                    // error rather than panicking to keep the function panic-free.
-                    other => {
-                        return Err(anyhow::Error::from(
-                            WorkerExecutorError::unexpected_oplog_entry(
-                                "OplogEntry::HostCall",
-                                format!("{other:?}"),
-                            ),
-                        ));
-                    }
+                    _ => SerializableInvokeResult::Pending,
                 }
             };
 
@@ -1138,14 +1156,15 @@ impl<Ctx: WorkerCtx> HostFutureInvokeResult for DurableWorkerCtx<Ctx> {
         self.observe_function_call("golem::rpc::future-invoke-result", "drop");
         let future_rep = this.rep();
 
-        match self.table().delete(this) {
+        // delete_future_invoke_result also clears the rep's invoke_result_seq, but only when the
+        // rep is truly freed back to the resource table — not on the deferred HasChildren branch
+        // below, where the rep is still occupied and the seq must survive until `HostPollable::
+        // drop` finishes the deletion (through the same helper).
+        match delete_future_invoke_result(self, this) {
             Ok(entry) => {
                 for child_rep in &entry.child_pollables {
                     self.state.rpc_pollable_to_parent.remove(child_rep);
                 }
-                // Only once the rep is truly freed back to the resource table (not deferred by
-                // HasChildren below) — same rep-reuse rationale as clear_pollable_seq.
-                self.state.clear_invoke_result_seq(future_rep);
             }
             Err(ResourceTableError::HasChildren) => {
                 let parent: Resource<FutureInvokeResult> = Resource::new_borrow(future_rep);

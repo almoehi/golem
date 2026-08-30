@@ -2658,3 +2658,92 @@ no observed concurrent-query-stream workload).
 ### 14.12 Status
 
 **Design only.** Nothing implemented, nothing committed, no build run. Ready for review.
+
+### 14.13 Implementation status — what actually landed
+
+Status: **IMPLEMENTED.** Branch `hrapp/finding-b-general-mechanism-design`, five commits on top of
+`2b873f4b9`. `cargo build --release -p golem-worker-executor` clean;
+`cargo test -p golem-worker-executor --lib --release` = **488 passed, 0 failed, 0 ignored, 0
+filtered** (461 before this work, +27 new).
+
+**Landed as designed:**
+
+| §14 proposal | Landed |
+|---|---|
+| `Eq`/`Hash` on `HostFunctionName` (`oplog_macro.rs:326`) | yes — `Hash` on `DurableFunctionType` turned out unnecessary (see below) |
+| `StrayEntryIdentity = (HostFunctionName, IdentityNamespace)` | yes, verbatim |
+| `stray_entry_identity()` → 3-arm shape match, no per-function arms | yes |
+| Five typed `pre_resolved_*` maps → one `HashMap<StrayEntryIdentity, HostResponse>` | yes |
+| `decode_and_cache_stray_entry()`'s five arms (~130 lines) → generic download-and-store | yes |
+| `cached_stray_identities()` → `keys().cloned()` | yes |
+| `open_batches` registry in `begin_function`/`end_function` | yes |
+| Tracked-identity guard kept (§14.6 counterexample) | yes, with a dedicated regression test each side |
+| Push the protocol into `Durability::replay_raw` (§14.9 item 4) | yes — see scope note below |
+| `http/types.rs`'s raw `get_oplog_entry!` converted by hand | yes |
+
+**Three deliberate deviations, each with its reason:**
+
+1. **`Hash` on `DurableFunctionType` was not needed.** §14.9 item 1 called for it, but the identity
+   is keyed on the purpose-built `IdentityNamespace` (which carries only `u32`/`OplogIndex`), not on
+   `DurableFunctionType` itself. Adding a derive to a `golem-common` wire type with no consumer would
+   have been dead API surface, so it was dropped. `Eq`/`Hash` on `HostFunctionName` — the half that
+   *is* a map key — landed as proposed.
+
+2. **§14.9's steps 4–5 (`try_read_own_host_call` + the non-destructive-miss default, and
+   `replay_or`) were NOT adopted.** `replay_raw`'s integration is cache → scan → **the existing,
+   unchanged** `read_persisted_durable_function_invocation()` + `validate_oplog_entry()`. Reasoning,
+   arrived at in the code rather than from the design:
+   - The scan alone is *sufficient* for every gap §14.2 catalogued, including §14.2.1's silent
+     misdelivery: request A's scan recognizes and defers B's `future_incoming_response::get` entry
+     before A reads, so A reads its own. The regression test
+     `concurrent_future_response_entries_reach_their_own_callers` asserts exactly that, on payload
+     content, not merely "no trap".
+   - Making the final read identity-strict across all ~92 sites would newly *reject* any entry whose
+     `durable_function_type` differs from what the replaying call computes, where today only the
+     function name is validated. That is a behaviour change on paths with no evidence of a problem —
+     the opposite of the "no behaviour change expected on already-fixed call sites" bar §14.11 set.
+   - The non-destructive miss additionally needs a legal "not yet" answer per function (§14.5.3) and,
+     where none exists, risks converting a trap into an unbounded guest retry loop. `poll()` needed a
+     whole bounded-miss mechanism (`record_poll_replay_miss`) to make that safe for ONE call site;
+     generalising it to 92 is a separate change with its own risk budget.
+
+   §13.7.2's non-destructive reads therefore stay exactly where they already are — `poll()`,
+   `ready()`, RPC `get()` — and are unchanged by this work. Extending them is tracked as follow-on,
+   not silently skipped.
+
+3. **`read` and `blocking_read` now carry SEPARATE identities.** The prior point-fix folded
+   `HttpTypesIncomingBodyStreamBlockingRead` into `read`'s identity because the cache was typed by
+   response shape and both produce `StreamChunk`. With the cache keyed by function name that hack is
+   unnecessary and strictly worse: replay re-executes the same guest code and therefore the same
+   variant, so the per-function key is the correct one, and a scan can now defer one entry of each
+   instead of one in total.
+
+**One semantic widening worth flagging, because it changed an existing test.** Exclusion is now
+per-*identity*, where §12.5 made it per-*request*: a `read()` on request A now defers A's own
+`check_write`/`write` entries instead of refusing them. This is safe and strictly better — under the
+old rule such an entry fell through to `read()`'s own oplog read and trapped on the function-name
+mismatch; now it is cached under its own key and collected by the call that owns it, which only works
+because `Durability::replay_raw` makes *every* consumer a collector. The old test
+(`excludes_own_http_request_identity_across_both_directions`) was rewritten as
+`exclusion_is_per_identity_not_per_request`, with `each_deferred_entry_is_returned_to_its_own_owner`
+added as the §14.3-counterexample proof that the three functions sharing one `begin_index` each get
+their own answer back, narrowed to their own type.
+
+**Audit of the 18 gaps against real code, as §14 required — all confirmed to have the bug pattern
+before the fix, none excluded:** all sixteen `Durability`-based ones
+(`skip`/`blocking_skip`/`blocking_read`, `flush`/`blocking_flush`/`write_zeroes`/`splice`/
+`blocking_splice`, `future_trailers::get`, and `DbConnectionQueryStream`/`DbResultStreamGetColumns`/
+`DbResultStreamGetNext` × 3 dialects) had a bare `durability.replay(ctx)` on their replay branch —
+unconditional positional consumption, no identity check — and all sixteen are fixed by the
+`replay_raw` change alone, with no per-function work. `future_incoming_response::get` had the raw
+`get_oplog_entry!` and needed the hand conversion. The RDBMS transaction family
+(`WriteRemoteTransaction(Some(_))`) remains deliberately out of scope per §14.7(c), pinned by
+`transactional_entries_never_participate`.
+
+**Tests added (27):** the §14.3 counterexample; catalog-elimination across all nineteen
+previously-uncovered `HostFunctionName`s; the tracked-guard both ways; consumer-side vs entry-side
+identity agreement plus the closed three-variant list; transactional exclusion; the §14.2.1
+silent-misdelivery before/after pair on payload content; and one cursor-level deferral regression per
+newly-wired family (outgoing stream, incoming stream, trailers, RDBMS). Every pre-existing
+`stray_entry_tests` and `replay_state::tests` case survives with only the mechanical identity-
+constructor change, except the one documented above.

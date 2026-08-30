@@ -1141,6 +1141,8 @@ impl TryFrom<oplog::OplogEntry> for golem_common::model::oplog::OplogEntry {
                 // (recover_next_pollable_seq, durable_host/mod.rs, reads the native Rust
                 // OplogEntry directly from local storage).
                 next_pollable_seq: 0,
+                // Same reasoning as next_pollable_seq immediately above.
+                next_invoke_result_seq: 0,
             }),
             oplog::OplogEntry::OplogProcessorCheckpoint(params) => {
                 Ok(Self::OplogProcessorCheckpoint {

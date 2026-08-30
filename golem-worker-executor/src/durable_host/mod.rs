@@ -4186,6 +4186,18 @@ struct PrivateDurableWorkerState {
     /// (wasmtime resource-table slot reuse) gets a fresh sequence number rather than wrongly
     /// inheriting the dropped pollable's identity.
     pollable_seq: HashMap<u32, u32>,
+    /// REPLAY-ONLY cache of pollable seqs whose `IoPollReady(seq)=<result>` entry was consumed
+    /// by a DIFFERENT `poll()` call's replay logic, because it appeared in the oplog before the
+    /// guest's replayed structural check order reached that pollable's own `ready()` call (see
+    /// FINDING_B_FIX_DESIGN.md: `wstd`'s `Reactor` batches concurrently-pending pollables via a
+    /// `HashMap`-keyed waker set whose iteration order is per-process-randomized, so the guest's
+    /// structural `ready()` check order among a batch's members is not guaranteed to match
+    /// live's real completion order). `io/poll.rs`'s `Host::poll` replay branch populates this;
+    /// `HostPollable::ready`'s replay branch consults it FIRST (removing the entry) before
+    /// falling back to its own oplog lookup — the oplog itself has nothing left to find for a
+    /// seq recorded here, since `poll()` already durably consumed it. Always empty on the live
+    /// path.
+    pre_resolved_pollable_ready: HashMap<u32, bool>,
     /// Next value to assign in `pollable_seq`. Semantically: "how many distinct pollables has
     /// this WORKER (not this in-memory instance) observed via `ready()` since the very first
     /// time it ever ran" — a value that must stay consistent with what's already been persisted,
@@ -4390,6 +4402,7 @@ impl PrivateDurableWorkerState {
             runtime_retry_policy_mutations: std::collections::BTreeMap::new(),
             rpc_pollable_to_parent: HashMap::new(),
             pollable_seq: HashMap::new(),
+            pre_resolved_pollable_ready: HashMap::new(),
             next_pollable_seq,
             shard_service,
             promise_backed_pollables: TRwLock::new(HashMap::new()),
@@ -4464,6 +4477,49 @@ impl PrivateDurableWorkerState {
     /// sequence number rather than wrongly inheriting the dropped pollable's identity.
     pub fn clear_pollable_seq(&mut self, rep: u32) {
         self.pollable_seq.remove(&rep);
+    }
+
+    /// Returns `rep`'s already-assigned seq, if any, WITHOUT assigning a fresh one. Unlike
+    /// `pollable_seq()`, this must never mutate `next_pollable_seq` — `poll()`'s replay path
+    /// (`io/poll.rs`) uses this to check whether a batch member already has an identity to match
+    /// stray oplog entries against, without perturbing seq assignment order/values relative to
+    /// what LIVE recorded (LIVE only ever assigns seqs from `ready()`, never from `poll()` — see
+    /// `pollable_seq`'s doc comment). Perturbing that order would itself be a new live/replay
+    /// divergence and would risk breaking replay of already-persisted oplogs recorded under the
+    /// current (`ready()`-only) assignment order.
+    pub fn pollable_seq_if_assigned(&self, rep: u32) -> Option<u32> {
+        self.pollable_seq.get(&rep).copied()
+    }
+
+    /// Records that `seq`'s `IoPollReady` confirmation was consumed early, by a `poll()` call's
+    /// replay, on behalf of a pollable whose own `ready()` call hasn't replayed yet — see
+    /// `pre_resolved_pollable_ready`'s field doc comment for the full mechanism
+    /// (FINDING_B_FIX_DESIGN.md).
+    pub fn record_pre_resolved_pollable_ready(&mut self, seq: u32, ready: bool) {
+        debug!(
+            agent_id = %self.owned_agent_id,
+            seq,
+            ready,
+            "POLLSEQ_TRACE record_pre_resolved_pollable_ready"
+        );
+        self.pre_resolved_pollable_ready.insert(seq, ready);
+    }
+
+    /// Takes (removes) a pre-resolved answer for `seq`, if `poll()`'s replay already consumed
+    /// its entry on this pollable's behalf. Consulted by `ready()`'s replay BEFORE its own
+    /// `try_get_oplog_entry` lookup — if present, the oplog has nothing left to find for this
+    /// seq (already durably consumed), so this is the only remaining source of the answer.
+    pub fn take_pre_resolved_pollable_ready(&mut self, seq: u32) -> Option<bool> {
+        let taken = self.pre_resolved_pollable_ready.remove(&seq);
+        if let Some(ready) = taken {
+            debug!(
+                agent_id = %self.owned_agent_id,
+                seq,
+                ready,
+                "POLLSEQ_TRACE take_pre_resolved_pollable_ready"
+            );
+        }
+        taken
     }
 
     /// Returns the agent-config-derived retry policies (cached, cheap).

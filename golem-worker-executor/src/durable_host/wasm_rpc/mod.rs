@@ -14,7 +14,8 @@
 
 use crate::durable_host::durability::{ClassifiedHostError, HostFailureKind, InFunctionRetryHost};
 use crate::durable_host::{
-    Durability, DurabilityHost, DurableWorkerCtx, InternalRetryResult, is_own_invoke_result_entry,
+    Durability, DurabilityHost, DurableWorkerCtx, IdentityNamespace, InternalRetryResult,
+    StrayEntryIdentity, is_own_invoke_result_entry,
 };
 use crate::preview2::golem::agent::host::{
     CancellationToken, FutureInvokeResult, HostCancellationToken, HostFutureInvokeResult,
@@ -36,7 +37,7 @@ use golem_common::model::environment::EnvironmentId;
 use golem_common::model::invocation_context::InvocationContextStack;
 use golem_common::model::invocation_context::{AttributeValue, InvocationContextSpan, SpanId};
 use golem_common::model::oplog::host_functions::{
-    GolemRpcCancellationTokenCancel, GolemRpcFutureInvokeResultCancel,
+    GolemRpcCancellationTokenCancel, GolemRpcFutureInvokeResultCancel, HostFunctionName,
     GolemRpcFutureInvokeResultGet, GolemRpcWasmRpcInvoke, GolemRpcWasmRpcInvokeAndAwaitResult,
     GolemRpcWasmRpcScheduleInvocation,
 };
@@ -926,16 +927,22 @@ impl<Ctx: WorkerCtx> HostFutureInvokeResult for DurableWorkerCtx<Ctx> {
 
             // 1. Check the cache first — a sibling poll()/get() call's stray-scan may already
             //    have consumed my own entry on my behalf (see FINDING_B_FIX_DESIGN.md).
-            let serialized_invoke_result = if let Some(cached) = self
-                .state
-                .take_pre_resolved_invoke_result(my_invoke_result_seq)
+            let my_identity = StrayEntryIdentity::new(
+                HostFunctionName::GolemRpcFutureInvokeResultGet,
+                IdentityNamespace::InvokeResult(my_invoke_result_seq),
+            );
+            let serialized_invoke_result = if let Some(cached) =
+                self.state.take_pre_resolved_stray(&my_identity)
             {
-                cached
+                let payload: HostResponseGolemRpcInvokeGet = cached
+                    .try_into()
+                    .map_err(|e: String| WorkerExecutorError::runtime(e))?;
+                payload.result
             } else {
                 // 2. Scan past any stray entries belonging to OTHER tracked operations
                 //    (excluding my own invoke_result_seq), caching each for its real owner.
                 self.state
-                    .consume_and_cache_stray_entries(Some(my_invoke_result_seq), None)
+                    .consume_and_cache_stray_entries(Some(my_identity.clone()))
                     .await?;
 
                 // 3. Consume whatever's left ONLY if it positively identifies as this call's

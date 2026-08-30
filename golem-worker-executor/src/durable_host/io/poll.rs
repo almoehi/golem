@@ -15,7 +15,8 @@
 use crate::durable_host::durability::InFunctionRetryHost;
 use crate::durable_host::wasm_rpc::delete_future_invoke_result;
 use crate::durable_host::{
-    Durability, DurabilityHost, DurableWorkerCtx, SuspendForSleep, is_own_poll_entry,
+    Durability, DurabilityHost, DurableWorkerCtx, IdentityNamespace, StrayEntryIdentity,
+    SuspendForSleep, is_own_poll_entry,
 };
 use crate::metrics::ephemeral::{dec_promise_waiting, inc_promise_waiting};
 use crate::services::oplog::OplogOps;
@@ -95,15 +96,26 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
             // HashMap-keyed waker set whose iteration order is per-process-randomized). If so,
             // the oplog has nothing left to find for this seq — this cached answer is
             // authoritative.
-            if let Some(pre_resolved) = self.state.take_pre_resolved_pollable_ready(pollable_seq) {
+            let my_identity = StrayEntryIdentity::new(
+                HostFunctionName::IoPollReady,
+                IdentityNamespace::Pollable(pollable_seq),
+            );
+            if let Some(pre_resolved) = self.state.take_pre_resolved_stray(&my_identity) {
+                let payload: HostResponsePollReady = pre_resolved
+                    .try_into()
+                    .map_err(|e: String| wasmtime::Error::msg(e))?;
+                // A recorded error is reported as "not ready yet", matching what this cached
+                // path has always returned (the answer used to be stored pre-collapsed as a
+                // bool); the guest's next `ready()` call re-reads it if it is still relevant.
+                let ready = payload.result.unwrap_or(false);
                 trace!(
                     agent_id = %self.owned_agent_id,
                     rep = pollable_rep,
                     seq = pollable_seq,
-                    result = pre_resolved,
+                    result = ready,
                     "POLLREADY_TRACE ready() REPLAY using answer pre-resolved by an earlier poll() call"
                 );
-                return Ok(pre_resolved);
+                return Ok(ready);
             }
 
             // Replay: consume the next IoPollReady entry only if it was recorded for THIS
@@ -398,9 +410,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
             // takes over. No batch-size or entry-kind assumption: N stray entries of any
             // recognized kind, in any order, is simply N loop iterations (bounded to one per
             // identity, see StrayEntryScan).
-            self.state
-                .consume_and_cache_stray_entries(None, None)
-                .await?;
+            self.state.consume_and_cache_stray_entries(None).await?;
 
             // Whatever's left is consumed only if it positively identifies as poll()'s own
             // entry (FINDING_B_FIX_DESIGN.md §13.7.2): a replay consumer must never destroy an

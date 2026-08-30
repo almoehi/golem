@@ -2381,6 +2381,173 @@ mod tests {
         );
     }
 
+    /// The `EndRemoteWrite` that closes a batch — the structural entry that immediately follows
+    /// a body-stream cluster, carrying a `begin_index: OplogIndex` field of the very same shape
+    /// and value as the identity namespace the cluster's entries are keyed by
+    /// (`Batch(OplogIndex)`). Superficially "matching" that field is exactly the confusion the
+    /// tests below rule out.
+    fn end_remote_write_entry(begin_index: OplogIndex) -> OplogEntry {
+        OplogEntry::EndRemoteWrite {
+            timestamp: Timestamp::now_utc(),
+            begin_index,
+        }
+    }
+
+    /// FINDING_B_FIX_DESIGN.md §15.5, recognition half: a cluster of exactly two same-identity
+    /// entries followed by the batch's own `EndRemoteWrite`. The scan must drain both entries
+    /// and STOP at the structural one, never consuming it — even though that entry carries a
+    /// `begin_index` field holding the identical `OplogIndex` the cluster is keyed by.
+    #[test]
+    async fn a_structural_entry_closing_the_batch_is_never_consumed_by_a_scan() {
+        use golem_common::model::oplog::{HostResponse, HostResponseStreamChunk};
+        let begin_idx = OplogIndex::from_u64(2190);
+        let read = |bytes: &[u8]| {
+            batched_entry(
+                HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+                begin_idx,
+                HostResponse::StreamChunk(HostResponseStreamChunk {
+                    result: Ok(bytes.to_vec()),
+                }),
+            )
+        };
+        let mut state = replay_state_over(vec![
+            read(b"body"),
+            read(b""),
+            end_remote_write_entry(begin_idx),
+        ])
+        .await;
+
+        // Identity derivation must reject the structural entry outright — it is not a HostCall,
+        // so it has no identity at all, regardless of its begin_index.
+        assert_eq!(
+            stray_entry_identity(&end_remote_write_entry(begin_idx)),
+            None
+        );
+
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::Batch(begin_idx)]));
+        let scan = StrayEntryScan::new(tracked, None);
+        let mut consumed = Vec::new();
+        state
+            .consume_stray_entries(|e| scan.accept(e), |idx, e| consumed.push((idx, e)))
+            .await
+            .unwrap();
+
+        assert_eq!(consumed.len(), 2, "both reads defer, the marker does not");
+        let survivor = state
+            .try_get_oplog_entry(|e| matches!(e, OplogEntry::EndRemoteWrite { .. }))
+            .await
+            .unwrap();
+        assert!(
+            survivor.is_some(),
+            "EndRemoteWrite must still be at the cursor for end_function, its real owner"
+        );
+    }
+
+    /// §15.5, consumption half — the actual live trap. After the scan clears the cluster the
+    /// cursor sits on `EndRemoteWrite`, and the post-scan read must REFUSE it non-destructively.
+    /// The unconditional `get_oplog_entry!(.., OplogEntry::HostCall)` used before consumed it and
+    /// only then reported "expected OplogEntry::HostCall, got EndRemoteWrite", destroying the
+    /// engine's region bookkeeping and making the failure permanent instead of retriable.
+    #[test]
+    async fn a_post_scan_read_refuses_a_structural_entry_without_consuming_it() {
+        use golem_common::model::oplog::{HostResponse, HostResponseStreamChunk};
+        let begin_idx = OplogIndex::from_u64(2190);
+        let mut state = replay_state_over(vec![
+            batched_entry(
+                HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+                begin_idx,
+                HostResponse::StreamChunk(HostResponseStreamChunk { result: Ok(vec![]) }),
+            ),
+            end_remote_write_entry(begin_idx),
+        ])
+        .await;
+
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::Batch(begin_idx)]));
+        let scan = StrayEntryScan::new(tracked, None);
+        state
+            .consume_stray_entries(|e| scan.accept(e), |_, _| {})
+            .await
+            .unwrap();
+
+        // BEFORE (the bug): `get_oplog_entry!` expands to `get_oplog_entry()`, i.e.
+        // `try_get_oplog_entry(|_| true)`. Reproduced here against the real primitive to pin
+        // what the old post-scan read did — it CONSUMES the structural entry, and the caller's
+        // "expected HostCall, got EndRemoteWrite" is reported only afterwards, too late.
+        // (`poll_entry` is only a trailing sentinel so the cursor stays inside the replay target
+        // after the destructive read; nothing about it matters beyond being a later entry.)
+        let mut destructive =
+            replay_state_over(vec![end_remote_write_entry(begin_idx), poll_entry()]).await;
+        let (_, eaten) = destructive.get_oplog_entry().await.unwrap();
+        assert!(
+            matches!(eaten, OplogEntry::EndRemoteWrite { .. }),
+            "the unconditional read consumes whatever sits at the cursor — the defect"
+        );
+        assert!(
+            destructive
+                .try_get_oplog_entry(|e| matches!(e, OplogEntry::EndRemoteWrite { .. }))
+                .await
+                .unwrap()
+                .is_none(),
+            "and it is gone: end_function can never find it again"
+        );
+
+        // AFTER (the fix): the same read, guarded by the predicate
+        // `try_read_persisted_durable_function_invocation` and
+        // `future_incoming_response::get`'s replay both now use.
+        let attempt = state
+            .try_get_oplog_entry(|entry| matches!(entry, OplogEntry::HostCall { .. }))
+            .await
+            .unwrap();
+        assert!(
+            attempt.is_none(),
+            "a HostCall-only read must not match EndRemoteWrite"
+        );
+
+        // ... and crucially, the refusal left the cursor untouched.
+        let survivor = state
+            .try_get_oplog_entry(|e| matches!(e, OplogEntry::EndRemoteWrite { .. }))
+            .await
+            .unwrap();
+        assert!(
+            survivor.is_some(),
+            "the refused entry must survive for end_function; consuming it is the §15.5 bug"
+        );
+    }
+
+    /// Generalization of the above beyond `EndRemoteWrite`: any non-`HostCall` variant that can
+    /// follow a cluster must be refused identically. `FinishSpan` (the entry immediately after
+    /// `EndRemoteWrite` in the live capture) has no `begin_index` at all, `EndAtomicRegion` has
+    /// one — neither may be consumed by a HostCall read.
+    #[test]
+    async fn every_structural_variant_is_refused_by_a_host_call_read() {
+        let begin_idx = OplogIndex::from_u64(2190);
+        for structural in [
+            end_remote_write_entry(begin_idx),
+            finish_span_entry(),
+            OplogEntry::EndAtomicRegion {
+                timestamp: Timestamp::now_utc(),
+                begin_index: begin_idx,
+            },
+        ] {
+            assert_eq!(
+                stray_entry_identity(&structural),
+                None,
+                "{structural:?} must carry no stray identity"
+            );
+            let mut state = replay_state_over(vec![structural.clone()]).await;
+            let attempt = state
+                .try_get_oplog_entry(|entry| matches!(entry, OplogEntry::HostCall { .. }))
+                .await
+                .unwrap();
+            assert!(
+                attempt.is_none(),
+                "{structural:?} must not satisfy a HostCall read"
+            );
+        }
+    }
+
     /// N=2 is not special-cased: five occurrences of one identity behave identically.
     #[test]
     async fn many_occurrences_of_one_identity_all_replay_in_order() {

@@ -497,6 +497,15 @@ pub struct PersistedDurableFunctionInvocation {
     oplog_entry_version: OplogEntryVersion,
 }
 
+impl PersistedDurableFunctionInvocation {
+    /// The recorded answer, for consumers outside this module that read the oplog directly
+    /// rather than through `Durability::replay` (currently `future_incoming_response::get`,
+    /// the one host function that never constructs a `Durability`).
+    pub fn into_response(self) -> HostResponse {
+        self.response
+    }
+}
+
 #[async_trait]
 pub trait DurabilityHost: InFunctionRetryHost {
     /// Observes a function call (produces logs and metrics)
@@ -533,10 +542,22 @@ pub trait DurabilityHost: InFunctionRetryHost {
         function_type: DurableFunctionType,
     );
 
-    /// Reads the next persisted durable function invocation from the oplog during replay
+    /// Reads the next persisted durable function invocation from the oplog during replay.
+    ///
+    /// Consumes the entry at the cursor only if it is an `OplogEntry::HostCall`; anything else is
+    /// left in place and reported as an error (see `DurableWorkerCtx::read_host_call_entry` for
+    /// why refusing non-destructively is load-bearing). Same error surface as before, minus the
+    /// destructive side effect.
     async fn read_persisted_durable_function_invocation(
         &mut self,
     ) -> Result<PersistedDurableFunctionInvocation, WorkerExecutorError>;
+
+    /// Same read, but a non-`HostCall` at the cursor is reported as `None` rather than as an
+    /// error — for consumers that have a legal "not yet" answer to give the guest instead of
+    /// trapping (FINDING_B_FIX_DESIGN.md §13.7.2, §14.5.3).
+    async fn try_read_persisted_durable_function_invocation(
+        &mut self,
+    ) -> Result<Option<PersistedDurableFunctionInvocation>, WorkerExecutorError>;
 
     /// Walks the replay cursor past every entry belonging to a DIFFERENT concurrently-tracked
     /// operation than `exclude` (the caller's own identity), caching each undecoded answer for
@@ -609,7 +630,9 @@ impl From<DurableFunctionType> for durability::DurableFunctionType {
             DurableFunctionType::ReadRemote => durability::DurableFunctionType::ReadRemote,
             DurableFunctionType::ReadLocal => durability::DurableFunctionType::ReadLocal,
             DurableFunctionType::ReadLocalPollable(_) => durability::DurableFunctionType::ReadLocal,
-            DurableFunctionType::WriteRemoteConcurrent(_) => durability::DurableFunctionType::WriteRemote,
+            DurableFunctionType::WriteRemoteConcurrent(_) => {
+                durability::DurableFunctionType::WriteRemote
+            }
             DurableFunctionType::WriteRemoteTransaction(oplog_index) => {
                 durability::DurableFunctionType::WriteRemoteTransaction(
                     oplog_index.map(|idx| idx.into()),
@@ -817,6 +840,92 @@ impl<Ctx: WorkerCtx> InFunctionRetryHost for DurableWorkerCtx<Ctx> {
     }
 }
 
+impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
+    /// THE replay read for host-call entries — the single place that decides whether an entry at
+    /// the replay cursor may be consumed as a durable function invocation. Both public readers
+    /// are thin wrappers over it, so they cannot drift.
+    ///
+    /// Consumes the entry at the cursor ONLY if it is an `OplogEntry::HostCall`. Anything else is
+    /// left in place and reported as `Err(<debug of the refused entry>)` for the caller to turn
+    /// into an error or into a legal "not yet".
+    ///
+    /// **Non-destructive refusal is the load-bearing part.** The stray-entry scan walks forward
+    /// until it meets an entry it does not recognize, and STRUCTURAL entries (`EndRemoteWrite`,
+    /// `FinishSpan`, `EndAtomicRegion`, ...) are exactly such entries — so a scan that clears a
+    /// whole run of tracked entries routinely parks the cursor on one. The previous
+    /// `get_oplog_entry!(.., OplogEntry::HostCall)` read consumed whatever sat there and reported
+    /// the type mismatch only afterwards, destroying the engine's own region bookkeeping and
+    /// turning a retriable failure into a permanent one (FINDING_B_FIX_DESIGN.md §15.5, and
+    /// §13.7.2's general rule: never destroy an entry you have not identified as your own).
+    ///
+    /// Deliberately checks the VARIANT only — not the function name, not the durable function
+    /// type. Callers' existing name validation is untouched, so no call site changes behaviour
+    /// when a `HostCall` really is at the cursor (§14.13's objection to identity strictness
+    /// across ~92 sites). The error surface is unchanged too: the same
+    /// `unexpected_oplog_entry("OplogEntry::HostCall", <entry debug>)` as before, carrying the
+    /// same diagnostics — only the destructive side effect is gone.
+    async fn read_host_call_entry(
+        &mut self,
+    ) -> Result<Result<PersistedDurableFunctionInvocation, String>, WorkerExecutorError> {
+        if self.state.persistence_level == PersistenceLevel::PersistNothing {
+            return Err(WorkerExecutorError::runtime(
+                "Trying to replay an durable invocation in a PersistNothing block",
+            ));
+        }
+
+        // Captured from inside the predicate so a refusal keeps the same diagnostics the
+        // destructive read used to produce — `try_get_oplog_entry` rewinds on refusal and
+        // therefore never hands the entry back to us.
+        let mut refused: Option<String> = None;
+        let peeked = self
+            .state
+            .replay_state
+            .try_get_oplog_entry(|entry| {
+                let is_host_call = matches!(entry, OplogEntry::HostCall { .. });
+                if !is_host_call {
+                    refused = Some(format!("{entry:?}"));
+                }
+                is_host_call
+            })
+            .await?;
+
+        let Some((
+            _,
+            OplogEntry::HostCall {
+                timestamp,
+                function_name,
+                durable_function_type,
+                response,
+                ..
+            },
+        )) = peeked
+        else {
+            return Ok(Err(
+                refused.unwrap_or_else(|| "no entry at the replay cursor".to_string())
+            ));
+        };
+
+        let response = self
+            .public_state
+            .worker()
+            .oplog()
+            .download_payload(response)
+            .await
+            .map_err(|err| {
+                WorkerExecutorError::runtime(format!(
+                    "HostCall payload cannot be downloaded: {err}"
+                ))
+            })?;
+        Ok(Ok(PersistedDurableFunctionInvocation {
+            timestamp,
+            function_name: function_name.to_string(),
+            response,
+            function_type: durable_function_type,
+            oplog_entry_version: OplogEntryVersion::V2,
+        }))
+    }
+}
+
 #[async_trait]
 impl<Ctx: WorkerCtx> DurabilityHost for DurableWorkerCtx<Ctx> {
     fn observe_function_call(&self, interface: &str, function: &str) {
@@ -876,46 +985,15 @@ impl<Ctx: WorkerCtx> DurabilityHost for DurableWorkerCtx<Ctx> {
     async fn read_persisted_durable_function_invocation(
         &mut self,
     ) -> Result<PersistedDurableFunctionInvocation, WorkerExecutorError> {
-        if self.state.persistence_level == PersistenceLevel::PersistNothing {
-            Err(WorkerExecutorError::runtime(
-                "Trying to replay an durable invocation in a PersistNothing block",
-            ))
-        } else {
-            let (_, oplog_entry) =
-                crate::get_oplog_entry!(self.state.replay_state, OplogEntry::HostCall)?;
-            match oplog_entry {
-                OplogEntry::HostCall {
-                    timestamp,
-                    function_name,
-                    durable_function_type,
-                    response,
-                    ..
-                } => {
-                    let response = self
-                        .public_state
-                        .worker()
-                        .oplog()
-                        .download_payload(response)
-                        .await
-                        .map_err(|err| {
-                            WorkerExecutorError::runtime(format!(
-                                "HostCall payload cannot be downloaded: {err}"
-                            ))
-                        })?;
-                    Ok(PersistedDurableFunctionInvocation {
-                        timestamp,
-                        function_name: function_name.to_string(),
-                        response,
-                        function_type: durable_function_type,
-                        oplog_entry_version: OplogEntryVersion::V2,
-                    })
-                }
-                _ => Err(WorkerExecutorError::unexpected_oplog_entry(
-                    "HostCall",
-                    format!("{oplog_entry:?}"),
-                )),
-            }
-        }
+        self.read_host_call_entry().await?.map_err(|rejected| {
+            WorkerExecutorError::unexpected_oplog_entry("OplogEntry::HostCall", rejected)
+        })
+    }
+
+    async fn try_read_persisted_durable_function_invocation(
+        &mut self,
+    ) -> Result<Option<PersistedDurableFunctionInvocation>, WorkerExecutorError> {
+        Ok(self.read_host_call_entry().await?.ok())
     }
 
     async fn consume_and_cache_stray_entries(
@@ -1349,6 +1427,14 @@ impl<Pair: HostPayloadPair> Durability<Pair> {
                     // 3. Whatever is left is read exactly as before — every other tracked
                     //    identity has been filtered out, so this is either this call's own
                     //    entry or a genuine, still-correctly-reported mismatch.
+                    //
+                    //    The read itself refuses to CONSUME a non-`HostCall`, which matters
+                    //    here specifically: the scan above stops at the first entry it does not
+                    //    recognize, and a structural entry (the `EndRemoteWrite` closing the
+                    //    very batch these entries belong to, `FinishSpan`, ...) is exactly that,
+                    //    so clearing a whole run of tracked entries routinely parks the cursor
+                    //    on one. See `DurableWorkerCtx::read_host_call_entry` and
+                    //    FINDING_B_FIX_DESIGN.md §15.5.
                     let oplog_entry = ctx.read_persisted_durable_function_invocation().await?;
                     Self::validate_oplog_entry(&oplog_entry, Pair::FQFN, self.begin_index)?;
                     oplog_entry.response
@@ -1763,6 +1849,12 @@ mod tests {
         async fn read_persisted_durable_function_invocation(
             &mut self,
         ) -> Result<PersistedDurableFunctionInvocation, WorkerExecutorError> {
+            Err(WorkerExecutorError::runtime("not implemented in mock"))
+        }
+
+        async fn try_read_persisted_durable_function_invocation(
+            &mut self,
+        ) -> Result<Option<PersistedDurableFunctionInvocation>, WorkerExecutorError> {
             Err(WorkerExecutorError::runtime("not implemented in mock"))
         }
 

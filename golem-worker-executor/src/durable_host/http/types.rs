@@ -22,7 +22,6 @@ use crate::durable_host::{
     Durability, DurabilityHost, DurableWorkerCtx, HttpRequestCloseOwner, IdentityNamespace,
     StrayEntryIdentity,
 };
-use crate::get_oplog_entry;
 use crate::services::HasWorker;
 use crate::services::oplog::{CommitLevel, OplogOps};
 use crate::workerctx::WorkerCtx;
@@ -33,7 +32,7 @@ use golem_common::model::oplog::host_functions::{
 use golem_common::model::oplog::types::{SerializableHttpResponse, SerializableResponseHeaders};
 use golem_common::model::oplog::{
     DurableFunctionType, HostPayloadPair, HostRequest, HostResponse,
-    HostResponseHttpFutureTrailersGet, HostResponseHttpResponse, OplogEntry, PersistenceLevel,
+    HostResponseHttpFutureTrailersGet, HostResponseHttpResponse, PersistenceLevel,
 };
 use golem_common::model::{NamedRetryPolicy, ScheduleId};
 use golem_service_base::error::worker_executor::WorkerExecutorError;
@@ -1254,30 +1253,37 @@ impl<Ctx: WorkerCtx> HostFutureIncomingResponse for DurableWorkerCtx<Ctx> {
             let host_response = match cached {
                 Some(cached) => cached,
                 None => {
-                    // Propagate WorkerExecutorError via `?` (From) so the downcast
-                    // survives the wasmtime::Error chain — TrapType::from_error
-                    // classifies UnexpectedOplogEntry as non-retriable.
-                    let (_, oplog_entry) =
-                        get_oplog_entry!(self.state.replay_state, OplogEntry::HostCall)?;
-                    match oplog_entry {
-                        OplogEntry::HostCall { response, .. } => self
-                            .state
-                            .oplog
-                            .download_payload(response)
-                            .await
-                            .map_err(|err| {
-                                WorkerExecutorError::runtime(format!(
-                                    "failed to download http::types::future_incoming_response::get oplog payload: {err}"
-                                ))
-                            })?,
-                        // The macro above already guarantees `OplogEntry::HostCall`, so
-                        // this arm is structurally unreachable. We still return an
-                        // error rather than panicking to keep the function panic-free.
-                        other => {
+                    // The stray scan above stops at the first entry it does not recognize, and a
+                    // structural entry — in particular the `EndRemoteWrite` closing this very
+                    // request's batch — is exactly that, so a scan that clears the batch's whole
+                    // remaining run parks the cursor on one. This is not hypothetical: it is the
+                    // live trap in FINDING_B_FIX_DESIGN.md §15.5, where this call (the reactor
+                    // re-polling an already-resolved response future, so every entry recorded for
+                    // it had already been handed out) consumed the `EndRemoteWrite` and reported
+                    // "expected OplogEntry::HostCall, got EndRemoteWrite".
+                    //
+                    // The `try_` read leaves such an entry in place for `end_function`, its real
+                    // owner. Propagate WorkerExecutorError via `?` (From) so the downcast
+                    // survives the wasmtime::Error chain — TrapType::from_error classifies
+                    // UnexpectedOplogEntry as non-retriable.
+                    match self
+                        .try_read_persisted_durable_function_invocation()
+                        .await?
+                    {
+                        Some(invocation) => invocation.into_response(),
+                        // Nothing of ours at the cursor. `get()` has a legal "not yet" answer and
+                        // the guest's reactor is built to re-poll on it, so report pending rather
+                        // than trapping — §13.7.2's non-destructive-miss rule, which
+                        // `poll()`/`ready()`/RPC `get()` already follow.
+                        None if my_identity.is_some() => return Ok(None),
+                        // With no identity of our own (post-snapshot-restore mid-request) nothing
+                        // defers our entries out from under us, so a miss there is a genuine
+                        // mismatch and must still be reported.
+                        None => {
                             return Err(wasmtime::Error::from(
                                 WorkerExecutorError::unexpected_oplog_entry(
                                     "OplogEntry::HostCall",
-                                    format!("{other:?}"),
+                                    "a non-HostCall entry at the replay cursor (left unconsumed)",
                                 ),
                             ));
                         }

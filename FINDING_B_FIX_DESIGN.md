@@ -2886,3 +2886,124 @@ production code rather than a re-implementation of it.
 **not run**: this worktree has only 5 of the ~21 `test-components/*.wasm` fixtures built, so the
 integration harness aborts during component cache warm-up before any test body executes. An
 environmental gap, unrelated to this change. Live verification is deliberately out of scope here.
+
+### 15.5 Live verification round 1 — the fix works, and exposes the defect the old bound was masking
+
+The §15.3 fix was built and live-verified against the same agent. **The target trap is gone**:
+`#02254`/`#02255` (the two same-identity `blocking_read` entries) now both replay cleanly to their
+own answers. A different trap appears immediately after, at the next entry:
+
+```
+retry_from: OplogIndex(2255)
+Unexpected oplog entry - expected OplogEntry :: HostCall |, got EndRemoteWrite { begin_index: OplogIndex(2190) }
+```
+
+The full oplog window, from the fresh dump — one outgoing `POST ollama.com/api/chat`, batch
+`BeginRemoteWrite` at `#02190`:
+
+```
+#02251: CALL io::poll::poll
+#02252: CALL io::poll::pollable::ready
+#02253: CALL http::types::future_incoming_response::get   -> headers-received(200)
+#02254: CALL http::types::incoming_body_stream::blocking_read -> ok([...470-byte body...])
+#02255: CALL http::types::incoming_body_stream::blocking_read -> err(closed)
+#02256: END REMOTE WRITE  (begin_index: 2190)
+#02257: FINISH SPAN
+```
+
+`retry_from: 2255` confirms `#02254` AND `#02255` both replayed successfully — the §15.3 fix doing
+exactly its job — and the failure is now at `#02256`.
+
+#### 15.5.1 The `matched: true` trace is not a loose predicate
+
+The accompanying trace,
+
+```
+TRYGET_TRACE try_get_oplog_entry peeked entry, oplog_index: 2256, entry: EndRemoteWrite { ... }, matched: true
+```
+
+looks like an identity predicate wrongly matching a structural entry — in particular one that might
+be comparing `begin_index` (which `EndRemoteWrite` also carries) without first checking the variant.
+It is not. `ReplayState::get_oplog_entry()` is implemented as `try_get_oplog_entry(|_| true)`
+(`replay_state.rs`), so **every unconditional read logs `matched: true` for whatever sits at the
+cursor**. The predicate that "matched" is the always-true closure.
+
+Every real identity predicate was audited and all are structurally sound: `stray_entry_identity`
+destructures `OplogEntry::HostCall { .. }` first and returns `None` for every other variant, so
+`is_stray_concurrent_entry`, `StrayEntryScan` and the cache key inherit that guard;
+`is_own_poll_entry` and `is_own_invoke_result_entry` both match on `OplogEntry::HostCall { .. }`
+patterns. No predicate compares an inner field before confirming the variant. Candidate (a) —
+a structurally loose identity check — is **ruled out**.
+
+Candidate (b) — the new FIFO design hunting a non-existent occurrence #3 — is **also ruled out** by
+the payloads: the guest makes exactly two `blocking_read` calls, `ok(body)` then `err(closed)`, and
+`err(closed)` is what terminates its read loop. Nothing looks for a third.
+
+#### 15.5.2 Root cause: the post-scan read was destructive, and the old scan bound was hiding it
+
+The culprit is `get_oplog_entry!(.., OplogEntry::HostCall)` — an unconditional,
+consume-then-validate read — at the two sites reached after a stray-entry scan:
+`read_persisted_durable_function_invocation` (`durability.rs`, i.e. `Durability::replay_raw`'s
+step 3, covering ~92 call sites) and `future_incoming_response::get`'s hand-wired replay
+(`http/types.rs`).
+
+A scan stops at the first entry it does not recognize. Structural entries — `EndRemoteWrite`,
+`FinishSpan`, `EndAtomicRegion` — are never recognized (they are not `HostCall`s, so they have no
+identity), which is correct. But it means **a scan that clears a whole run of tracked entries parks
+the cursor precisely on a structural entry**, and the consumer's next act was to consume it blindly
+and only then report the type mismatch — destroying the engine's own region bookkeeping and
+converting a retriable failure into a permanent one.
+
+The live sequence: the reactor re-polls the response future after `#02253` already resolved it, so
+`future_incoming_response::get` runs with its queue exhausted. Its identity
+(`FutureIncomingResponseGet`, `Batch(2190)`) differs from `blocking_read`'s, so its scan legitimately
+defers `#02254` and `#02255` — then its unconditional read eats `#02256`.
+
+**This is precisely §13.7.2's documented hazard, and §14.9 step 4 designed the fix for it; §14.13
+deviation 2 deliberately deferred it as "no evidence of a problem".** What supplied that apparent
+absence of evidence was the one-entry-per-identity scan bound: by stopping at the second occurrence
+of any identity, it left a `HostCall` at the cursor in almost every case, so the destructive read
+almost always landed on one. §15.3 removed that bound for the reasons given there — and with it, the
+accidental protection. The bound removal is not itself wrong; it exposed a latent defect that was
+always reachable and simply had not been hit.
+
+#### 15.5.3 Fix
+
+`DurableWorkerCtx::read_host_call_entry` becomes the single authoritative replay read for host-call
+entries. It consumes the entry at the cursor **only if it is an `OplogEntry::HostCall`**; anything
+else is left in place (`try_get_oplog_entry` rewinds on refusal) and reported back as the refused
+entry's debug string. Both public readers are thin wrappers, so they cannot drift:
+
+- `read_persisted_durable_function_invocation` → refusal becomes the same
+  `unexpected_oplog_entry("OplogEntry::HostCall", <entry debug>)` error as before, with the same
+  diagnostics (the entry's `Debug` is captured inside the predicate, since a rewind never hands the
+  entry back). **Only the destructive side effect is gone.** This covers `replay_raw`'s tracked and
+  untracked branches alike, and therefore also `poll()`'s bounded-miss fallback — which takes the
+  untracked branch (`IoPollPoll` is `ReadLocal`) and could otherwise have destroyed `#02256` itself
+  once the miss streak ran out.
+- `try_read_persisted_durable_function_invocation` → refusal becomes `None`, for consumers holding a
+  legal "not yet". Used by `future_incoming_response::get`, which returns
+  `SerializableHttpResponse::Pending` (`Ok(None)`) — the answer its own code already had an arm for,
+  and the one the guest's reactor is built to re-poll on. Gated on the stray protocol being active
+  for that request; with no identity (post-snapshot-restore mid-request) nothing can defer its
+  entries, so a miss there is still a genuine mismatch and is still reported.
+
+Deliberately a **variant** check, never an identity check: function-name validation stays exactly
+where it was, so no call site changes behaviour when a `HostCall` really is at the cursor. That
+sidesteps §14.13's objection to identity strictness across ~92 sites entirely — the change is
+"do not destroy what you are about to reject", nothing more. `future_incoming_response::get`'s
+hand-rolled read and its duplicate `download_payload` were replaced by the shared reader.
+
+#### 15.5.4 Test results
+
+`cargo build --release -p golem-worker-executor` clean; `cargo clippy --release --lib --tests` clean.
+`cargo test -p golem-worker-executor --lib --release` = **496 passed, 0 failed, 0 ignored, 0
+filtered** (493 after §15.3, +3).
+
+| Test | Asserts |
+|---|---|
+| `a_structural_entry_closing_the_batch_is_never_consumed_by_a_scan` | The live shape: two same-identity entries then the batch's own `EndRemoteWrite`. Both defer, the marker does not, and `stray_entry_identity` returns `None` for it — even though it carries a `begin_index` holding the identical `OplogIndex` the cluster is keyed by. |
+| `a_post_scan_read_refuses_a_structural_entry_without_consuming_it` | A before/after pair on the real primitives: the unconditional read (`get_oplog_entry()`) CONSUMES the `EndRemoteWrite` and it is then gone forever; the guarded read refuses it and the entry survives at the cursor for `end_function`. |
+| `every_structural_variant_is_refused_by_a_host_call_read` | Generality beyond `EndRemoteWrite`: `FinishSpan` (no `begin_index` at all) and `EndAtomicRegion` (has one) are refused identically and carry no stray identity. |
+
+Integration suites remain un-runnable in this worktree for the fixture reason recorded in §15.4.

@@ -4218,7 +4218,6 @@ struct PrivateDurableWorkerState {
     /// `recover_next_invoke_result_seq()`.
     next_invoke_result_seq: u32,
 
-
     /// Bookkeeping for `poll()`'s bounded replay-miss fallback (see `record_poll_replay_miss`).
     /// `(replay cursor at the time of the first miss at that position, number of consecutive
     /// misses observed at that same, unmoved cursor)`.
@@ -4413,9 +4412,7 @@ pub fn is_stray_concurrent_entry(
     exclude: Option<&StrayEntryIdentity>,
 ) -> bool {
     match stray_entry_identity(entry) {
-        Some(identity) => {
-            Some(&identity) != exclude && tracked.contains(&identity.namespace)
-        }
+        Some(identity) => Some(&identity) != exclude && tracked.contains(&identity.namespace),
         None => false,
     }
 }
@@ -4565,7 +4562,11 @@ mod stray_entry_tests {
         )
     }
 
-    fn batched(function_name: HostFunctionName, begin_idx: OplogIndex, response: HostResponse) -> OplogEntry {
+    fn batched(
+        function_name: HostFunctionName,
+        begin_idx: OplogIndex,
+        response: HostResponse,
+    ) -> OplogEntry {
         host_call(
             function_name,
             DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
@@ -4623,7 +4624,10 @@ mod stray_entry_tests {
         )
     }
 
-    fn batch_identity(function_name: HostFunctionName, begin_idx: OplogIndex) -> StrayEntryIdentity {
+    fn batch_identity(
+        function_name: HostFunctionName,
+        begin_idx: OplogIndex,
+    ) -> StrayEntryIdentity {
         StrayEntryIdentity::new(function_name, IdentityNamespace::Batch(begin_idx))
     }
 
@@ -4778,7 +4782,11 @@ mod stray_entry_tests {
     fn each_deferred_entry_is_returned_to_its_own_owner() {
         let a = OplogIndex::from_u64(42);
         let mut cache: HashMap<StrayEntryIdentity, HostResponse> = HashMap::new();
-        for entry in [http_stream_check_write(a), http_stream_write(a), http_stream_read(a)] {
+        for entry in [
+            http_stream_check_write(a),
+            http_stream_write(a),
+            http_stream_read(a),
+        ] {
             let identity = stray_entry_identity(&entry).expect("tracked shape");
             let OplogEntry::HostCall { response, .. } = entry else {
                 unreachable!()
@@ -4831,11 +4839,8 @@ mod stray_entry_tests {
     #[test]
     fn scan_accepts_at_most_one_entry_per_identity() {
         let a = OplogIndex::from_u64(42);
-        let mut scan = StrayEntryScan::new(
-            tracked([IdentityNamespace::Batch(a)]),
-            None,
-            HashSet::new(),
-        );
+        let mut scan =
+            StrayEntryScan::new(tracked([IdentityNamespace::Batch(a)]), None, HashSet::new());
 
         assert!(scan.accept(&http_stream_check_write(a)));
         // Different identity (same request, other function) — still acceptable.
@@ -4864,7 +4869,10 @@ mod stray_entry_tests {
     #[test]
     fn identity_covers_every_supported_entry_kind() {
         let idx = OplogIndex::from_u64(3);
-        assert_eq!(stray_entry_identity(&io_poll_ready(9)), Some(pollable_identity(9)));
+        assert_eq!(
+            stray_entry_identity(&io_poll_ready(9)),
+            Some(pollable_identity(9))
+        );
         assert_eq!(
             stray_entry_identity(&golem_rpc_invoke_get(4)),
             Some(invoke_identity(4))
@@ -4902,34 +4910,89 @@ mod stray_entry_tests {
         let idx = OplogIndex::from_u64(7);
         let tracked_set = tracked([IdentityNamespace::Batch(idx)]);
 
-        let no_bytes = HostResponse::StreamWriteResult(HostResponseStreamWriteResult { result: Ok(()) });
+        let no_bytes =
+            HostResponse::StreamWriteResult(HostResponseStreamWriteResult { result: Ok(()) });
         let skip = HostResponse::StreamSkip(HostResponseStreamSkip { result: Ok(0) });
         let chunk = HostResponse::StreamChunk(HostResponseStreamChunk { result: Ok(vec![]) });
 
         let uncovered = [
             // HTTP response / trailers completion futures — §14.2.1's silent-misdelivery risk.
-            (HostFunctionName::HttpTypesFutureIncomingResponseGet, chunk.clone()),
+            (
+                HostFunctionName::HttpTypesFutureIncomingResponseGet,
+                chunk.clone(),
+            ),
             (HostFunctionName::HttpTypesFutureTrailersGet, chunk.clone()),
             // Incoming body stream.
-            (HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead, chunk.clone()),
-            (HostFunctionName::HttpTypesIncomingBodyStreamSkip, skip.clone()),
-            (HostFunctionName::HttpTypesIncomingBodyStreamBlockingSkip, skip.clone()),
+            (
+                HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::HttpTypesIncomingBodyStreamSkip,
+                skip.clone(),
+            ),
+            (
+                HostFunctionName::HttpTypesIncomingBodyStreamBlockingSkip,
+                skip.clone(),
+            ),
             // Outgoing body stream.
-            (HostFunctionName::HttpTypesOutgoingBodyStreamFlush, no_bytes.clone()),
-            (HostFunctionName::HttpTypesOutgoingBodyStreamBlockingFlush, no_bytes.clone()),
-            (HostFunctionName::HttpTypesOutgoingBodyStreamWriteZeroes, no_bytes.clone()),
-            (HostFunctionName::HttpTypesOutgoingBodyStreamSplice, skip.clone()),
-            (HostFunctionName::HttpTypesOutgoingBodyStreamBlockingSplice, skip.clone()),
+            (
+                HostFunctionName::HttpTypesOutgoingBodyStreamFlush,
+                no_bytes.clone(),
+            ),
+            (
+                HostFunctionName::HttpTypesOutgoingBodyStreamBlockingFlush,
+                no_bytes.clone(),
+            ),
+            (
+                HostFunctionName::HttpTypesOutgoingBodyStreamWriteZeroes,
+                no_bytes.clone(),
+            ),
+            (
+                HostFunctionName::HttpTypesOutgoingBodyStreamSplice,
+                skip.clone(),
+            ),
+            (
+                HostFunctionName::HttpTypesOutgoingBodyStreamBlockingSplice,
+                skip.clone(),
+            ),
             // RDBMS result streams, all three dialects.
-            (HostFunctionName::RdbmsMysqlDbConnectionQueryStream, chunk.clone()),
-            (HostFunctionName::RdbmsMysqlDbResultStreamGetColumns, chunk.clone()),
-            (HostFunctionName::RdbmsMysqlDbResultStreamGetNext, chunk.clone()),
-            (HostFunctionName::RdbmsPostgresDbConnectionQueryStream, chunk.clone()),
-            (HostFunctionName::RdbmsPostgresDbResultStreamGetColumns, chunk.clone()),
-            (HostFunctionName::RdbmsPostgresDbResultStreamGetNext, chunk.clone()),
-            (HostFunctionName::RdbmsIgnite2DbConnectionQueryStream, chunk.clone()),
-            (HostFunctionName::RdbmsIgnite2DbResultStreamGetColumns, chunk.clone()),
-            (HostFunctionName::RdbmsIgnite2DbResultStreamGetNext, chunk.clone()),
+            (
+                HostFunctionName::RdbmsMysqlDbConnectionQueryStream,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsMysqlDbResultStreamGetColumns,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsMysqlDbResultStreamGetNext,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsPostgresDbConnectionQueryStream,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsPostgresDbResultStreamGetColumns,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsPostgresDbResultStreamGetNext,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsIgnite2DbConnectionQueryStream,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsIgnite2DbResultStreamGetColumns,
+                chunk.clone(),
+            ),
+            (
+                HostFunctionName::RdbmsIgnite2DbResultStreamGetNext,
+                chunk.clone(),
+            ),
         ];
 
         let mut scan = StrayEntryScan::new(
@@ -5336,7 +5399,11 @@ impl PrivateDurableWorkerState {
     /// Records an answer consumed early by a DIFFERENT operation's stray-scan, for
     /// `identity`'s real owner to collect — see `pre_resolved_stray`'s field doc comment.
     /// The payload is stored undecoded; the owner narrows it to its own response type.
-    pub fn record_pre_resolved_stray(&mut self, identity: StrayEntryIdentity, response: HostResponse) {
+    pub fn record_pre_resolved_stray(
+        &mut self,
+        identity: StrayEntryIdentity,
+        response: HostResponse,
+    ) {
         debug!(
             agent_id = %self.owned_agent_id,
             ?identity,
@@ -5349,7 +5416,10 @@ impl PrivateDurableWorkerState {
     /// stray-scan already consumed its entry on its behalf. Consulted BEFORE any oplog read: if
     /// present, the oplog has nothing left to find for this identity (already durably
     /// consumed), so this is the only remaining source of the answer.
-    pub fn take_pre_resolved_stray(&mut self, identity: &StrayEntryIdentity) -> Option<HostResponse> {
+    pub fn take_pre_resolved_stray(
+        &mut self,
+        identity: &StrayEntryIdentity,
+    ) -> Option<HostResponse> {
         let taken = self.pre_resolved_stray.remove(identity);
         if taken.is_some() {
             debug!(
@@ -5559,7 +5629,12 @@ impl PrivateDurableWorkerState {
                 .copied()
                 .map(IdentityNamespace::InvokeResult),
         );
-        namespaces.extend(self.open_batches.iter().copied().map(IdentityNamespace::Batch));
+        namespaces.extend(
+            self.open_batches
+                .iter()
+                .copied()
+                .map(IdentityNamespace::Batch),
+        );
         TrackedConcurrentOpSeqs::new(namespaces)
     }
 

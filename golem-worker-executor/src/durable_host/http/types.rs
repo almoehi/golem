@@ -1223,12 +1223,16 @@ impl<Ctx: WorkerCtx> HostFutureIncomingResponse for DurableWorkerCtx<Ctx> {
             // `handle()`; when it is not (post-snapshot-restore mid-request), no batch is
             // registered either, so the mechanism correctly stays out of the way and the
             // original unconditional read is used unchanged.
-            let my_identity = self.state.open_http_requests.get(&handle).map(|request_state| {
-                StrayEntryIdentity::new(
-                    HttpTypesFutureIncomingResponseGet::HOST_FUNCTION_NAME,
-                    IdentityNamespace::Batch(request_state.begin_index),
-                )
-            });
+            let my_identity = self
+                .state
+                .open_http_requests
+                .get(&handle)
+                .map(|request_state| {
+                    StrayEntryIdentity::new(
+                        HttpTypesFutureIncomingResponseGet::HOST_FUNCTION_NAME,
+                        IdentityNamespace::Batch(request_state.begin_index),
+                    )
+                });
 
             let cached = match &my_identity {
                 Some(identity) => match self.state.take_pre_resolved_stray(identity) {

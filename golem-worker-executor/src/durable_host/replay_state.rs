@@ -982,9 +982,7 @@ mod tests {
         let io_poll_ready = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollReady,
-            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
-                HostRequestNoInput {},
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
                 HostResponsePollReady { result: Ok(true) },
             ))),
@@ -1043,9 +1041,9 @@ mod tests {
         let io_poll_poll = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollPoll,
-            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
-                HostRequestPollCount { count: 1 },
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(HostRequestPollCount {
+                count: 1,
+            }))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
                 HostResponsePollResult {
                     result: Ok(vec![0]),
@@ -1141,12 +1139,12 @@ mod tests {
     /// consumes `HttpTypesOutgoingBodyStreamCheckWrite` entries.
     #[test]
     async fn try_get_oplog_entry_matches_http_outgoing_check_write() {
+        use golem_common::model::oplog::host_functions::HostFunctionName;
+        use golem_common::model::oplog::types::SerializableHttpMethod;
         use golem_common::model::oplog::{
             DurableFunctionType, HostRequest, HostRequestHttpRequest, HostResponse,
             HostResponseStreamCheckWrite, OplogPayload,
         };
-        use golem_common::model::oplog::host_functions::HostFunctionName;
-        use golem_common::model::oplog::types::{SerializableHttpMethod};
         use std::collections::HashMap;
 
         let agent_id = AgentId {
@@ -1216,11 +1214,11 @@ mod tests {
     /// remain unconsumed for `poll()`'s normal replay path.
     #[test]
     async fn try_get_oplog_entry_does_not_match_io_poll_poll_for_check_write_predicate() {
+        use golem_common::model::oplog::host_functions::HostFunctionName;
         use golem_common::model::oplog::{
             DurableFunctionType, HostRequest, HostRequestPollCount, HostResponse,
             HostResponsePollResult, OplogPayload,
         };
-        use golem_common::model::oplog::host_functions::HostFunctionName;
 
         let agent_id = AgentId {
             component_id: ComponentId::new(),
@@ -1230,9 +1228,9 @@ mod tests {
         let poll_entry = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollPoll,
-            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
-                HostRequestPollCount { count: 1 },
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(HostRequestPollCount {
+                count: 1,
+            }))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
                 HostResponsePollResult {
                     result: Ok(vec![0]),
@@ -1310,9 +1308,7 @@ mod tests {
         let io_poll_ready_for_p_stream = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollReady,
-            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
-                HostRequestNoInput {},
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
                 HostResponsePollReady { result: Ok(true) },
             ))),
@@ -1398,9 +1394,7 @@ mod tests {
         let pre_snapshot_ready = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollReady,
-            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
-                HostRequestNoInput {},
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
                 HostResponsePollReady { result: Ok(true) },
             ))),
@@ -1409,9 +1403,7 @@ mod tests {
         let post_snapshot_ready = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollReady,
-            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
-                HostRequestNoInput {},
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
                 HostResponsePollReady { result: Ok(true) },
             ))),
@@ -1441,10 +1433,11 @@ mod tests {
         ])));
 
         let last_snapshot_index = OplogIndex::from_u64(4);
-        let skipped_regions = DeletedRegionsBuilder::from_regions(vec![
-            OplogRegion::from_index_range(OplogIndex::INITIAL.next()..=last_snapshot_index),
-        ])
-        .build();
+        let skipped_regions =
+            DeletedRegionsBuilder::from_regions(vec![OplogRegion::from_index_range(
+                OplogIndex::INITIAL.next()..=last_snapshot_index,
+            )])
+            .build();
 
         let mut state = ReplayState::new(
             OwnedAgentId::new(EnvironmentId::new(), &agent_id),
@@ -1503,9 +1496,7 @@ mod tests {
         let io_poll_ready_for_p_stream = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollReady,
-            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
-                HostRequestNoInput {},
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
                 HostResponsePollReady { result: Ok(true) },
             ))),
@@ -1679,9 +1670,7 @@ mod tests {
         let io_poll_ready = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollReady,
-            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(
-                HostRequestNoInput {},
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
                 HostResponsePollReady { result: Ok(true) },
             ))),
@@ -1690,9 +1679,9 @@ mod tests {
         let io_poll_poll = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollPoll,
-            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
-                HostRequestPollCount { count: 1 },
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(HostRequestPollCount {
+                count: 1,
+            }))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
                 HostResponsePollResult {
                     result: Ok(vec![0]),
@@ -1793,11 +1782,13 @@ mod tests {
         let genuine = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollPoll,
-            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
-                HostRequestPollCount { count: 2 },
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(HostRequestPollCount {
+                count: 2,
+            }))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
-                HostResponsePollResult { result: Ok(vec![0]) },
+                HostResponsePollResult {
+                    result: Ok(vec![0]),
+                },
             ))),
             durable_function_type: DurableFunctionType::ReadLocal,
         };
@@ -1887,11 +1878,13 @@ mod tests {
         let genuine = OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollPoll,
-            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
-                HostRequestPollCount { count: 1 },
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(HostRequestPollCount {
+                count: 1,
+            }))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
-                HostResponsePollResult { result: Ok(vec![0]) },
+                HostResponsePollResult {
+                    result: Ok(vec![0]),
+                },
             ))),
             durable_function_type: DurableFunctionType::ReadLocal,
         };
@@ -1942,7 +1935,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(genuine_found.is_some(), "poll()'s entry must remain, untouched");
+        assert!(
+            genuine_found.is_some(),
+            "poll()'s entry must remain, untouched"
+        );
     }
 
     /// "Before" half of the bidirectional falsification for the Eleventh capture: reproduces
@@ -1958,11 +1954,11 @@ mod tests {
     /// fallback.
     #[test]
     async fn old_unconditional_consume_would_have_hit_eleventh_capture_mismatch() {
+        use golem_common::model::oplog::types::SerializableInvokeResult;
         use golem_common::model::oplog::{
             DurableFunctionType, HostRequest, HostRequestNoInput, HostResponse,
             HostResponseGolemRpcInvokeGet, OplogPayload,
         };
-        use golem_common::model::oplog::types::SerializableInvokeResult;
 
         let agent_id = AgentId {
             component_id: ComponentId::new(),
@@ -2146,9 +2142,10 @@ mod tests {
             replay_state_over(vec![rpc_invoke_get_entry(seq_live), finish_span_entry()]).await;
 
         // The stray-scan misclassifies the caller's own entry (identity drift) and consumes it.
-        let tracked = TrackedConcurrentOpSeqs::new(HashSet::from([
-            IdentityNamespace::InvokeResult(seq_live),
-        ]));
+        let tracked =
+            TrackedConcurrentOpSeqs::new(HashSet::from([IdentityNamespace::InvokeResult(
+                seq_live,
+            )]));
         let exclude = StrayEntryIdentity::new(
             HostFunctionName::GolemRpcFutureInvokeResultGet,
             IdentityNamespace::InvokeResult(seq_replay),
@@ -2388,9 +2385,11 @@ mod tests {
         let b = OplogIndex::from_u64(20);
 
         // The pre-fix failure mode, pinned: a positional read at A's turn returns B's entry.
-        let mut naive =
-            replay_state_over(vec![future_response_entry(b, 202), future_response_entry(a, 201)])
-                .await;
+        let mut naive = replay_state_over(vec![
+            future_response_entry(b, 202),
+            future_response_entry(a, 201),
+        ])
+        .await;
         let (_, first) = naive
             .try_get_oplog_entry(|_| true)
             .await
@@ -2404,9 +2403,11 @@ mod tests {
         );
 
         // With the mechanism: A defers B's entry into the cache and reads its own.
-        let mut state =
-            replay_state_over(vec![future_response_entry(b, 202), future_response_entry(a, 201)])
-                .await;
+        let mut state = replay_state_over(vec![
+            future_response_entry(b, 202),
+            future_response_entry(a, 201),
+        ])
+        .await;
         let tracked = TrackedConcurrentOpSeqs::new(HashSet::from([
             IdentityNamespace::Batch(a),
             IdentityNamespace::Batch(b),
@@ -2526,7 +2527,9 @@ mod tests {
             batched_entry(
                 HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
                 begin_idx,
-                HostResponse::StreamChunk(HostResponseStreamChunk { result: Ok(vec![1]) }),
+                HostResponse::StreamChunk(HostResponseStreamChunk {
+                    result: Ok(vec![1]),
+                }),
             ),
             batched_entry(
                 HostFunctionName::HttpTypesIncomingBodyStreamSkip,
@@ -2689,7 +2692,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(consumed.is_empty(), "nothing may be deferred with no open batch");
+        assert!(
+            consumed.is_empty(),
+            "nothing may be deferred with no open batch"
+        );
         let survivor = state
             .try_get_oplog_entry(|e| {
                 matches!(
@@ -2707,5 +2713,4 @@ mod tests {
             "the check_write entry must still be at the cursor for its own bare read"
         );
     }
-
 }

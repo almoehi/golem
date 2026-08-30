@@ -37,9 +37,9 @@ use golem_common::model::environment::EnvironmentId;
 use golem_common::model::invocation_context::InvocationContextStack;
 use golem_common::model::invocation_context::{AttributeValue, InvocationContextSpan, SpanId};
 use golem_common::model::oplog::host_functions::{
-    GolemRpcCancellationTokenCancel, GolemRpcFutureInvokeResultCancel, HostFunctionName,
+    GolemRpcCancellationTokenCancel, GolemRpcFutureInvokeResultCancel,
     GolemRpcFutureInvokeResultGet, GolemRpcWasmRpcInvoke, GolemRpcWasmRpcInvokeAndAwaitResult,
-    GolemRpcWasmRpcScheduleInvocation,
+    GolemRpcWasmRpcScheduleInvocation, HostFunctionName,
 };
 use golem_common::model::oplog::types::{SerializableInvokeResult, SerializableScheduleId};
 use golem_common::model::oplog::{

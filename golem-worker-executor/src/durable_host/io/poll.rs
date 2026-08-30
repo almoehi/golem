@@ -14,7 +14,9 @@
 
 use crate::durable_host::durability::InFunctionRetryHost;
 use crate::durable_host::wasm_rpc::delete_future_invoke_result;
-use crate::durable_host::{Durability, DurabilityHost, DurableWorkerCtx, SuspendForSleep};
+use crate::durable_host::{
+    Durability, DurabilityHost, DurableWorkerCtx, SuspendForSleep, is_own_poll_entry,
+};
 use crate::metrics::ephemeral::{dec_promise_waiting, inc_promise_waiting};
 use crate::services::oplog::OplogOps;
 use crate::services::{HasOplog, HasWorker};
@@ -417,15 +419,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
             let peeked = self
                 .state
                 .replay_state
-                .try_get_oplog_entry(|entry| {
-                    matches!(
-                        entry,
-                        OplogEntry::HostCall {
-                            function_name: HostFunctionName::IoPollPoll,
-                            ..
-                        }
-                    )
-                })
+                .try_get_oplog_entry(is_own_poll_entry)
                 .await?;
 
             match peeked {

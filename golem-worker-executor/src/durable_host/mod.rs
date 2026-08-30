@@ -4363,6 +4363,44 @@ pub fn stray_entry_identity(entry: &OplogEntry) -> Option<StrayEntryIdentity> {
     }
 }
 
+/// Does this oplog entry positively identify as the `get()` call whose `invoke_result_seq` is
+/// `my_invoke_result_seq`?
+///
+/// A replay consumer may only consume an entry it has positively identified as its own
+/// (FINDING_B_FIX_DESIGN.md §13.7.2) — a read that consumes first and validates afterwards
+/// destroys structural entries (`FinishSpan`, `EndAtomicRegion`, ...) it had no business
+/// reading, turning any identity drift into a permanent trap. Legacy untagged entries
+/// (`WriteRemote`, recorded before per-call tagging existed) carry no identity and are still
+/// consumed positionally, exactly as before.
+pub fn is_own_invoke_result_entry(entry: &OplogEntry, my_invoke_result_seq: u32) -> bool {
+    match entry {
+        OplogEntry::HostCall {
+            function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
+            durable_function_type: DurableFunctionType::WriteRemoteConcurrent(seq),
+            ..
+        } => *seq == my_invoke_result_seq,
+        OplogEntry::HostCall {
+            function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
+            durable_function_type: DurableFunctionType::WriteRemote,
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// Does this oplog entry positively identify as a `poll()` call's own entry? Same invariant as
+/// `is_own_invoke_result_entry`; `poll()` has no per-call identity beyond the entry kind, since
+/// only one `poll()` can be in flight per agent at a time.
+pub fn is_own_poll_entry(entry: &OplogEntry) -> bool {
+    matches!(
+        entry,
+        OplogEntry::HostCall {
+            function_name: HostFunctionName::IoPollPoll,
+            ..
+        }
+    )
+}
+
 /// Stateful predicate driving one `consume_stray_entries` walk.
 ///
 /// Recognition alone (`is_stray_concurrent_entry`) is not a safe consumption rule: every
@@ -4383,6 +4421,22 @@ pub struct StrayEntryScan {
 }
 
 impl StrayEntryScan {
+    /// `already_cached` are identities whose pre-resolved answer is still waiting to be
+    /// collected by its owner — treated exactly like "already consumed by this scan".
+    pub fn new(
+        tracked: TrackedConcurrentOpSeqs,
+        exclude_invoke_result_seq: Option<u32>,
+        exclude_http_begin_idx: Option<OplogIndex>,
+        already_cached: HashSet<StrayEntryIdentity>,
+    ) -> Self {
+        Self {
+            tracked,
+            exclude_invoke_result_seq,
+            exclude_http_begin_idx,
+            consumed: already_cached,
+        }
+    }
+
     /// Decides whether the entry at the replay cursor may be consumed as a stray by this scan.
     pub fn accept(&mut self, entry: &OplogEntry) -> bool {
         if !is_stray_concurrent_entry(
@@ -4458,6 +4512,32 @@ mod stray_entry_tests {
             request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
             response: OplogPayload::Inline(Box::new(HostResponse::StreamChunk(
                 HostResponseStreamChunk { result: Ok(vec![]) },
+            ))),
+            durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
+        }
+    }
+
+    fn http_stream_check_write(begin_idx: OplogIndex) -> OplogEntry {
+        OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
+            response: OplogPayload::Inline(Box::new(HostResponse::StreamCheckWrite(
+                HostResponseStreamCheckWrite {
+                    result: Ok(1048576),
+                },
+            ))),
+            durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
+        }
+    }
+
+    fn http_stream_write(begin_idx: OplogIndex) -> OplogEntry {
+        OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::HttpTypesOutgoingBodyStreamWrite,
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
+            response: OplogPayload::Inline(Box::new(HostResponse::StreamWriteWithBytes(
+                HostResponseStreamWriteWithBytes { result: Ok(vec![]) },
             ))),
             durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
         }
@@ -4560,6 +4640,133 @@ mod stray_entry_tests {
             None,
             Some(a)
         ));
+    }
+
+    /// Twelfth/thirteenth capture's shape (FINDING_B_FIX_DESIGN.md §12): an outgoing-body
+    /// `check_write`/`write` entry recognized as a stray from a `poll()` context (no HTTP
+    /// identity of its own to exclude) whenever its request is currently open. Without this,
+    /// one ordinary multi-chunk `fetch()` traps replay with "expected io::poll::poll, got
+    /// http::types::outgoing_body_stream::check_write".
+    #[test]
+    fn recognizes_tracked_http_outgoing_write_strays_from_poll_context() {
+        let a = OplogIndex::from_u64(42);
+        let tracked = TrackedConcurrentOpSeqs {
+            http_begin_indexes: HashSet::from([a]),
+            ..empty_tracked()
+        };
+        assert!(is_stray_concurrent_entry(
+            &http_stream_check_write(a),
+            &tracked,
+            None,
+            None
+        ));
+        assert!(is_stray_concurrent_entry(
+            &http_stream_write(a),
+            &tracked,
+            None,
+            None
+        ));
+        // An entry for a request that is not open is never a stray.
+        let other = OplogIndex::from_u64(99);
+        assert!(!is_stray_concurrent_entry(
+            &http_stream_check_write(other),
+            &tracked,
+            None,
+            None
+        ));
+    }
+
+    /// `exclude_http_begin_idx` is per-REQUEST, not per-direction (§12.5): a `read()` on
+    /// request A must leave A's own `check_write`/`write` entries for their own calls, while
+    /// still recognizing a concurrent request B's.
+    #[test]
+    fn excludes_own_http_request_identity_across_both_directions() {
+        let a = OplogIndex::from_u64(10);
+        let b = OplogIndex::from_u64(20);
+        let tracked = TrackedConcurrentOpSeqs {
+            http_begin_indexes: HashSet::from([a, b]),
+            ..empty_tracked()
+        };
+        for entry in [http_stream_check_write(a), http_stream_write(a)] {
+            assert!(
+                !is_stray_concurrent_entry(&entry, &tracked, None, Some(a)),
+                "my own request's other-direction entry must not be swallowed"
+            );
+        }
+        for entry in [http_stream_check_write(b), http_stream_write(b)] {
+            assert!(
+                is_stray_concurrent_entry(&entry, &tracked, None, Some(a)),
+                "a concurrent request's entry is still a stray"
+            );
+        }
+    }
+
+    /// The scan bound (§12.6 fallout): `check_write`/`write` occur in lockstep, many times per
+    /// request, so recognition alone would let one scan run away through a whole write cluster
+    /// and keep only the last answer of each kind (the caches hold one answer per identity).
+    /// A scan must accept at most ONE entry per identity and stop at the second.
+    #[test]
+    fn scan_accepts_at_most_one_entry_per_identity() {
+        let a = OplogIndex::from_u64(42);
+        let tracked = TrackedConcurrentOpSeqs {
+            http_begin_indexes: HashSet::from([a]),
+            ..empty_tracked()
+        };
+        let mut scan = StrayEntryScan::new(tracked, None, None, HashSet::new());
+
+        assert!(scan.accept(&http_stream_check_write(a)));
+        // Different identity (same request, other direction) — still acceptable.
+        assert!(scan.accept(&http_stream_write(a)));
+        // Second occurrence of an identity already consumed by this scan: refused, so the
+        // entry stays at the cursor for its owner instead of overwriting the cached answer.
+        assert!(!scan.accept(&http_stream_check_write(a)));
+        assert!(!scan.accept(&http_stream_write(a)));
+    }
+
+    /// Same bound, sourced from the caches rather than from this scan: an identity whose
+    /// pre-resolved answer has not been collected by its owner yet must not have a second
+    /// entry consumed on top of it.
+    #[test]
+    fn scan_refuses_identities_whose_answer_is_already_cached() {
+        let tracked = TrackedConcurrentOpSeqs {
+            pollable_seqs: HashSet::from([7]),
+            ..empty_tracked()
+        };
+        let mut scan = StrayEntryScan::new(
+            tracked,
+            None,
+            None,
+            HashSet::from([StrayEntryIdentity::Pollable(7)]),
+        );
+        assert!(!scan.accept(&io_poll_ready(7)));
+    }
+
+    /// `stray_entry_identity` is the single source of truth the recognition predicate, the scan
+    /// bound and the decode all read from — assert it maps every supported entry shape.
+    #[test]
+    fn identity_covers_every_supported_entry_kind() {
+        let idx = OplogIndex::from_u64(3);
+        assert_eq!(
+            stray_entry_identity(&io_poll_ready(9)),
+            Some(StrayEntryIdentity::Pollable(9))
+        );
+        assert_eq!(
+            stray_entry_identity(&golem_rpc_invoke_get(4)),
+            Some(StrayEntryIdentity::InvokeResult(4))
+        );
+        assert_eq!(
+            stray_entry_identity(&http_stream_read(idx)),
+            Some(StrayEntryIdentity::HttpStreamRead(idx))
+        );
+        assert_eq!(
+            stray_entry_identity(&http_stream_check_write(idx)),
+            Some(StrayEntryIdentity::HttpStreamCheckWrite(idx))
+        );
+        assert_eq!(
+            stray_entry_identity(&http_stream_write(idx)),
+            Some(StrayEntryIdentity::HttpStreamWrite(idx))
+        );
+        assert_eq!(stray_entry_identity(&io_poll_poll()), None);
     }
 
     /// A genuinely unrelated/unrecognized entry must never be swallowed — this mechanism's
@@ -5093,14 +5300,14 @@ impl PrivateDurableWorkerState {
         exclude_invoke_result_seq: Option<u32>,
         exclude_http_begin_idx: Option<OplogIndex>,
     ) -> StrayEntryScan {
-        StrayEntryScan {
-            tracked: self.tracked_concurrent_op_seqs(),
+        StrayEntryScan::new(
+            self.tracked_concurrent_op_seqs(),
             exclude_invoke_result_seq,
             exclude_http_begin_idx,
             // Pre-seeded with identities whose answer is already cached and uncollected — see
             // `cached_stray_identities`.
-            consumed: self.cached_stray_identities(),
-        }
+            self.cached_stray_identities(),
+        )
     }
 
     /// Walks the replay cursor past every stray entry belonging to a DIFFERENT concurrently-

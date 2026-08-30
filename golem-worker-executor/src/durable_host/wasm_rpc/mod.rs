@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::durable_host::durability::{ClassifiedHostError, HostFailureKind, InFunctionRetryHost};
-use crate::durable_host::{Durability, DurabilityHost, DurableWorkerCtx, InternalRetryResult};
+use crate::durable_host::{
+    Durability, DurabilityHost, DurableWorkerCtx, InternalRetryResult, is_own_invoke_result_entry,
+};
 use crate::preview2::golem::agent::host::{
     CancellationToken, FutureInvokeResult, HostCancellationToken, HostFutureInvokeResult,
     HostWasmRpc, RpcError,
@@ -36,7 +38,7 @@ use golem_common::model::invocation_context::{AttributeValue, InvocationContextS
 use golem_common::model::oplog::host_functions::{
     GolemRpcCancellationTokenCancel, GolemRpcFutureInvokeResultCancel,
     GolemRpcFutureInvokeResultGet, GolemRpcWasmRpcInvoke, GolemRpcWasmRpcInvokeAndAwaitResult,
-    GolemRpcWasmRpcScheduleInvocation, HostFunctionName,
+    GolemRpcWasmRpcScheduleInvocation,
 };
 use golem_common::model::oplog::types::{SerializableInvokeResult, SerializableScheduleId};
 use golem_common::model::oplog::{
@@ -950,20 +952,8 @@ impl<Ctx: WorkerCtx> HostFutureInvokeResult for DurableWorkerCtx<Ctx> {
                 let peeked = self
                     .state
                     .replay_state
-                    .try_get_oplog_entry(|entry| match entry {
-                        OplogEntry::HostCall {
-                            function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
-                            durable_function_type: DurableFunctionType::WriteRemoteConcurrent(seq),
-                            ..
-                        } => *seq == my_invoke_result_seq,
-                        // Legacy, pre-WriteRemoteConcurrent oplogs: untagged entries carry no
-                        // identity, so they are consumed positionally exactly as before.
-                        OplogEntry::HostCall {
-                            function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
-                            durable_function_type: DurableFunctionType::WriteRemote,
-                            ..
-                        } => true,
-                        _ => false,
+                    .try_get_oplog_entry(|entry| {
+                        is_own_invoke_result_entry(entry, my_invoke_result_seq)
                     })
                     .await?;
 

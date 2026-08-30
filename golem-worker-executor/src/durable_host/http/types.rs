@@ -567,11 +567,14 @@ impl<Ctx: WorkerCtx> HostFutureTrailers for DurableWorkerCtx<Ctx> {
 
                 result
             } else {
-                let serialized: HostResponseHttpFutureTrailersGet =
-                    durability
-                        .replay(self)
-                        .await
-                        .map_err(wasmtime::Error::from)?;
+                // Shares the request's batch identity with the body streams, so it is reachable
+                // in exactly the same parked-cursor state (§15.7). `Ok(None)` is its own
+                // "nothing yet" arm — the answer the guest's reactor already knows how to
+                // handle — so it can wind the request down instead of trapping.
+                let serialized: HostResponseHttpFutureTrailersGet = durability
+                    .replay_or(self, HostResponseHttpFutureTrailersGet { result: Ok(None) })
+                    .await
+                    .map_err(wasmtime::Error::from)?;
                 let result = match serialized.result {
                     Ok(Some(Ok(Ok(None)))) => Ok(Some(Ok(Ok(None)))),
                     Ok(Some(Ok(Ok(Some(serialized_trailers))))) => {

@@ -3112,3 +3112,92 @@ If it does not clear, the evidence needed next is the trace window BEFORE the sp
 `#02255`, and whether their answers were ever collected by a `take_pre_resolved_stray`), plus the
 first `POLLCALL_TRACE ... synthesizing` after the cursor reached #02255. The oplog itself is not the
 limiting evidence here; the consumer ordering is.
+
+### 15.7 Live verification round 3 — the same defect, generalized once and for all
+
+`f055798b1` cleared the livelock: `poll()`/`ready()` stopped contradicting each other and the guest's
+control flow genuinely advanced into new code. It then trapped inside `OutputStream::check_write`
+with the identical text (`expected OplogEntry::HostCall, got EndRemoteWrite{begin_index: 2190}`).
+
+#### 15.7.1 There was no separate `check_write` fallback — it was the shared path all along
+
+`check_write` has three replay branches (`io/streams.rs`), and reading them rules out the
+"sibling call site has its own unguarded fallback" theory:
+
+| Branch | Read | Status |
+|---|---|---|
+| `is_http` | `durability.replay(self)` | the SHARED `replay_raw` path |
+| `replaying_http_batch` | `durability.replay(self)` | the SHARED `replay_raw` path |
+| post-snapshot-restore | its own `try_get_oplog_entry` with a name-specific predicate | already guarded, already non-destructive |
+
+So the trap came from `replay_raw` itself, via the §15.5 guarded reader — which correctly refused to
+consume `#02256` and then, having no answer, returned the error. **The guard worked; the error was
+the problem.** `poll()` needed a bespoke fix in §15.6 only because it never goes through
+`Durability` on that path at all.
+
+This reframes the whole class: it is not "each call site has its own fallback to patch". It is one
+shared behaviour — *what `replay_raw` does when the recorded region is exhausted* — that was wrong
+for every tracked consumer at once.
+
+#### 15.7.2 The general rule
+
+A parked structural cursor means the guest is executing MORE calls on a resource than the live run
+recorded. That is not a corrupt oplog and not a mis-ordering — there is genuinely nothing left to
+replay for that resource. Trapping is wrong twice over: the marker's owner (`end_function`, the span
+machinery) is driven by GUEST CONTROL FLOW rather than by consuming the cursor, so (a) the cursor can
+only move once the guest winds the operation down, and (b) trapping is exactly what stops it. The
+correct answer is the operation's own terminal value, which every affected function already has.
+
+#### 15.7.3 Fix — `Durability::replay_or`
+
+`replay_raw` is refactored into `replay_raw_opt`, returning `Ok(None)` for the parked case. Both
+branches (tracked and untracked) now use the `try_` reader, so the condition is detected uniformly.
+
+- `replay_raw`/`replay` — unchanged error surface. Callers with no terminal answer behave exactly as
+  before.
+- `replay_or(ctx, exhausted)` — returns `exhausted` on a parked cursor, after `end_durable_function`.
+  Fires ONLY on a parked structural cursor: a foreign `HostCall` at the cursor still errors, because
+  that entry has a real consumer that will claim it and move things along.
+
+**Wired at every tracked stream/HTTP consumer in one pass** — 16 sites, not just the two that had
+failed, so the failure cannot simply relocate one call later (§12.6's lockstep lesson):
+
+| Site | Terminal answer |
+|---|---|
+| `read`, `blocking_read` (`StreamChunk`) | `Err(SerializableStreamError::Closed)` |
+| `skip`, `blocking_skip`, `splice`, `blocking_splice` (`StreamSkip`) | `Err(Closed)` |
+| `check_write` ×2 (`StreamCheckWrite`) | `Err(Closed)` |
+| `write` ×2, `blocking_write_and_flush` (`StreamWriteWithBytes`) | `Err(Closed)` |
+| `flush`, `blocking_flush` (`StreamWriteResult`) | `Err(Closed)` |
+| `write_zeroes`, `blocking_write_zeroes_and_flush` (`StreamWriteZeroes`) | `Err(Closed)` |
+| `future_trailers::get` (`HttpFutureTrailersGet`) | `Ok(None)` |
+
+`future_incoming_response::get` already returns `Pending` on this condition (§15.5) and is unchanged.
+
+#### 15.7.4 Tracked list — what still has today's erroring behaviour
+
+Audited exhaustively rather than assumed. Every other `durability.replay(...)` in the crate
+(blobstore, clocks, sockets, websocket, keyvalue, the non-stream RDBMS calls) constructs an
+**untracked** `DurableFunctionType` — `WriteRemote`/`ReadRemote`/`ReadLocal` — so no scan can ever
+defer its entries and it cannot be parked by this mechanism. They are unaffected by design, not
+merely unfixed.
+
+The only tracked consumers left on the erroring path are **three RDBMS result-stream sites**, all
+`WriteRemoteBatched(Some(_))` (`rdbms/mod.rs`): `db_connection_durable_query_stream`,
+`db_result_stream_durable_get_columns`, `db_result_stream_durable_get_next`. They have the same shape
+and would take `Ok(None)`-style terminal answers, but there is no observed concurrent
+query-stream workload (§14.9's caveat) and no way to exercise them here, so they are listed rather
+than speculatively wired. The `WriteRemoteTransaction(Some(_))` sites remain out of scope per
+§14.7(c) — they do not participate in the stray mechanism at all.
+
+#### 15.7.5 Test results
+
+Release build and `cargo clippy --release --lib --tests` clean.
+`cargo test -p golem-worker-executor --lib --release` = **501 passed, 0 failed, 0 ignored, 0
+filtered** (498 after §15.6, +3).
+
+| Test | Asserts |
+|---|---|
+| `replay_or_returns_the_exhausted_answer_on_a_parked_cursor` | The live shape via the mock host: the reader reports a parked cursor and `replay_or` returns the caller's terminal answer instead of trapping — and `host_call_reads == 1`, proving the reader really was consulted rather than the result being faked by never reading. |
+| `replay_still_errors_on_a_parked_cursor` | The unchanged half: a caller with no terminal answer gets the same error as before on the same cursor. |
+| `replay_or_returns_the_recorded_answer_when_one_is_present` | `replay_or` must not shadow a real recorded answer — the wrong-way bug here would silently feed every replay a terminal value. |

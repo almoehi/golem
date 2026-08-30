@@ -482,11 +482,15 @@ run before `consume_stray_ready_entries` existed, was a compile error — the st
   worktree has never had those built, in any round of this investigation; only
   `agent_rpc_rust`, `host_api_tests`, and `agent_counters` are available locally.
 
-## 8. v3 — generalizing beyond `IoPollReady` (Eleventh capture)
+## 8. v3/v4 — generalizing beyond `IoPollReady` (Eleventh capture), fully resolved
 
-Status: **DESIGN ONLY — not implemented.** Presented for review before coding, per explicit
-request — larger scope than v1/v2, touches a second call site and a new `DurableFunctionType`
-variant.
+Status: **DESIGN ONLY — not implemented, all open questions resolved (§8.10).** Presented for
+review before coding, per explicit request — larger scope than v1/v2: three call sites
+(`poll()`, `get()`, HTTP body streams), a new `DurableFunctionType` variant, and a new
+snapshot-recovered counter. §8.2's first draft (`begin_index` as the RPC identity) was found
+unsound during this revision's own re-verification and replaced (§8.2.1-8.2.2) — see §8.10 for
+the full resolution summary of all three original open questions plus the newly-completed HTTP
+investigation.
 
 ### 8.1 What the Eleventh capture showed
 
@@ -513,7 +517,7 @@ to match the guest's replayed structural check order), but this time the racing 
 RPC calls themselves (`golem::rpc::future-invoke-result::get`), not `io::poll` pollables — and
 the shipped fix only recognizes `IoPollReady` strays.
 
-### 8.2 Is there already a shared identity mechanism across entry types?
+### 8.2 Is there already a shared identity mechanism across entry types? (REVISED — see 8.2.1)
 
 No. `ReadLocalPollable(seq)` is a pollable-specific `DurableFunctionType` tag; RPC's
 `future-invoke-result::get()` entries are tagged plain, untagged `DurableFunctionType::WriteRemote`
@@ -522,37 +526,108 @@ No. `ReadLocalPollable(seq)` is a pollable-specific `DurableFunctionType` tag; R
 OplogEntry::HostCall)` macro `poll()`'s replay used before the Finding B fix. This needs a new
 identity to be introduced, not reused.
 
-**Deliberately NOT mirroring `pollable_seq`'s design.** `pollable_seq` is a monotonic counter
-("the Nth distinct pollable observed since this in-memory instance was constructed"), which is
-exactly what made the Eighth capture's bug possible in the first place: the counter's *value* is
-not recoverable from a fresh instance without embedding it in the snapshot entry
-(`recover_next_pollable_seq`, the Option 2 fix's entire mechanism). Introducing a second such
-counter for RPC calls would mean replicating that whole snapshot-recovery apparatus a second
-time — real, avoidable risk.
+#### 8.2.1 REVISED: the `begin_index` idea (as first proposed) is UNSOUND — traced and rejected
 
-**Instead: use the call's own `begin_index` (an `OplogIndex`) as its identity.**
-`FutureInvokeResultState` (`wasm_rpc/mod.rs:1528-1596`) already carries `begin_index: OplogIndex`
-in every variant (`Pending`/`Completed`/`Deferred`/`Cancelled`/`Consumed`), with a `begin_index()`
-accessor — the oplog position where this specific call's `WriteRemote` region began
-(`Durability::<GolemRpcWasmRpcInvokeAndAwaitResult>::new(..., DurableFunctionType::WriteRemote)`'s
-own `begin_function()` call). An `OplogIndex` is **not a counter that needs recovering** — it's a
-direct reference to an immutable, already-persisted oplog position, identical on live and replay
-by construction (replay reconstructs the exact same sequence of positions), with no "value at
-construction time" ambiguity to solve. This sidesteps the entire class of risk the counter-based
-design carries, and needs no analog of `recover_next_pollable_seq` at all.
+The first draft of this section proposed using the RPC call's own `begin_index: OplogIndex`
+(already tracked in `FutureInvokeResultState`) as its identity, specifically to avoid
+`pollable_seq`'s counter-recovery complexity. Tracing the actual computation to the same depth as
+the original `pollable_seq`/Eighth-capture investigation (per explicit request) found a concrete
+flaw that rules this out.
 
-**New `DurableFunctionType` variant**: `WriteRemoteConcurrent(OplogIndex)` — semantically "a
-`WriteRemote` call that can race concurrently with sibling calls of the same shape, tagged by the
-call's own begin_index for replay identity matching," mirroring `ReadLocalPollable(u32)`'s role
-for pollables. `HostFutureInvokeResult::get`'s LIVE path tags its persisted entry with this
-instead of plain `WriteRemote`.
+**Where `begin_index` actually comes from** (`async_invoke_and_await`, `wasm_rpc/mod.rs:412-414`,
+called unconditionally live or replay — no `is_live()` gate above it):
 
-**Backward compatible with already-persisted oplogs**: `get()`'s existing REPLAY fallback
-(`get_oplog_entry!`, unconditional) is left completely unchanged as the final step after
-stray-scanning (§8.4) — an old, untagged `WriteRemote` entry simply never matches the new
-stray-recognition predicate (which only recognizes `WriteRemoteConcurrent(_)`), so it falls
-straight through to the unchanged unconditional read, exactly as today. Nothing about old
-recordings' replay behavior changes.
+```rust
+let begin_index = self.begin_function(&DurableFunctionType::WriteRemote).await?;
+```
+
+`begin_function` (`durable_host/mod.rs:1192`) has two branches depending on
+`assume_idempotence`. **Confirmed**: `assume_idempotence` is hardcoded `true` at construction
+(`durable_host/mod.rs:4292`, `PrivateDurableWorkerState::new()` — not a per-agent config this
+engine exposes as configurable to `false` in practice), so `DurableFunctionType::WriteRemote`
+calls with `assume_idempotence == true` always take the **second** branch
+(`durable_host/mod.rs:1310-1322`), which does NOT write an explicit `BeginRemoteWrite` entry —
+it computes a "current position" value directly:
+
+```rust
+let begin_index = if self.state.replay_state.is_live() {
+    self.state.oplog.current_oplog_index().await          // LIVE
+} else {
+    self.state.replay_state.last_replayed_non_hint_index() // REPLAY
+};
+```
+
+**The flaw**: `current_oplog_index()` (live) reflects the position of the **last entry written,
+of any kind, including hints**. `last_replayed_non_hint_index()` (replay) — per its own name and
+the `begin_function` comment directly above the code that uses it ("hint entries must be ignored
+because they are nondeterministic") — **explicitly excludes hint entries**, tracking only the
+last *non-hint* entry replay has consumed. `OplogEntry::is_hint()` includes real, routinely-fired
+entry kinds — critically, `Log` (confirmed via `golem-common/src/base_model/oplog/mod.rs`'s
+`hint: true` markers). video-harness's own dispatch loop calls `console.warn(...)` between tool
+dispatches (`client.ts:1144`, `startSuspendingCall`'s `console.warn("tool call (start): ...")`) —
+a `Log` entry landing between two sequential RPC dispatches is not a hypothetical edge case, it's
+what the actual app code does on essentially every tool call.
+
+**Concretely**: dispatch A's `begin_index` = X. A `Log` hint entry gets written (e.g. the next
+tool call's own `console.warn`). Dispatch B's `begin_index`: **live** reads
+`current_oplog_index()` = (position after the Log entry, since live counts everything written);
+**replay** reads `last_replayed_non_hint_index()` = still X's neighborhood (the Log entry doesn't
+advance it, by design). These are **different values for the same logical dispatch** — exactly
+the kind of live/replay divergence this whole fix exists to eliminate, not one to introduce.
+
+**Why this doesn't affect `begin_function`'s existing, legitimate use of this same formula**
+(for `WriteRemoteBatched`/`WriteRemoteTransaction` retry-point tracking): that usage is **purely
+self-referential** — the value is computed fresh, used only as "a reasonable place for *this same
+replay run* to retry from," and never compared against an independently-recorded value from a
+*different* execution. My use case is the opposite: persist a value during LIVE, recompute it
+independently during a **later, separate REPLAY**, and require bitwise equality — a categorically
+stronger guarantee the existing formula was never designed to provide, and (per the trace above)
+does not provide.
+
+#### 8.2.2 REVISED design: a dedicated counter, mirroring `pollable_seq`'s structure exactly (not `begin_index`)
+
+Given the position-derived approach is unsound, and reconsidering the counter-based approach
+this section originally argued against: `pollable_seq`'s *actual* problem (Eighth capture) was
+narrower than "counters are unsafe" — it was specifically "a counter that resets to 0 on every
+fresh instance construction is wrong when constructing from a snapshot with prior live history."
+That failure mode is **already fully solved and proven** (`recover_next_pollable_seq`, the
+Option 2 fix, falsified bidirectionally and shipped). Reusing the *identical pattern* — a new,
+independent counter for RPC identity, with its own snapshot-embedded recovery mirroring
+`recover_next_pollable_seq` exactly — carries no new *class* of risk, just more of the same,
+already-validated mechanism. This is the corrected design:
+
+**New fields on `PrivateDurableWorkerState`** (`durable_host/mod.rs`, structurally identical to
+`pollable_seq`/`next_pollable_seq`, kept fully separate rather than merged into them — merging
+would mean touching the already-shipped, already-proven pollable_seq mechanism for no benefit):
+
+```rust
+/// Maps a FutureInvokeResult's wasmtime resource rep to a logical, call-order-derived sequence
+/// number — the RPC-call analog of `pollable_seq`. Assigned unconditionally (live or replay) the
+/// first time a given rep is observed, at the top of `async_invoke_and_await` (the dispatch
+/// call, which creates the resource — see 8.8.1 for why dispatch-time, not first-get()-call
+/// time, is the correct assignment point). Kept as an entirely separate map/counter from
+/// `pollable_seq` rather than merged into it, to avoid touching that already-shipped, already-
+/// proven mechanism.
+invoke_result_seq: HashMap<u32, u32>,
+next_invoke_result_seq: u32,
+```
+
+`recover_next_invoke_result_seq()` mirrors `recover_next_pollable_seq()` exactly — reads
+`next_invoke_result_seq` directly from the `Snapshot` oplog entry at construction time when
+resuming from a snapshot, falls back to 0 for genesis replay. The `Snapshot` entry's `raw{}`
+block gains a **second** new field (`next_invoke_result_seq: u32`, alongside the Option-2 fix's
+`next_pollable_seq: u32`) — same mechanism, same file, same falsification bar as that fix.
+
+**New `DurableFunctionType` variant**: `WriteRemoteConcurrent(u32)` — carries the assigned
+`invoke_result_seq` value (a counter value, like `ReadLocalPollable(u32)`, **not** an `OplogIndex`
+— correcting the earlier draft). `HostFutureInvokeResult::get`'s LIVE path tags its persisted
+entry with this instead of plain `WriteRemote`.
+
+**Backward compatible with already-persisted oplogs**, same reasoning as before: `get()`'s
+existing REPLAY fallback (`get_oplog_entry!`, unconditional) is left completely unchanged as the
+final step after stray-scanning (§8.4) — an old, untagged `WriteRemote` entry never matches the
+new stray-recognition predicate, so it falls straight through to the unchanged unconditional
+read, exactly as today.
 
 ### 8.3 The "my own identity" problem — why `get()` differs from `poll()`/`ready()`
 
@@ -600,7 +675,7 @@ stray predicates recognize *both* known kinds (broadened from v2's batch-scoped 
 below), each decoded/cached via its own `PrivateDurableWorkerState` map:
 
 ```rust
-fn is_known_stray(entry: &OplogEntry, state: &PrivateDurableWorkerState, exclude_begin_index: Option<OplogIndex>) -> bool {
+fn is_known_stray(entry: &OplogEntry, state: &PrivateDurableWorkerState, exclude_invoke_result_seq: Option<u32>) -> bool {
     match entry {
         OplogEntry::HostCall {
             function_name: HostFunctionName::IoPollReady,
@@ -610,19 +685,20 @@ fn is_known_stray(entry: &OplogEntry, state: &PrivateDurableWorkerState, exclude
 
         OplogEntry::HostCall {
             function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
-            durable_function_type: DurableFunctionType::WriteRemoteConcurrent(begin_index),
+            durable_function_type: DurableFunctionType::WriteRemoteConcurrent(seq),
             ..
-        } => Some(*begin_index) != exclude_begin_index
-            && state.invoke_result_tracked.contains(begin_index),
+        } => Some(*seq) != exclude_invoke_result_seq
+            && state.invoke_result_seq.values().any(|v| v == seq),
 
         _ => false,
     }
 }
 ```
 
-- `poll()` calls this with `exclude_begin_index: None` (poll() has no single RPC-call identity of
-  its own to exclude — it isn't itself an RPC call).
-- `get()` calls this with `exclude_begin_index: Some(my_begin_index)`.
+- `poll()` calls this with `exclude_invoke_result_seq: None` (poll() has no single RPC-call
+  identity of its own to exclude — it isn't itself an RPC call).
+- `get()` calls this with `exclude_invoke_result_seq: Some(my_seq)` (its own
+  `invoke_result_seq_if_assigned(rep)`, mirroring `pollable_seq_if_assigned`).
 
 **Broadened from v2's "my explicit batch" to "any currently-tracked identity."** v2 scoped
 `poll()`'s stray recognition to `in_`'s own batch (`pollable_seq_if_assigned` per pollable in the
@@ -636,36 +712,41 @@ case, not just same-batch races), not a loosening of safety: seqs/begin_indexes 
 so a stray consumed-and-cached here can never be mismatched against a later, unrelated operation.
 
 **New state on `PrivateDurableWorkerState`** (`durable_host/mod.rs`, alongside `pollable_seq`/
-`pre_resolved_pollable_ready`):
+`pre_resolved_pollable_ready` — `invoke_result_seq`/`next_invoke_result_seq` themselves defined
+in §8.2.2; no separate "tracked" set needed, `invoke_result_seq`'s own key/value maps already
+serve that role, exactly mirroring how `pollable_seq` itself is both the assignment map and the
+"currently tracked" set):
 
 ```rust
-/// Tracks which RPC begin_indexes are currently "mine, in flight" — analogous to
-/// pollable_seq's key-set, but keyed directly by the call's own begin_index (no separate
-/// counter — see §8.2 for why an OplogIndex-based identity avoids pollable_seq's counter-
-/// recovery problem entirely). Populated when a FutureInvokeResult first calls get()
-/// (mirroring pollable_seq's assign-on-first-ready() timing), cleared when the call reaches a
-/// terminal state (Completed/Cancelled/Consumed) or the resource is dropped.
-invoke_result_tracked: HashSet<OplogIndex>,
-
 /// REPLAY-ONLY cache, symmetric with pre_resolved_pollable_ready: a stray
 /// GolemRpcFutureInvokeResultGet entry's decoded result, consumed early by a DIFFERENT call's
-/// stray-scan, cached here for the owning get() call to consult first.
-pre_resolved_invoke_result: HashMap<OplogIndex, SerializableInvokeResult>,
+/// stray-scan, cached here for the owning get() call to consult first. Keyed by
+/// invoke_result_seq (not OplogIndex — see §8.2.2's correction).
+pre_resolved_invoke_result: HashMap<u32, SerializableInvokeResult>,
 ```
+
+`invoke_result_seq_if_assigned(rep)` / `clear_invoke_result_seq(rep)` mirror
+`pollable_seq_if_assigned`/`clear_pollable_seq` exactly (non-mutating lookup; clear-on-drop so a
+reused wasmtime rep gets a fresh seq).
 
 **`HostFutureInvokeResult::get`'s replay branch**, restructured to match `ready()`'s
 cache-then-scan-then-fallback shape:
 
 ```rust
 } else {
+    // my_seq: this FutureInvokeResult's own invoke_result_seq (assigned at dispatch time —
+    // see §8.2.2 and §8.8.1 — so it's always already assigned by the time get() replays).
+    let my_seq = self.state.invoke_result_seq_if_assigned(this.rep())
+        .expect("invoke_result_seq assigned at dispatch time, before get() can be called");
+
     // 1. Check the cache first — a sibling's poll()/get() stray-scan may already have
     //    consumed my own entry on my behalf.
-    if let Some(cached) = self.state.take_pre_resolved_invoke_result(begin_index) {
+    if let Some(cached) = self.state.take_pre_resolved_invoke_result(my_seq) {
         /* use cached directly, same downstream handling as the decoded oplog case */
     } else {
         // 2. Scan past any stray entries belonging to OTHER tracked operations (excluding
-        //    my own begin_index).
-        consume_stray_entries(&mut self.state.replay_state, |e| is_known_stray(e, &self.state, Some(begin_index)), |idx, entry| { /* decode + cache by kind */ }).await?;
+        //    my own seq).
+        consume_stray_entries(&mut self.state.replay_state, |e| is_known_stray(e, &self.state, Some(my_seq)), |idx, entry| { /* decode + cache by kind */ }).await?;
         // 3. Unchanged existing fallback — whatever's left must be mine (every other known
         //    identity has been filtered out) or a genuine, still-correctly-crashing mismatch.
         let (_, oplog_entry) = get_oplog_entry!(self.state.replay_state, OplogEntry::HostCall)?;
@@ -678,7 +759,7 @@ cache-then-scan-then-fallback shape:
 (`is_known_stray` instead of the `IoPollReady`-only check) and add the `WriteRemoteConcurrent`
 decode arm alongside the existing `IoPollReady` one in the `on_stray` callback.
 
-### 8.5 `DurableFunctionType::WriteRemoteConcurrent(OplogIndex)` — touch points
+### 8.5 `DurableFunctionType::WriteRemoteConcurrent(u32)` — touch points
 
 Mirrors exactly the file list `ReadLocalPollable(u32)` originally touched (confirmed by grep —
 same enum, same exhaustiveness-checked match sites):
@@ -701,81 +782,248 @@ same enum, same exhaustiveness-checked match sites):
   `WriteRemote` isn't explicitly matched there either (falls to `_ => false`), so
   `WriteRemoteConcurrent(_)` should fall to the same wildcard; confirm via the compiler's
   exhaustiveness checking during implementation, don't assume.
+- **`Snapshot` oplog entry** (`golem-common/src/base_model/oplog/mod.rs`'s `raw{}` block for the
+  `Snapshot` case, plus the same construction sites the Option 2 fix touched for
+  `next_pollable_seq`: `golem-common/src/model/oplog/protobuf.rs`, `golem-worker-executor/src/
+  model/public_oplog/mod.rs`, `.../public_oplog/wit.rs`, `golem-worker-executor/src/services/
+  oplog/tests.rs`, `golem-worker-executor/src/worker/status.rs`, and the real write site
+  `golem-worker-executor/src/worker/invocation_loop.rs`): a **second** new field,
+  `next_invoke_result_seq: u32`, alongside `next_pollable_seq: u32` — same mechanism, same
+  falsification bar (bidirectional: revert, confirm the analogous Eighth-capture-shaped trap
+  reproduces for RPC identity across a periodic snapshot; restore, confirm it doesn't) as the
+  Option 2 fix.
 - Any other exhaustive `match self.function_type` / `match durable_function_type` site the
   compiler flags after adding the variant — same discovery process used for the Option 2 fix
   (`cargo check`-driven, not manual grep-and-hope).
 
-### 8.6 Scope: what's fixed now vs. flagged for later
+### 8.6 Bidirectional cross-contamination — traced concretely, not assumed
 
-**Fixed in this pass**: `Host::poll` (extended) and `HostFutureInvokeResult::get` (new) — the two
-call sites confirmed vulnerable by live captures (Tenth and Eleventh).
+Four directions to check (`ready()` and `get()` are the two "final, single-identity-match"
+consumers; `poll()` and `get()`'s *unconditional* fallback are the two "could blindly swallow a
+stray" consumers):
 
-**Not fixed, explicitly flagged as a follow-up, not bundled into this change**: the same
-underlying vulnerability — unconditional/positional `durability.replay()`/`get_oplog_entry!`
-consumption, with no per-operation identity — exists at every other host-call replay site
-(grep count: 100+ call sites across `io/streams.rs`, `websocket/client.rs`, `blobstore/`,
-`keyvalue/`, `rdbms/`, `clocks/`, `random/`, `golem/v1x.rs`, etc.). The vulnerability only
-*matters* where an app can have **multiple concurrent operations of the same call-type
-genuinely in flight at once** — most of these host calls are used strictly one-at-a-time
-(awaited immediately) in video-harness's actual code, so they're not practically exposed. The one
-other call site with *plausible* real exposure, already flagged in this doc's §2 scope note:
-`io/streams.rs`'s HTTP body-stream reads/`check_write` — video-harness's `download-manager.ts:138`
+**`ready()` → can it be confused by a stray of any kind (pollable or RPC)? No — safe by
+construction, no change needed.** `ready()`'s replay (`io/poll.rs`) uses `try_get_oplog_entry`
+with a predicate that requires an *exact* `IoPollReady` function_name **and** exact seq match. Any
+non-matching entry — whether a different pollable's `IoPollReady`, a `GolemRpcFutureInvokeResultGet`,
+or anything else — simply fails the predicate, `try_get_oplog_entry` leaves it untouched, and
+`ready()` synthesizes `false`. This is the exact mechanism that already made the *first* stray
+(Tenth capture) not crash `ready()` itself — only `poll()`'s *unconditional* consumption crashed.
+`ready()` can never accidentally consume something that isn't its own exact entry, for any entry
+type, today or after this fix. No changes needed here, confirmed by re-reading the existing code
+rather than assumed from the pollable case generalizing.
+
+**`poll()` → confirmed vulnerable to both directions** (both already established): stray
+`IoPollReady` (Tenth capture, shipped fix) and stray `GolemRpcFutureInvokeResultGet` (Eleventh
+capture, this design). Both handled by the widened `is_known_stray` predicate (§8.4).
+
+**`get()` → does it need to recognize stray `GolemRpcFutureInvokeResultGet` (sibling get()
+calls)? Confirmed yes**, and specifically *why*: `get()`'s current replay
+(`get_oplog_entry!(replay_state, OplogEntry::HostCall)`, `wasm_rpc/mod.rs:874`) matches **any**
+`HostCall` variant — it does not check `function_name` at all (unlike `validate_oplog_entry`,
+which `get()`'s path doesn't use — `get_oplog_entry!` only checks the outer `OplogEntry` variant).
+A sibling `get()` call's own entry — same `GolemRpcFutureInvokeResultGet` function_name — would
+be silently accepted by the macro, then fail only at the *response payload* decode step
+(`match response { HostResponse::GolemRpcInvokeGet(...) => ..., other => Err(unexpected_oplog_entry(...)) }`)
+— since both entries share the same response *shape* (`HostResponseGolemRpcInvokeGet`), this
+wouldn't even necessarily error — it could **silently consume the wrong RPC call's result**, no
+error at all. Confirmed vulnerable, and confirmed the failure mode is worse than a loud crash
+when the two entries happen to be the same shape.
+
+**`get()` → does it need to recognize stray `IoPollReady` (the reverse of the Eleventh capture's
+direction)? Confirmed yes, traced concretely — not assumed.** Same reasoning: `get_oplog_entry!`
+matches any `HostCall`, so a stray `IoPollReady` entry sitting where `get()`'s own entry is
+expected would also be accepted by the macro. This time the response *shape* differs
+(`HostResponsePollReady` vs. the expected `HostResponseGolemRpcInvokeGet`), so the existing
+`match response { ..., other => Err(unexpected_oplog_entry(...)) }` arm *would* catch it and
+error — loudly, unlike the sibling-`get()` case above, but still a crash `get()` shouldn't have
+today. No live capture has shown this exact direction yet, but the code path is unconditional
+regardless of which entry type shows up, so nothing about the mechanism is direction-specific —
+confirmed vulnerable by tracing the actual macro and match arms, not inferred from symmetry.
+`is_known_stray` already recognizes both kinds at every call site (§8.4), so this is covered by
+the same design with no special-casing needed.
+
+### 8.7 HTTP concurrent fetches — investigated, confirmed vulnerable, brought into scope
+
+Traced `io/streams.rs`'s `HostInputStream::read` (representative of the whole family —
+`blocking_read`, `skip`, `blocking_skip`, and the output-stream `check_write`/`write`/`flush`
+variants all follow the identical shape) to the same depth as `poll()`/`get()`.
+
+**HTTP body-stream calls already carry a per-request identity — unlike RPC's plain `WriteRemote`.**
+`io/streams.rs:59-64`: `Durability::<HttpTypesIncomingBodyStreamRead>::new(self,
+DurableFunctionType::WriteRemoteBatched(Some(begin_idx)))` — not the bare `WriteRemote` RPC's
+`get()` used. `WriteRemoteBatched(Option<OplogIndex>)`'s own doc comment (`raw_types.rs:333-341`)
+confirms `begin_idx` here is a **real, explicit `BeginRemoteWrite` oplog entry's own index** (the
+first call in a batch passes `None`, which triggers writing that entry; every subsequent call in
+the same batch passes `Some(that_entry's_index)`) — not a "current position" approximation, so it
+does **not** have the hint-entry-asymmetry flaw §8.2.1 found in the RPC `begin_index` idea: a
+`BeginRemoteWrite` entry is an actual, independently-discoverable oplog position
+(`get_oplog_entry!(..., OplogEntry::BeginRemoteWrite)` finds it directly on replay), immune to
+hint-entry skipping the same way `pollable_seq`/`invoke_result_seq` are.
+
+**Per-request identity is already tracked, resource-rep-keyed, exactly like `pollable_seq`.**
+`get_http_request_begin_idx` (`io/streams.rs:1165-1175`) reads `ctx.state.open_http_requests.get(&handle).begin_index`
+— `open_http_requests: HashMap<handle, RequestState>` is *already* a rep-keyed per-request
+identity map, structurally identical in shape to `pollable_seq`/the new `invoke_result_seq`. No
+new identity-assignment mechanism is needed for HTTP at all — the identity already exists and is
+already sound; what's missing is *using* it defensively during replay.
+
+**The vulnerability: the identity is recorded but never verified during replay — and the failure
+mode is silent data corruption, not a crash.** `HostInputStream::read`'s replay branch
+(`durability.replay(self).await`, `io/streams.rs:116`) goes through the same generic
+`Durability::replay_raw()` → `get_oplog_entry!(HostCall)` → `validate_oplog_entry` path already
+traced for `poll()`/`get()` — which checks **only `function_name`**, never the
+`durable_function_type`'s embedded `Some(begin_idx)` parameter. Two concurrently in-flight HTTP
+streams' reads share the exact same `function_name`
+(`HttpTypesIncomingBodyStreamRead`) — so if their real completion order (driven by the same
+`wstd`-reactor `HashMap`-keyed waker mechanism, §2, which is generic across *any* concurrently-
+polled WASI resource, not just RPC futures) diverges from replay's structural check order, replay
+would not crash at all — `validate_oplog_entry`'s function_name check would pass (same function),
+and stream A's replay would **silently consume stream B's bytes** as its own read result. This is
+a strictly worse failure mode than `poll()`/`get()`'s loud crashes: silent data corruption in
+whatever's downloaded, not a visible trap.
+
+**Confirmed reachable in video-harness's actual code**: `download-manager.ts:138`
 (`Promise.all(batch.map((item) => this.fetchBytes(item.url)))`) and `fileshare.ts:81` both fire
-genuinely concurrent fetches inside one `atomically()` region. This is **not evaluated or fixed here** — the shared
-`consume_stray_entries` primitive (§8.4) is deliberately generic enough that extending coverage
-to HTTP streams later is "add an `is_known_stray` arm + a tracked-identity map for HTTP's own
-resource kind," not a redesign — but doing so needs its own live-capture-confirmed trigger before
-touching more code, matching this whole investigation's standing discipline of fixing confirmed
-traps, not hypothesized ones.
+genuinely concurrent fetches inside one `atomically()` region — the same "N independently-awaited
+operations, real completion order not guest-structural-order-guaranteed" shape already confirmed
+for RPC dispatches (§2's `LlmClient` trace) and pollables (Tenth capture).
 
-### 8.7 Test plan
+**Design: a third instance of the same shared mechanism, not a bolt-on.** `is_known_stray` (§8.4)
+gains a third arm:
+
+```rust
+OplogEntry::HostCall {
+    function_name: HostFunctionName::HttpTypesIncomingBodyStreamRead
+        | HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead
+        | HostFunctionName::HttpTypesIncomingBodyStreamSkip
+        | HostFunctionName::HttpTypesIncomingBodyStreamBlockingSkip,
+    durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
+    ..
+} => Some(*begin_idx) != exclude_http_begin_idx
+    && state.open_http_requests.values().any(|r| r.begin_index == *begin_idx),
+```
+
+No new counter, no new snapshot-recovery — `open_http_requests`'s `begin_index` is already sound
+(§ above) and already populated at request-open time. The cache is keyed by `OplogIndex`
+(`pre_resolved_http_stream_chunk: HashMap<OplogIndex, HostResponseStreamChunk>` or similar —
+per-function-kind response shapes differ across the read/skip/write/check_write family, same
+"caller decodes, primitive doesn't" split as §8.4's `on_stray` callback already provides for).
+`HostInputStream::read`'s (and siblings') replay branch gains the same
+cache-then-scan-then-fallback restructure `get()`'s does (§8.4) — `exclude_http_begin_idx` is
+*this* call's own `begin_idx` (already available, `get_http_request_begin_idx`), same
+own-identity-exclusion reasoning as §8.3 (concurrent HTTP streams share `function_name`, exactly
+like sibling `get()` calls do, so exclusion is required here too, not just for RPC).
+
+**What still needs implementation-time verification, flagged honestly rather than assumed
+resolved**: `open_http_requests`'s exact population/clearing lifecycle (when a request opens vs.
+when `begin_index` actually gets assigned — the `WriteRemoteBatched(None)` → `Some(idx)`
+two-phase pattern means the *first* call in a batch doesn't have `begin_idx` yet when it starts,
+unlike `pollable_seq`/`invoke_result_seq`'s simpler "assigned unconditionally up front" shape) has
+not been traced to the same line-by-line depth §8.8.1 gives the RPC dispatch path below — this is
+real, additional tracing to do during implementation, not a gap in the design's soundness (the
+identity mechanism itself is confirmed sound; only its precise lifecycle timing remains to
+verify). The output-stream side (`check_write`/`write`/`flush`/`splice`) should be checked for
+the same `WriteRemoteBatched(Some(begin_idx))` shape before assuming it's identical to the
+input-stream side used for this analysis.
+
+### 8.8 `invoke_result_seq` assignment timing — resolved
+
+Traced `async_invoke_and_await` (`wasm_rpc/mod.rs:380-519`, quoted in full in §8.2.1): it runs
+**unconditionally, live or replay** (no `is_live()` gate above the dispatch logic — only the
+`Pending`-vs-`Deferred` state constructed differs), and it's the method that **creates** the
+`FutureInvokeResult` resource (`self.table().push(FutureInvokeResultEntry { ... })`) — meaning a
+given resource `rep` does not exist before this call returns. This makes dispatch time the only
+correct assignment point, not "first call to `get()`" (the open question's original phrasing):
+`invoke_result_seq(rep)` must be called unconditionally inside `async_invoke_and_await`, exactly
+where `pollable_seq(rep)` is called unconditionally at the top of `ready()` — same pattern,
+different call site because the two resource kinds become "known" to the engine at different
+points (a `Pollable` always already exists when `ready()`/`poll()` touch it; a
+`FutureInvokeResult` is *born* inside `async_invoke_and_await`, so that's its natural first-touch
+point). `clear_invoke_result_seq(rep)` fires on the resource's `drop`, mirroring
+`clear_pollable_seq`. This also confirms §8.4's `get()` code sketch is correct as written — `my_seq`
+is always already assigned by the time `get()` runs, since dispatch necessarily precedes it.
+
+### 8.9 Test plan
 
 - **Regression, mandatory**: all six existing `io/poll.rs` unit tests (§7) must keep passing
   unmodified against the widened predicate — the Tenth capture's shape (single `IoPollReady`
   stray) must still resolve identically.
 - **New unit test, seeded from the Eleventh capture's exact entries**: oplog =
-  `[IoPollReady(seq=185)=true, GolemRpcFutureInvokeResultGet(WriteRemoteConcurrent(some_begin_index))=<result>, IoPollPoll]`
-  (`peek(961)`/`peek(962)`/poll()'s own next entry) — batch includes seq 185 (rep 22... wait, rep
-  23 per the trace — confirm exact rep/seq assignment from the archived oplog file before
-  writing the test, don't guess); asserts `poll()`'s widened scanner consumes both strays (one of
-  each kind), caches both answers correctly, and poll()'s own entry survives untouched.
-- **`get()`-side test — the "exclude my own identity" case**: oplog = `[GolemRpcFutureInvokeResultGet(WriteRemoteConcurrent(sibling_begin_index))=<result>, GolemRpcFutureInvokeResultGet(WriteRemoteConcurrent(my_begin_index))=<result>]`
+  `[IoPollReady(seq=185)=true, GolemRpcFutureInvokeResultGet(WriteRemoteConcurrent(some_seq))=<result>, IoPollPoll]`
+  (`peek(961)`/`peek(962)`/poll()'s own next entry) — confirm the exact rep/seq values (185 for
+  the pollable; the RPC call's own assigned `invoke_result_seq`, not literally 185 — a distinct
+  counter namespace) from the archived oplog file before writing the test, don't guess. Asserts
+  `poll()`'s widened scanner consumes both strays (one of each kind), caches both answers
+  correctly via their respective caches, and poll()'s own entry survives untouched.
+- **`get()`-side test — the "exclude my own identity" case**: oplog =
+  `[GolemRpcFutureInvokeResultGet(WriteRemoteConcurrent(sibling_seq))=<result>, GolemRpcFutureInvokeResultGet(WriteRemoteConcurrent(my_seq))=<result>]`
   — two DIFFERENT concurrent calls' entries in a row, own entry genuinely second. Asserts: (a)
   the scanner correctly identifies the FIRST as a stray (sibling) and consumes+caches it, (b)
   does NOT mistake the SECOND (mine) for a stray even though it matches the same
   `WriteRemoteConcurrent` shape, correctly leaving it for the unconditional fallback read.
+- **`get()`-side test — the reverse direction (§8.6)**: oplog = `[IoPollReady(seq=some_pollable)=true, GolemRpcFutureInvokeResultGet(WriteRemoteConcurrent(my_seq))=<result>]`
+  — a stray pollable confirmation in front of `get()`'s own entry. Asserts the widened scanner
+  consumes+caches it (into `pre_resolved_pollable_ready`, for that pollable's own `ready()` to
+  find later) and reaches `get()`'s own entry without error.
 - **`get()`-side test — cache hit**: `take_pre_resolved_invoke_result` populated by a prior
   (simulated) stray-consume; assert `get()`'s replay uses it directly without touching the oplog
   at all.
+- **`invoke_result_seq` unit tests, mirroring `pollable_seq`'s own**: assigned unconditionally at
+  the top of `async_invoke_and_await` (not lazily at `get()` time); `invoke_result_seq_if_assigned`
+  never mutates the counter; `recover_next_invoke_result_seq` reads correctly from a `Snapshot`
+  entry, mirroring `recover_next_pollable_seq`'s own tests.
+- **HTTP unit tests, same shapes as the RPC ones above**: a stray same-`function_name` HTTP
+  stream-read entry (different `begin_idx`) in front of the current stream's own entry, consumed
+  and cached; the "exclude my own `begin_idx`" case (two concurrent streams' reads, own entry
+  genuinely second); a cache-hit case.
 - **Bidirectional falsification**: same approach as §7 — a same-oplog "before" test (the OLD
   unconditional `get_oplog_entry!`/`validate_oplog_entry`-equivalent mechanism, run directly
-  against the Eleventh capture's crafted entries) proving it genuinely mismatches, paired with
-  the "after" tests proving the widened mechanism avoids it. A true integration-level
-  live/replay-divergence repro remains not achievable for the same reason established in §4b/§7
-  (hand-authored deterministic Rust can't force the underlying `wstd`-reactor-level ordering
-  non-determinism) — unchanged conclusion, now confirmed applicable to this second entry-type
-  too.
+  against the Eleventh capture's crafted entries, and against the HTTP silent-misattribution
+  scenario specifically demonstrating stream A would consume stream B's bytes) proving each
+  genuinely reproduces its failure mode, paired with "after" tests proving the widened mechanism
+  avoids each. A true integration-level live/replay-divergence repro remains not achievable for
+  the same reason established in §4b/§7 (hand-authored deterministic Rust can't force the
+  underlying `wstd`-reactor-level ordering non-determinism) — unchanged conclusion, now confirmed
+  applicable to RPC and HTTP too, not just pollables.
 - **Full regression sweep**: everything from §7's sweep, re-run — full `--lib`, `durable_host::`,
-  full `rpc.rs`/`durability.rs` integration suites, Eighth capture's fix test.
+  full `rpc.rs`/`durability.rs` integration suites, Eighth capture's fix test. Add `http.rs`'s
+  suite to the sweep this time if the relevant test component is buildable in the environment
+  doing the implementation (it wasn't in this worktree as of §7 — re-check).
 
-### 8.8 Open questions for review
+### 8.10 Resolution status
 
-1. **`invoke_result_tracked`'s population/clearing timing.** Proposed: populate on `get()`'s
-   FIRST call for a given `FutureInvokeResult` (mirroring `pollable_seq`'s assign-on-first-touch
-   timing), clear on terminal state or resource drop (mirroring `clear_pollable_seq`). Needs
-   confirming against `FutureInvokeResultState`'s actual state-transition code
-   (`wasm_rpc/mod.rs`) during implementation — in particular, whether "first call to `get()`"
-   is really the right assignment point, or whether it should happen earlier (at
-   `subscribe()`/dispatch time) to match production's actual observed shape more precisely.
-2. **Does `get()` also need to recognize stray `IoPollReady` entries** (not just sibling
-   `GolemRpcFutureInvokeResultGet`s)? No live capture has shown this direction yet (only
-   RPC-stray-in-front-of-poll, not poll-stray-in-front-of-RPC-get), but by the same reasoning
-   nothing rules it out. The design above already covers it for free (`is_known_stray` recognizes
-   both kinds at every call site) — flagging only to confirm that's intentional and not
-   overreach, given no live evidence for that specific direction yet.
-3. **Is `begin_index` really live/replay-identical for `FutureInvokeResult`'s dispatch path**,
-   the same way it's confirmed for `poll()`/`ready()`'s `pollable_seq`? I traced
-   `FutureInvokeResultState`'s `begin_index` field through its state enum and accessor but did
-   not fully trace the dispatch code path (`handle_deferred_rpc_dispatch`) that first assigns it,
-   the way the Eighth/Option-2 investigation fully traced `pollable_seq`'s assignment path.
-   Should confirm this precisely before implementing, not assume from the field's presence alone.
+All three original open questions (§8.8 in the prior revision) are now resolved:
+
+1. **`invoke_result_seq` assignment timing** — resolved, §8.8 above (dispatch time, inside
+   `async_invoke_and_await`, unconditional).
+2. **Does `get()` need to recognize stray `IoPollReady`, not just sibling RPC entries?** —
+   resolved via concrete tracing (§8.6): yes, confirmed vulnerable (the mismatch would surface as
+   a response-shape decode error, not silently) — not merely "covered for free," genuinely
+   necessary.
+3. **Is the chosen identity live/replay-identical, traced to `pollable_seq`'s depth?** — resolved,
+   and the answer changed the design: `begin_index` (the original proposal) is **not**
+   live/replay-identical (§8.2.1, hint-entry asymmetry between `current_oplog_index()` and
+   `last_replayed_non_hint_index()`, concretely reachable via `console.warn`/`Log` hints between
+   dispatches). Replaced with a dedicated counter (`invoke_result_seq`) mirroring `pollable_seq`'s
+   already-proven structure instead (§8.2.2).
+
+**Newly surfaced and resolved in this revision**: HTTP concurrent fetches (§8.7) — investigated
+with the same rigor, confirmed vulnerable (silent data misattribution between concurrent streams,
+not a crash), brought into scope as a third instance of the same shared mechanism, using its
+*already-sound* `open_http_requests`/`begin_index` (a real `BeginRemoteWrite` entry position, not
+a `current_oplog_index()`-style approximation — so it does not have RPC's original identity flaw).
+
+**Remaining, explicitly flagged, genuinely open items** (implementation-time verification, not
+design uncertainty):
+- HTTP's `open_http_requests` population/clearing lifecycle and the `WriteRemoteBatched(None)` →
+  `Some(idx)` two-phase assignment timing needs the same line-by-line trace §8.8 gave the RPC
+  dispatch path (§8.7's own caveat).
+- HTTP's output-stream side (`check_write`/`write`/`flush`/`splice`) should be confirmed to use
+  the identical `WriteRemoteBatched(Some(begin_idx))` shape before assuming the input-stream
+  analysis transfers directly.
+- Every other host-call replay site beyond `poll()`/`get()`/HTTP streams (websocket, blobstore,
+  keyvalue, rdbms, clocks, random, `golem/v1x.rs` — 100+ grep hits, §8.6's predecessor scope note)
+  remains unevaluated — flagged as before, out of scope unless a live capture or explicit request
+  brings a specific one into scope, matching this investigation's standing discipline of fixing
+  confirmed traps.

@@ -305,13 +305,18 @@ impl ReplayState {
     /// operations doesn't have to match the guest's replayed structural check order. Callers
     /// decide what "stray" means (via `is_stray`) and what to do with one (via `on_stray`); this
     /// function only knows how to walk forward and consume matches.
+    ///
+    /// `is_stray` is `FnMut` so a caller can bound the walk with per-scan state — see
+    /// `StrayEntryScan`, which refuses a second entry for an identity it already consumed
+    /// (every pre-resolved cache holds at most one pending answer per identity, so consuming
+    /// two would silently destroy the first).
     pub async fn consume_stray_entries(
         &mut self,
-        is_stray: impl Fn(&OplogEntry) -> bool,
+        mut is_stray: impl FnMut(&OplogEntry) -> bool,
         mut on_stray: impl FnMut(OplogIndex, OplogEntry),
     ) -> Result<(), WorkerExecutorError> {
         loop {
-            match self.try_get_oplog_entry(&is_stray).await? {
+            match self.try_get_oplog_entry(&mut is_stray).await? {
                 Some((idx, entry)) => on_stray(idx, entry),
                 None => return Ok(()),
             }

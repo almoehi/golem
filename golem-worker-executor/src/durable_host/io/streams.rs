@@ -20,7 +20,7 @@ use crate::durable_host::http::{continue_http_request, end_http_request};
 use crate::durable_host::io::{ManagedStdErr, ManagedStdOut};
 use crate::durable_host::{
     Durability, DurabilityHost, DurableWorkerCtx, HttpOutputStreamState, HttpRequestCloseOwner,
-    PendingFilesystemReservation, is_stray_concurrent_entry,
+    PendingFilesystemReservation,
 };
 use crate::model::event::InternalWorkerEvent;
 use crate::services::oplog::OplogOps;
@@ -49,6 +49,25 @@ use wasmtime_wasi::p2::bindings::io::streams::{
     Host, HostInputStream, HostOutputStream, InputStream, OutputStream, Pollable,
 };
 use wasmtime_wasi_http::p2::body::{FailingStream, HostIncomingBodyStream};
+
+/// Walks the replay cursor past stray entries belonging to OTHER concurrently-tracked
+/// operations, on behalf of an HTTP stream call that owns `begin_idx` — a thin `StreamError`
+/// adapter over the shared `PrivateDurableWorkerState::consume_and_cache_stray_entries`, so the
+/// four HTTP stream call sites (`read`, `check_write`, `write`, `blocking_write_and_flush`)
+/// don't each re-spell the same error mapping.
+///
+/// `begin_idx` is per-*request*, not per-*direction*: passing it excludes this request's own
+/// entries in BOTH directions from being mistaken for someone else's stray, leaving them for
+/// their own call's replay.
+async fn consume_and_cache_stray_entries<Ctx: WorkerCtx>(
+    ctx: &mut DurableWorkerCtx<Ctx>,
+    begin_idx: OplogIndex,
+) -> Result<(), StreamError> {
+    ctx.state
+        .consume_and_cache_stray_entries(None, Some(begin_idx))
+        .await
+        .map_err(|e| StreamError::Trap(wasmtime::Error::from_anyhow(e.into())))
+}
 
 impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
     async fn read(
@@ -122,24 +141,7 @@ impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
                 // Scan past any stray entries belonging to OTHER tracked concurrent operations
                 // (excluding this stream's own begin_idx), caching each for its real owner —
                 // same shared mechanism as poll()/get() (FINDING_B_FIX_DESIGN.md).
-                let tracked = self.state.tracked_concurrent_op_seqs();
-                let mut strays = Vec::new();
-                self.state
-                    .replay_state
-                    .consume_stray_entries(
-                        |entry| {
-                            is_stray_concurrent_entry(entry, &tracked, None, Some(begin_idx))
-                        },
-                        |idx, entry| strays.push((idx, entry)),
-                    )
-                    .await
-                    .map_err(|e| StreamError::Trap(wasmtime::Error::from_anyhow(e.into())))?;
-                for (idx, entry) in strays {
-                    self.state
-                        .decode_and_cache_stray_entry(idx, entry)
-                        .await
-                        .map_err(|e| StreamError::Trap(wasmtime::Error::from_anyhow(e.into())))?;
-                }
+                consume_and_cache_stray_entries(self, begin_idx).await?;
 
                 // Unchanged existing fallback — whatever's left must be mine (every other known
                 // identity has been filtered out) or a genuine, still-correctly-crashing
@@ -392,7 +394,21 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                         },
                     )
                     .await
+            } else if let Some(cached) = self
+                .state
+                .take_pre_resolved_http_stream_check_write(state.begin_index)
+            {
+                // A concurrent operation's stray-scan already consumed this entry on our behalf
+                // (FINDING_B_FIX_DESIGN.md §12) — use it directly, oplog untouched.
+                Ok(cached)
             } else {
+                // Scan past any stray entries belonging to OTHER tracked concurrent operations,
+                // caching each for its real owner — same shared mechanism as read()/poll()/get().
+                // Without this, an ordinary single fetch() with a multi-chunk request body is
+                // enough to strand a check_write entry at the cursor and trap a later poll()
+                // with "expected io::poll::poll, got
+                // http::types::outgoing_body_stream::check_write".
+                consume_and_cache_stray_entries(self, state.begin_index).await?;
                 durability.replay(self).await
             }
             .map_err(StreamError::from)?;
@@ -510,7 +526,19 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
-                let replayed = durability.replay(self).await;
+                // Same cache-then-scan-then-fallback shape as check_write()/read(): `write` and
+                // `check_write` occur 1:1 in lockstep on every body chunk, so fixing only
+                // check_write would relocate the identical trap one call later
+                // (FINDING_B_FIX_DESIGN.md §12.6).
+                let replayed = if let Some(cached) = self
+                    .state
+                    .take_pre_resolved_http_stream_write(state.begin_index)
+                {
+                    Ok(cached)
+                } else {
+                    consume_and_cache_stray_entries(self, state.begin_index).await?;
+                    durability.replay(self).await
+                };
                 mark_replayed_body_write(self, state.request_handle);
                 replayed
             }
@@ -649,7 +677,19 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
-                let replayed = durability.replay(self).await;
+                // Records under the same HostFunctionName and the same response shape as
+                // write(), so it must consult the same pre-resolved cache: an entry this call
+                // owns can have been consumed by a concurrent operation's stray-scan, which
+                // cannot tell the two apart (nor does it need to).
+                let replayed = if let Some(cached) = self
+                    .state
+                    .take_pre_resolved_http_stream_write(state.begin_index)
+                {
+                    Ok(cached)
+                } else {
+                    consume_and_cache_stray_entries(self, state.begin_index).await?;
+                    durability.replay(self).await
+                };
                 mark_replayed_body_write(self, state.request_handle);
                 replayed
             }

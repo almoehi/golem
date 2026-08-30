@@ -103,9 +103,9 @@ use golem_common::model::oplog::host_functions::HostFunctionName;
 use golem_common::model::oplog::types::SerializableInvokeResult;
 use golem_common::model::oplog::{
     AgentError, AgentResourceId, DurableFunctionType, HostRequestHttpRequest, HostResponse,
-    HostResponseGolemRpcInvokeGet, HostResponsePollReady, HostResponseStreamChunk, LogLevel,
-    OplogEntry, OplogIndex, PersistenceLevel, RawSnapshotData, TimestampedUpdateDescription,
-    UpdateDescription,
+    HostResponseGolemRpcInvokeGet, HostResponsePollReady, HostResponseStreamCheckWrite,
+    HostResponseStreamChunk, HostResponseStreamWriteWithBytes, LogLevel, OplogEntry, OplogIndex,
+    PersistenceLevel, RawSnapshotData, TimestampedUpdateDescription, UpdateDescription,
 };
 use golem_common::model::regions::{DeletedRegions, DeletedRegionsBuilder, OplogRegion};
 use golem_common::model::retry_policy::NamedRetryPolicy;
@@ -4188,6 +4188,22 @@ struct PrivateDurableWorkerState {
     /// consult first.
     pre_resolved_http_stream_chunk: HashMap<OplogIndex, HostResponseStreamChunk>,
 
+    /// REPLAY-ONLY cache, the outgoing-body-stream analog of `pre_resolved_http_stream_chunk`
+    /// (same `begin_index` identity, same request-scoped `open_http_requests` source — one
+    /// `HttpRequestState` covers both directions). Kept as its own map rather than shared with
+    /// the incoming-side cache because the response *shape* differs
+    /// (`HostResponseStreamCheckWrite` vs `HostResponseStreamChunk`) — the same reason the
+    /// pollable/RPC/HTTP-read caches are three separate maps. See FINDING_B_FIX_DESIGN.md §12.
+    pre_resolved_http_stream_check_write: HashMap<OplogIndex, HostResponseStreamCheckWrite>,
+
+    /// REPLAY-ONLY cache for stray `HttpTypesOutgoingBodyStreamWrite` entries — the other half
+    /// of the per-chunk write protocol (`check_write` reports capacity, `write` consumes it;
+    /// they occur 1:1, in lockstep, so fixing only `check_write` would relocate the identical
+    /// trap one call later — FINDING_B_FIX_DESIGN.md §12.6). Also consulted by
+    /// `blocking_write_and_flush`, which records under the same `HostFunctionName` and the same
+    /// `HostResponseStreamWriteWithBytes` shape.
+    pre_resolved_http_stream_write: HashMap<OplogIndex, HostResponseStreamWriteWithBytes>,
+
     // ResourceIds of all DynPollables that are backed by GetPromiseResultEntries
     promise_backed_pollables: TRwLock<HashMap<u32, GetPromiseResultEntry>>,
     // Map from resource_id to the dyn_pollables that wrap it
@@ -4248,49 +4264,135 @@ pub struct TrackedConcurrentOpSeqs {
 /// Recognizes a "stray" oplog entry — one belonging to a DIFFERENT concurrently-tracked
 /// operation than the one currently being resolved, of any kind this mechanism knows about
 /// (`IoPollReady` for pollables, `GolemRpcFutureInvokeResultGet` for RPC future-invoke-
-/// results, `HttpTypesIncomingBodyStreamRead` for concurrent HTTP body-stream reads) — the
-/// shared identity check behind the fix for a class of bug (`FINDING_B_FIX_DESIGN.md`) where
+/// results, `HttpTypesIncomingBodyStreamRead` for concurrent HTTP body-stream reads,
+/// `HttpTypesOutgoingBodyStreamCheckWrite`/`HttpTypesOutgoingBodyStreamWrite` for HTTP request-
+/// body writes) — the shared identity check behind the fix for a class of bug
+/// (`FINDING_B_FIX_DESIGN.md`) where
 /// positional/unconditional replay consumption can find such an entry sitting where its own
 /// next entry was expected, because real-world completion order among concurrently in-flight
 /// operations doesn't have to match the guest's replayed structural check order.
 ///
 /// `exclude_invoke_result_seq`/`exclude_http_begin_idx`: a caller's OWN identity, if it is
-/// itself an RPC `get()` call or an HTTP stream read — sibling calls of either kind share the
-/// same `function_name` (unlike `poll()`/`ready()`, naturally distinguishable), so a caller
+/// itself an RPC `get()` call or an HTTP stream read/write — sibling calls of either kind share
+/// the same `function_name` (unlike `poll()`/`ready()`, naturally distinguishable), so a caller
 /// must exclude its own identity or this would wrongly recognize its own genuine entry as a
 /// stray. `poll()` passes `None` for both (it has no RPC-call or HTTP-request identity of its
 /// own to exclude).
+///
+/// The HTTP exclusion is per-*request*, not per-*direction*: one `HttpRequestState` (and hence
+/// one `begin_index`) covers a request's incoming and outgoing streams alike, so a `read()` on
+/// request X correctly declines to consume X's own `check_write`/`write` entries, leaving them
+/// for their own call's replay.
 pub fn is_stray_concurrent_entry(
     entry: &OplogEntry,
     tracked: &TrackedConcurrentOpSeqs,
     exclude_invoke_result_seq: Option<u32>,
     exclude_http_begin_idx: Option<OplogIndex>,
 ) -> bool {
+    match stray_entry_identity(entry) {
+        Some(StrayEntryIdentity::Pollable(seq)) => tracked.pollable_seqs.contains(&seq),
+        Some(StrayEntryIdentity::InvokeResult(seq)) => {
+            Some(seq) != exclude_invoke_result_seq && tracked.invoke_result_seqs.contains(&seq)
+        }
+        Some(
+            StrayEntryIdentity::HttpStreamRead(begin_idx)
+            | StrayEntryIdentity::HttpStreamCheckWrite(begin_idx)
+            | StrayEntryIdentity::HttpStreamWrite(begin_idx),
+        ) => {
+            Some(begin_idx) != exclude_http_begin_idx
+                && tracked.http_begin_indexes.contains(&begin_idx)
+        }
+        None => false,
+    }
+}
+
+/// The identity carried by an oplog entry this stray-entry mechanism knows about — the single
+/// authoritative place that maps an `OplogEntry` shape onto "which concurrently-tracked
+/// operation does this belong to". `is_stray_concurrent_entry` (recognition),
+/// `StrayEntryScan` (per-scan de-duplication) and `decode_and_cache_stray_entry` (decode into
+/// the matching pre-resolved cache) are all expressed in terms of it, so the three cannot drift
+/// apart the way three independent `match` statements would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StrayEntryIdentity {
+    Pollable(u32),
+    InvokeResult(u32),
+    HttpStreamRead(OplogIndex),
+    HttpStreamCheckWrite(OplogIndex),
+    HttpStreamWrite(OplogIndex),
+}
+
+/// Extracts the concurrently-tracked identity an oplog entry belongs to, or `None` if this entry
+/// kind takes no part in the stray-entry mechanism (see `StrayEntryIdentity`).
+pub fn stray_entry_identity(entry: &OplogEntry) -> Option<StrayEntryIdentity> {
     match entry {
         OplogEntry::HostCall {
             function_name: HostFunctionName::IoPollReady,
             durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
             ..
-        } => tracked.pollable_seqs.contains(seq),
+        } => Some(StrayEntryIdentity::Pollable(*seq)),
 
         OplogEntry::HostCall {
             function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
             durable_function_type: DurableFunctionType::WriteRemoteConcurrent(seq),
             ..
-        } => {
-            Some(*seq) != exclude_invoke_result_seq && tracked.invoke_result_seqs.contains(seq)
-        }
+        } => Some(StrayEntryIdentity::InvokeResult(*seq)),
 
         OplogEntry::HostCall {
             function_name: HostFunctionName::HttpTypesIncomingBodyStreamRead,
             durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
             ..
-        } => {
-            Some(*begin_idx) != exclude_http_begin_idx
-                && tracked.http_begin_indexes.contains(begin_idx)
-        }
+        } => Some(StrayEntryIdentity::HttpStreamRead(*begin_idx)),
 
-        _ => false,
+        OplogEntry::HostCall {
+            function_name: HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+            durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
+            ..
+        } => Some(StrayEntryIdentity::HttpStreamCheckWrite(*begin_idx)),
+
+        OplogEntry::HostCall {
+            function_name: HostFunctionName::HttpTypesOutgoingBodyStreamWrite,
+            durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
+            ..
+        } => Some(StrayEntryIdentity::HttpStreamWrite(*begin_idx)),
+
+        _ => None,
+    }
+}
+
+/// Stateful predicate driving one `consume_stray_entries` walk.
+///
+/// Recognition alone (`is_stray_concurrent_entry`) is not a safe consumption rule: every
+/// pre-resolved cache holds at most ONE pending answer per identity, so consuming a second entry
+/// for an identity whose answer is already held would silently destroy the first. That is not
+/// hypothetical — an ordinary `fetch()` with a multi-chunk body records `check_write`/`write`
+/// pairs for the SAME request back to back (106 of each in the capture behind
+/// FINDING_B_FIX_DESIGN.md §12), so a scan that only checked recognition would run away through
+/// an entire write cluster and keep only the last entry of each kind.
+///
+/// This bounds the walk to at most one entry per distinct identity: the second occurrence stops
+/// the scan and is left at the cursor for its owner's own replay to consume.
+pub struct StrayEntryScan {
+    tracked: TrackedConcurrentOpSeqs,
+    exclude_invoke_result_seq: Option<u32>,
+    exclude_http_begin_idx: Option<OplogIndex>,
+    consumed: HashSet<StrayEntryIdentity>,
+}
+
+impl StrayEntryScan {
+    /// Decides whether the entry at the replay cursor may be consumed as a stray by this scan.
+    pub fn accept(&mut self, entry: &OplogEntry) -> bool {
+        if !is_stray_concurrent_entry(
+            entry,
+            &self.tracked,
+            self.exclude_invoke_result_seq,
+            self.exclude_http_begin_idx,
+        ) {
+            return false;
+        }
+        match stray_entry_identity(entry) {
+            Some(identity) => self.consumed.insert(identity),
+            None => false,
+        }
     }
 }
 
@@ -4614,6 +4716,8 @@ impl PrivateDurableWorkerState {
             pre_resolved_invoke_result: HashMap::new(),
             next_invoke_result_seq,
             pre_resolved_http_stream_chunk: HashMap::new(),
+            pre_resolved_http_stream_check_write: HashMap::new(),
+            pre_resolved_http_stream_write: HashMap::new(),
             shard_service,
             promise_backed_pollables: TRwLock::new(HashMap::new()),
             promise_dyn_pollables: TRwLock::new(HashMap::new()),
@@ -4854,6 +4958,110 @@ impl PrivateDurableWorkerState {
         taken
     }
 
+    /// Outgoing-body-stream analog of `record_pre_resolved_http_stream_chunk` — see
+    /// `pre_resolved_http_stream_check_write`'s field doc comment.
+    pub fn record_pre_resolved_http_stream_check_write(
+        &mut self,
+        begin_idx: OplogIndex,
+        payload: HostResponseStreamCheckWrite,
+    ) {
+        debug!(
+            agent_id = %self.owned_agent_id,
+            %begin_idx,
+            "HTTPSTRAY_TRACE record_pre_resolved_http_stream_check_write"
+        );
+        self.pre_resolved_http_stream_check_write
+            .insert(begin_idx, payload);
+    }
+
+    /// Outgoing-body-stream analog of `take_pre_resolved_http_stream_chunk`.
+    pub fn take_pre_resolved_http_stream_check_write(
+        &mut self,
+        begin_idx: OplogIndex,
+    ) -> Option<HostResponseStreamCheckWrite> {
+        let taken = self.pre_resolved_http_stream_check_write.remove(&begin_idx);
+        if taken.is_some() {
+            debug!(
+                agent_id = %self.owned_agent_id,
+                %begin_idx,
+                "HTTPSTRAY_TRACE take_pre_resolved_http_stream_check_write"
+            );
+        }
+        taken
+    }
+
+    /// Outgoing-body-stream `write` analog of `record_pre_resolved_http_stream_chunk` — see
+    /// `pre_resolved_http_stream_write`'s field doc comment.
+    pub fn record_pre_resolved_http_stream_write(
+        &mut self,
+        begin_idx: OplogIndex,
+        payload: HostResponseStreamWriteWithBytes,
+    ) {
+        debug!(
+            agent_id = %self.owned_agent_id,
+            %begin_idx,
+            "HTTPSTRAY_TRACE record_pre_resolved_http_stream_write"
+        );
+        self.pre_resolved_http_stream_write.insert(begin_idx, payload);
+    }
+
+    /// Outgoing-body-stream `write` analog of `take_pre_resolved_http_stream_chunk`.
+    pub fn take_pre_resolved_http_stream_write(
+        &mut self,
+        begin_idx: OplogIndex,
+    ) -> Option<HostResponseStreamWriteWithBytes> {
+        let taken = self.pre_resolved_http_stream_write.remove(&begin_idx);
+        if taken.is_some() {
+            debug!(
+                agent_id = %self.owned_agent_id,
+                %begin_idx,
+                "HTTPSTRAY_TRACE take_pre_resolved_http_stream_write"
+            );
+        }
+        taken
+    }
+
+    /// Builds the stateful predicate for one stray-entry walk — see `StrayEntryScan`.
+    pub fn stray_entry_scan(
+        &self,
+        exclude_invoke_result_seq: Option<u32>,
+        exclude_http_begin_idx: Option<OplogIndex>,
+    ) -> StrayEntryScan {
+        StrayEntryScan {
+            tracked: self.tracked_concurrent_op_seqs(),
+            exclude_invoke_result_seq,
+            exclude_http_begin_idx,
+            // Pre-seeded with identities whose answer is already cached and uncollected — see
+            // `cached_stray_identities`.
+            consumed: self.cached_stray_identities(),
+        }
+    }
+
+    /// Walks the replay cursor past every stray entry belonging to a DIFFERENT concurrently-
+    /// tracked operation, decoding and caching each one for its real owner — the single entry
+    /// point every replay consumer (`poll()`, RPC `get()`, HTTP `read()`/`check_write()`/
+    /// `write()`) uses, so the scan bound in `StrayEntryScan` and the decode in
+    /// `decode_and_cache_stray_entry` are applied identically everywhere rather than
+    /// re-assembled per call site.
+    pub async fn consume_and_cache_stray_entries(
+        &mut self,
+        exclude_invoke_result_seq: Option<u32>,
+        exclude_http_begin_idx: Option<OplogIndex>,
+    ) -> Result<(), WorkerExecutorError> {
+        let mut scan = self.stray_entry_scan(exclude_invoke_result_seq, exclude_http_begin_idx);
+        let mut strays = Vec::new();
+        self.replay_state
+            .consume_stray_entries(
+                |entry| scan.accept(entry),
+                |idx, entry| strays.push((idx, entry)),
+            )
+            .await?;
+        for (idx, entry) in strays {
+            self.decode_and_cache_stray_entry(idx, entry).await?;
+        }
+        Ok(())
+    }
+
     /// Snapshots the currently-tracked pollable/invoke-result/HTTP-request identities into
     /// owned sets, for use with `is_stray_concurrent_entry` — taken as owned values (not
     /// borrowed from `self`) so the resulting predicate closure doesn't alias `self.state`
@@ -4877,6 +5085,37 @@ impl PrivateDurableWorkerState {
                 .map(|r| r.begin_index)
                 .collect(),
         }
+    }
+
+    /// The identities whose pre-resolved answer is already held in a cache and has not been
+    /// collected by its owner yet — treated by `StrayEntryScan` exactly like "already consumed
+    /// during this scan", since a cache holds one answer per identity and a second consumption
+    /// could only overwrite the first.
+    fn cached_stray_identities(&self) -> HashSet<StrayEntryIdentity> {
+        self.pre_resolved_pollable_ready
+            .keys()
+            .map(|seq| StrayEntryIdentity::Pollable(*seq))
+            .chain(
+                self.pre_resolved_invoke_result
+                    .keys()
+                    .map(|seq| StrayEntryIdentity::InvokeResult(*seq)),
+            )
+            .chain(
+                self.pre_resolved_http_stream_chunk
+                    .keys()
+                    .map(|idx| StrayEntryIdentity::HttpStreamRead(*idx)),
+            )
+            .chain(
+                self.pre_resolved_http_stream_check_write
+                    .keys()
+                    .map(|idx| StrayEntryIdentity::HttpStreamCheckWrite(*idx)),
+            )
+            .chain(
+                self.pre_resolved_http_stream_write
+                    .keys()
+                    .map(|idx| StrayEntryIdentity::HttpStreamWrite(*idx)),
+            )
+            .collect()
     }
 
     /// Decodes and caches one stray entry (as recognized by `is_stray_concurrent_entry`) —
@@ -4958,6 +5197,52 @@ impl PrivateDurableWorkerState {
                     "HTTPSTRAY_TRACE decode_and_cache_stray_entry: HttpTypesIncomingBodyStreamRead"
                 );
                 self.record_pre_resolved_http_stream_chunk(begin_idx, payload);
+                Ok(())
+            }
+            OplogEntry::HostCall {
+                function_name: HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+                durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
+                response,
+                ..
+            } => {
+                let host_response: HostResponse = self
+                    .oplog
+                    .download_payload(response)
+                    .await
+                    .map_err(WorkerExecutorError::runtime)?;
+                let payload: HostResponseStreamCheckWrite = host_response
+                    .try_into()
+                    .map_err(WorkerExecutorError::runtime)?;
+                debug!(
+                    agent_id = %self.owned_agent_id,
+                    %begin_idx,
+                    matched_oplog_index = %idx,
+                    "HTTPSTRAY_TRACE decode_and_cache_stray_entry: HttpTypesOutgoingBodyStreamCheckWrite"
+                );
+                self.record_pre_resolved_http_stream_check_write(begin_idx, payload);
+                Ok(())
+            }
+            OplogEntry::HostCall {
+                function_name: HostFunctionName::HttpTypesOutgoingBodyStreamWrite,
+                durable_function_type: DurableFunctionType::WriteRemoteBatched(Some(begin_idx)),
+                response,
+                ..
+            } => {
+                let host_response: HostResponse = self
+                    .oplog
+                    .download_payload(response)
+                    .await
+                    .map_err(WorkerExecutorError::runtime)?;
+                let payload: HostResponseStreamWriteWithBytes = host_response
+                    .try_into()
+                    .map_err(WorkerExecutorError::runtime)?;
+                debug!(
+                    agent_id = %self.owned_agent_id,
+                    %begin_idx,
+                    matched_oplog_index = %idx,
+                    "HTTPSTRAY_TRACE decode_and_cache_stray_entry: HttpTypesOutgoingBodyStreamWrite"
+                );
+                self.record_pre_resolved_http_stream_write(begin_idx, payload);
                 Ok(())
             }
             other => Err(WorkerExecutorError::runtime(format!(

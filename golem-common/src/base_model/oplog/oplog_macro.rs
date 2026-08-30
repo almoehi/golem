@@ -323,7 +323,13 @@ macro_rules! host_payload_pairs {
             }
         }
 
-        #[derive(Debug, Clone, PartialEq, desert_rust::BinaryCodec)]
+        // `Eq`/`Hash` are required because `HostFunctionName` is half of the key identifying
+        // which concurrently-tracked operation an oplog entry belongs to
+        // (`StrayEntryIdentity`, golem-worker-executor `durable_host/mod.rs`): a single HTTP
+        // request's `begin_index` is shared by 13 host functions across 8 response payload
+        // shapes, so the function name is what keeps their cached answers apart. All variants
+        // are fieldless except `Custom(String)`, so both derives are total and mechanical.
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, desert_rust::BinaryCodec)]
         pub enum HostFunctionName {
             Custom(String),
             $(

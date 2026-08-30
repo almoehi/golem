@@ -50,25 +50,6 @@ use wasmtime_wasi::p2::bindings::io::streams::{
 };
 use wasmtime_wasi_http::p2::body::{FailingStream, HostIncomingBodyStream};
 
-/// Walks the replay cursor past stray entries belonging to OTHER concurrently-tracked
-/// operations, on behalf of an HTTP stream call that owns `begin_idx` — a thin `StreamError`
-/// adapter over the shared `PrivateDurableWorkerState::consume_and_cache_stray_entries`, so the
-/// four HTTP stream call sites (`read`, `check_write`, `write`, `blocking_write_and_flush`)
-/// don't each re-spell the same error mapping.
-///
-/// `begin_idx` is per-*request*, not per-*direction*: passing it excludes this request's own
-/// entries in BOTH directions from being mistaken for someone else's stray, leaving them for
-/// their own call's replay.
-async fn consume_and_cache_stray_entries<Ctx: WorkerCtx>(
-    ctx: &mut DurableWorkerCtx<Ctx>,
-    begin_idx: OplogIndex,
-) -> Result<(), StreamError> {
-    ctx.state
-        .consume_and_cache_stray_entries(None, Some(begin_idx))
-        .await
-        .map_err(|e| StreamError::Trap(wasmtime::Error::from_anyhow(e.into())))
-}
-
 impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
     async fn read(
         &mut self,
@@ -131,19 +112,11 @@ impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
                         },
                     )
                     .await
-            } else if let Some(cached) = self.state.take_pre_resolved_http_stream_chunk(begin_idx) {
-                // A sibling concurrent stream's stray-scan already consumed this entry on our
-                // behalf (FINDING_B_FIX_DESIGN.md §8.7) — use it directly, oplog untouched.
-                Ok(cached)
             } else {
-                // Scan past any stray entries belonging to OTHER tracked concurrent operations
-                // (excluding this stream's own begin_idx), caching each for its real owner —
-                // same shared mechanism as poll()/get() (FINDING_B_FIX_DESIGN.md).
-                consume_and_cache_stray_entries(self, begin_idx).await?;
-
-                // Unchanged existing fallback — whatever's left must be mine (every other known
-                // identity has been filtered out) or a genuine, still-correctly-crashing
-                // mismatch.
+                // Cache-then-scan-then-read now lives inside `Durability::replay_raw`, keyed by
+                // this call's own `(function_name, begin_index)` identity — see
+                // FINDING_B_FIX_DESIGN.md §14.9. Every HTTP stream operation gets it, not just
+                // the handful that were retrofitted individually.
                 durability.replay(self).await
             }?;
 
@@ -214,13 +187,12 @@ impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
                         },
                     )
                     .await
-            } else if let Some(cached) = self.state.take_pre_resolved_http_stream_chunk(begin_idx) {
-                // `read` and `blocking_read` share one identity/cache (FINDING_B_FIX_DESIGN.md
-                // §12 addendum) — a sibling stream's, or this same stream's other read variant's,
-                // stray-scan may already have consumed this entry on our behalf.
-                Ok(cached)
             } else {
-                consume_and_cache_stray_entries(self, begin_idx).await?;
+                // `read` and `blocking_read` now carry SEPARATE identities (they record under
+                // separate `HostFunctionName`s), rather than sharing one cache as they did when
+                // the cache was typed by response shape. Replay re-executes the same guest code
+                // and therefore the same variant, so the more precise key is also the correct
+                // one — and it lets a scan defer one entry of each, instead of one in total.
                 durability.replay(self).await
             }?;
 
@@ -401,21 +373,11 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                         },
                     )
                     .await
-            } else if let Some(cached) = self
-                .state
-                .take_pre_resolved_http_stream_check_write(state.begin_index)
-            {
-                // A concurrent operation's stray-scan already consumed this entry on our behalf
-                // (FINDING_B_FIX_DESIGN.md §12) — use it directly, oplog untouched.
-                Ok(cached)
             } else {
-                // Scan past any stray entries belonging to OTHER tracked concurrent operations,
-                // caching each for its real owner — same shared mechanism as read()/poll()/get().
-                // Without this, an ordinary single fetch() with a multi-chunk request body is
-                // enough to strand a check_write entry at the cursor and trap a later poll()
-                // with "expected io::poll::poll, got
-                // http::types::outgoing_body_stream::check_write".
-                consume_and_cache_stray_entries(self, state.begin_index).await?;
+                // Cache-then-scan-then-read is applied inside `Durability::replay_raw`. Without
+                // it, an ordinary single fetch() with a multi-chunk request body is enough to
+                // strand a check_write entry at the cursor and trap a later poll() with
+                // "expected io::poll::poll, got http::types::outgoing_body_stream::check_write".
                 durability.replay(self).await
             }
             .map_err(StreamError::from)?;
@@ -534,19 +496,10 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
-                // Same cache-then-scan-then-fallback shape as check_write()/read(): `write` and
-                // `check_write` occur 1:1 in lockstep on every body chunk, so fixing only
-                // check_write would relocate the identical trap one call later
-                // (FINDING_B_FIX_DESIGN.md §12.6).
-                let replayed = if let Some(cached) = self
-                    .state
-                    .take_pre_resolved_http_stream_write(state.begin_index)
-                {
-                    Ok(cached)
-                } else {
-                    consume_and_cache_stray_entries(self, state.begin_index).await?;
-                    durability.replay(self).await
-                };
+                // `write` and `check_write` occur 1:1 in lockstep on every body chunk, so both
+                // must participate or the identical trap simply relocates one call later
+                // (FINDING_B_FIX_DESIGN.md §12.6). Both do, via `Durability::replay_raw`.
+                let replayed = durability.replay(self).await;
                 mark_replayed_body_write(self, state.request_handle);
                 replayed
             }
@@ -685,19 +638,10 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
-                // Records under the same HostFunctionName and the same response shape as
-                // write(), so it must consult the same pre-resolved cache: an entry this call
-                // owns can have been consumed by a concurrent operation's stray-scan, which
-                // cannot tell the two apart (nor does it need to).
-                let replayed = if let Some(cached) = self
-                    .state
-                    .take_pre_resolved_http_stream_write(state.begin_index)
-                {
-                    Ok(cached)
-                } else {
-                    consume_and_cache_stray_entries(self, state.begin_index).await?;
-                    durability.replay(self).await
-                };
+                // Records under the same `HostFunctionName` and the same response shape as
+                // write(), so it resolves to the same stray identity and consults the same
+                // cached answer — a stray-scan cannot tell the two apart, nor does it need to.
+                let replayed = durability.replay(self).await;
                 mark_replayed_body_write(self, state.request_handle);
                 replayed
             }

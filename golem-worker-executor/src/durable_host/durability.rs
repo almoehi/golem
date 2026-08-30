@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::durable_host::DurableWorkerCtx;
+use crate::durable_host::{DurableWorkerCtx, StrayEntryIdentity, stray_identity_of};
 use crate::metrics::wasm::{record_host_function_call, record_in_function_retry};
 // `TrapType` was used for the legacy retry-config fallback; no longer needed
 // here after the refactor that funnels every host-trap retry decision through
@@ -538,6 +538,23 @@ pub trait DurabilityHost: InFunctionRetryHost {
         &mut self,
     ) -> Result<PersistedDurableFunctionInvocation, WorkerExecutorError>;
 
+    /// Walks the replay cursor past every entry belonging to a DIFFERENT concurrently-tracked
+    /// operation than `exclude` (the caller's own identity), caching each undecoded answer for
+    /// its real owner to collect via `take_pre_resolved_stray`.
+    ///
+    /// See `FINDING_B_FIX_DESIGN.md`: real-world completion order among concurrently in-flight
+    /// operations does not have to match the guest's replayed structural check order, so a
+    /// positional replay read can find a sibling's entry where its own was expected.
+    async fn consume_and_cache_stray_entries(
+        &mut self,
+        exclude: Option<StrayEntryIdentity>,
+    ) -> Result<(), WorkerExecutorError>;
+
+    /// Takes the answer a sibling operation's stray-scan already consumed on this identity's
+    /// behalf, if any. When present the oplog has nothing left to find for this identity — the
+    /// entry was already durably consumed — so this is the only remaining source of the answer.
+    fn take_pre_resolved_stray(&mut self, identity: &StrayEntryIdentity) -> Option<HostResponse>;
+
     /// Checks if the current retry policy allows more retries, and if yes, then returns
     /// with `Err(failure)`. This error should be directly returned from host function
     /// implementations, triggering a retry.
@@ -899,6 +916,17 @@ impl<Ctx: WorkerCtx> DurabilityHost for DurableWorkerCtx<Ctx> {
                 )),
             }
         }
+    }
+
+    async fn consume_and_cache_stray_entries(
+        &mut self,
+        exclude: Option<StrayEntryIdentity>,
+    ) -> Result<(), WorkerExecutorError> {
+        self.state.consume_and_cache_stray_entries(exclude).await
+    }
+
+    fn take_pre_resolved_stray(&mut self, identity: &StrayEntryIdentity) -> Option<HostResponse> {
+        self.state.take_pre_resolved_stray(identity)
     }
 
     async fn try_trigger_retry(
@@ -1285,15 +1313,51 @@ impl<Pair: HostPayloadPair> Durability<Pair> {
             );
         }
 
-        let oplog_entry = ctx.read_persisted_durable_function_invocation().await?;
+        // Which concurrently-tracked operation this call is, derived from the two halves it
+        // already has: its host function name (a compile-time const on the payload pair) and
+        // the exact `DurableFunctionType` it tags its own live entry with. `None` for the
+        // majority of host functions, whose function type carries no concurrency identity —
+        // those take the unchanged legacy path below, byte for byte.
+        //
+        // Because this lives here rather than at individual call sites, EVERY `Durability`-based
+        // host function participates in the stray-entry mechanism automatically: HTTP response
+        // and trailers futures, all six incoming/outgoing stream operations that were never
+        // retrofitted by hand, and the RDBMS result-stream family (FINDING_B_FIX_DESIGN.md
+        // §14.2 catalogued 18 such latent gaps, of which the silent-misdelivery risk in
+        // `future_incoming_response::get` was the most severe).
+        let identity = stray_identity_of(Pair::HOST_FUNCTION_NAME, &self.function_type);
 
-        let function_name = Pair::FQFN;
-        Self::validate_oplog_entry(&oplog_entry, function_name, self.begin_index)?;
+        let response = match identity {
+            None => {
+                let oplog_entry = ctx.read_persisted_durable_function_invocation().await?;
+                Self::validate_oplog_entry(&oplog_entry, Pair::FQFN, self.begin_index)?;
+                oplog_entry.response
+            }
+            Some(identity) => {
+                // 1. A sibling operation's scan may already hold this call's answer — in which
+                //    case the entry is gone from the oplog and the cache is authoritative.
+                if let Some(cached) = ctx.take_pre_resolved_stray(&identity) {
+                    cached
+                } else {
+                    // 2. Defer past entries belonging to OTHER tracked operations, caching each
+                    //    for its owner. Excludes this call's own identity so it never swallows
+                    //    its own genuine entry.
+                    ctx.consume_and_cache_stray_entries(Some(identity)).await?;
+
+                    // 3. Whatever is left is read exactly as before — every other tracked
+                    //    identity has been filtered out, so this is either this call's own
+                    //    entry or a genuine, still-correctly-reported mismatch.
+                    let oplog_entry = ctx.read_persisted_durable_function_invocation().await?;
+                    Self::validate_oplog_entry(&oplog_entry, Pair::FQFN, self.begin_index)?;
+                    oplog_entry.response
+                }
+            }
+        };
 
         ctx.end_durable_function(&self.function_type, self.begin_index, false)
             .await?;
 
-        Ok(oplog_entry.response)
+        Ok(response)
     }
 
     fn validate_oplog_entry(
@@ -1698,6 +1762,20 @@ mod tests {
             &mut self,
         ) -> Result<PersistedDurableFunctionInvocation, WorkerExecutorError> {
             Err(WorkerExecutorError::runtime("not implemented in mock"))
+        }
+
+        async fn consume_and_cache_stray_entries(
+            &mut self,
+            _exclude: Option<StrayEntryIdentity>,
+        ) -> Result<(), WorkerExecutorError> {
+            Ok(())
+        }
+
+        fn take_pre_resolved_stray(
+            &mut self,
+            _identity: &StrayEntryIdentity,
+        ) -> Option<HostResponse> {
+            None
         }
 
         async fn try_trigger_retry(

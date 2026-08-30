@@ -13,10 +13,7 @@
 // limitations under the License.
 
 use crate::durable_host::durability::{ClassifiedHostError, HostFailureKind, InFunctionRetryHost};
-use crate::durable_host::{
-    Durability, DurabilityHost, DurableWorkerCtx, InternalRetryResult, is_stray_concurrent_entry,
-};
-use crate::get_oplog_entry;
+use crate::durable_host::{Durability, DurabilityHost, DurableWorkerCtx, InternalRetryResult};
 use crate::preview2::golem::agent::host::{
     CancellationToken, FutureInvokeResult, HostCancellationToken, HostFutureInvokeResult,
     HostWasmRpc, RpcError,
@@ -39,7 +36,7 @@ use golem_common::model::invocation_context::{AttributeValue, InvocationContextS
 use golem_common::model::oplog::host_functions::{
     GolemRpcCancellationTokenCancel, GolemRpcFutureInvokeResultCancel,
     GolemRpcFutureInvokeResultGet, GolemRpcWasmRpcInvoke, GolemRpcWasmRpcInvokeAndAwaitResult,
-    GolemRpcWasmRpcScheduleInvocation,
+    GolemRpcWasmRpcScheduleInvocation, HostFunctionName,
 };
 use golem_common::model::oplog::types::{SerializableInvokeResult, SerializableScheduleId};
 use golem_common::model::oplog::{
@@ -935,36 +932,43 @@ impl<Ctx: WorkerCtx> HostFutureInvokeResult for DurableWorkerCtx<Ctx> {
             } else {
                 // 2. Scan past any stray entries belonging to OTHER tracked operations
                 //    (excluding my own invoke_result_seq), caching each for its real owner.
-                let tracked = self.state.tracked_concurrent_op_seqs();
-                let mut strays = Vec::new();
                 self.state
-                    .replay_state
-                    .consume_stray_entries(
-                        |entry| {
-                            is_stray_concurrent_entry(
-                                entry,
-                                &tracked,
-                                Some(my_invoke_result_seq),
-                                None,
-                            )
-                        },
-                        |idx, entry| strays.push((idx, entry)),
-                    )
+                    .consume_and_cache_stray_entries(Some(my_invoke_result_seq), None)
                     .await?;
-                for (idx, entry) in strays {
-                    self.state.decode_and_cache_stray_entry(idx, entry).await?;
-                }
 
-                // 3. Unchanged existing fallback — whatever's left must be mine (every other
-                //    known identity has been filtered out) or a genuine, still-correctly-
-                //    crashing mismatch. Propagate WorkerExecutorError via `?` (From) so the
-                //    downcast survives the anyhow::Error chain — TrapType::from_error
-                //    classifies UnexpectedOplogEntry as non-retriable.
-                let (_, oplog_entry) =
-                    get_oplog_entry!(self.state.replay_state, OplogEntry::HostCall)?;
+                // 3. Consume whatever's left ONLY if it positively identifies as this call's
+                //    own entry (FINDING_B_FIX_DESIGN.md §13.7.2). The previous unconditional
+                //    `get_oplog_entry!(.., OplogEntry::HostCall)` consumed first and validated
+                //    second, so a cursor parked on a structural entry (`FinishSpan`,
+                //    `EndAtomicRegion`, ...) was destroyed before any identity check could run —
+                //    turning any drift in `invoke_result_seq` into a permanent, unrecoverable
+                //    trap ("expected OplogEntry :: HostCall |, got FinishSpan"). On a miss the
+                //    entry is left in place and this call reports `Pending`, which is an
+                //    already-handled outcome below (`Ok(None)`, no `end_function`, no
+                //    `finish_span`), so the guest simply polls again — the same self-correcting
+                //    loop `ready()` relies on.
+                let peeked = self
+                    .state
+                    .replay_state
+                    .try_get_oplog_entry(|entry| match entry {
+                        OplogEntry::HostCall {
+                            function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
+                            durable_function_type: DurableFunctionType::WriteRemoteConcurrent(seq),
+                            ..
+                        } => *seq == my_invoke_result_seq,
+                        // Legacy, pre-WriteRemoteConcurrent oplogs: untagged entries carry no
+                        // identity, so they are consumed positionally exactly as before.
+                        OplogEntry::HostCall {
+                            function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
+                            durable_function_type: DurableFunctionType::WriteRemote,
+                            ..
+                        } => true,
+                        _ => false,
+                    })
+                    .await?;
 
-                match oplog_entry {
-                    OplogEntry::HostCall { response, .. } => {
+                match peeked {
+                    Some((_, OplogEntry::HostCall { response, .. })) => {
                         let response =
                             self.state
                                 .oplog
@@ -990,17 +994,7 @@ impl<Ctx: WorkerCtx> HostFutureInvokeResult for DurableWorkerCtx<Ctx> {
                             }
                         }
                     }
-                    // The macro above already guarantees `OplogEntry::HostCall`, so
-                    // this arm is structurally unreachable. We still return an
-                    // error rather than panicking to keep the function panic-free.
-                    other => {
-                        return Err(anyhow::Error::from(
-                            WorkerExecutorError::unexpected_oplog_entry(
-                                "OplogEntry::HostCall",
-                                format!("{other:?}"),
-                            ),
-                        ));
-                    }
+                    _ => SerializableInvokeResult::Pending,
                 }
             };
 

@@ -4204,6 +4204,10 @@ struct PrivateDurableWorkerState {
     /// `HostResponseStreamWriteWithBytes` shape.
     pre_resolved_http_stream_write: HashMap<OplogIndex, HostResponseStreamWriteWithBytes>,
 
+    /// Bookkeeping for `poll()`'s bounded replay-miss fallback (see `record_poll_replay_miss`).
+    /// `(replay cursor at the time of the miss, number of consecutive misses at that cursor)`.
+    poll_replay_miss: Option<(OplogIndex, u32)>,
+
     // ResourceIds of all DynPollables that are backed by GetPromiseResultEntries
     promise_backed_pollables: TRwLock<HashMap<u32, GetPromiseResultEntry>>,
     // Map from resource_id to the dyn_pollables that wrap it
@@ -4400,8 +4404,8 @@ impl StrayEntryScan {
 mod stray_entry_tests {
     use super::*;
     use golem_common::model::oplog::{
-        HostRequest, HostRequestNoInput, HostRequestPollCount, HostResponse,
-        HostResponsePollReady, HostResponsePollResult, OplogPayload,
+        HostRequest, HostRequestNoInput, HostRequestPollCount, HostResponse, HostResponsePollReady,
+        HostResponsePollResult, OplogPayload,
     };
     use test_r::test;
 
@@ -4421,11 +4425,13 @@ mod stray_entry_tests {
         OplogEntry::HostCall {
             timestamp: Timestamp::now_utc(),
             function_name: HostFunctionName::IoPollPoll,
-            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
-                HostRequestPollCount { count: 2 },
-            ))),
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(HostRequestPollCount {
+                count: 2,
+            }))),
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
-                HostResponsePollResult { result: Ok(vec![0]) },
+                HostResponsePollResult {
+                    result: Ok(vec![0]),
+                },
             ))),
             durable_function_type: DurableFunctionType::ReadLocal,
         }
@@ -4718,6 +4724,7 @@ impl PrivateDurableWorkerState {
             pre_resolved_http_stream_chunk: HashMap::new(),
             pre_resolved_http_stream_check_write: HashMap::new(),
             pre_resolved_http_stream_write: HashMap::new(),
+            poll_replay_miss: None,
             shard_service,
             promise_backed_pollables: TRwLock::new(HashMap::new()),
             promise_dyn_pollables: TRwLock::new(HashMap::new()),
@@ -4770,7 +4777,10 @@ impl PrivateDurableWorkerState {
 
     /// Same mechanism as `recover_next_pollable_seq` immediately above, for
     /// `next_invoke_result_seq` — see that function's doc comment for the full rationale.
-    async fn recover_next_invoke_result_seq(oplog: &Arc<dyn Oplog>, snapshot_idx: OplogIndex) -> u32 {
+    async fn recover_next_invoke_result_seq(
+        oplog: &Arc<dyn Oplog>,
+        snapshot_idx: OplogIndex,
+    ) -> u32 {
         match oplog.read(snapshot_idx).await {
             OplogEntry::Snapshot {
                 next_invoke_result_seq,
@@ -4900,7 +4910,11 @@ impl PrivateDurableWorkerState {
     /// Records that `seq`'s `GolemRpcFutureInvokeResultGet` confirmation was consumed early, by
     /// a DIFFERENT call's stray-scan, on behalf of a `get()` call that hasn't replayed yet — RPC
     /// analog of `record_pre_resolved_pollable_ready`.
-    pub fn record_pre_resolved_invoke_result(&mut self, seq: u32, result: SerializableInvokeResult) {
+    pub fn record_pre_resolved_invoke_result(
+        &mut self,
+        seq: u32,
+        result: SerializableInvokeResult,
+    ) {
         debug!(
             agent_id = %self.owned_agent_id,
             seq,
@@ -4912,7 +4926,10 @@ impl PrivateDurableWorkerState {
     /// Takes (removes) a pre-resolved answer for `seq`, if a sibling call's replay already
     /// consumed its entry on this call's behalf. RPC analog of
     /// `take_pre_resolved_pollable_ready`.
-    pub fn take_pre_resolved_invoke_result(&mut self, seq: u32) -> Option<SerializableInvokeResult> {
+    pub fn take_pre_resolved_invoke_result(
+        &mut self,
+        seq: u32,
+    ) -> Option<SerializableInvokeResult> {
         let taken = self.pre_resolved_invoke_result.remove(&seq);
         if taken.is_some() {
             debug!(
@@ -5002,7 +5019,8 @@ impl PrivateDurableWorkerState {
             %begin_idx,
             "HTTPSTRAY_TRACE record_pre_resolved_http_stream_write"
         );
-        self.pre_resolved_http_stream_write.insert(begin_idx, payload);
+        self.pre_resolved_http_stream_write
+            .insert(begin_idx, payload);
     }
 
     /// Outgoing-body-stream `write` analog of `take_pre_resolved_http_stream_chunk`.
@@ -5019,6 +5037,54 @@ impl PrivateDurableWorkerState {
             );
         }
         taken
+    }
+
+    /// Does the pollable at `rep` already have a "ready" answer waiting in a pre-resolved cache
+    /// — either its own `IoPollReady` answer, or (for a pollable subscribed to a
+    /// `FutureInvokeResult`) its parent future's `get()` answer?
+    ///
+    /// Non-consuming: the answers stay in their caches for their owners' own replay to take.
+    /// Used by `poll()`'s replay to synthesize a ready-set when its own `IoPollPoll` entry is
+    /// not at the cursor — reporting these is not a guess, it is replaying an already-recorded
+    /// answer to the pollable it was actually recorded for.
+    pub fn is_pollable_pre_resolved_ready(&self, rep: u32) -> bool {
+        let own_ready = self
+            .pollable_seq
+            .get(&rep)
+            .and_then(|seq| self.pre_resolved_pollable_ready.get(seq))
+            .copied()
+            .unwrap_or(false);
+        own_ready
+            || self
+                .rpc_pollable_to_parent
+                .get(&rep)
+                .and_then(|parent_rep| self.invoke_result_seq.get(parent_rep))
+                .map(|seq| self.pre_resolved_invoke_result.contains_key(seq))
+                .unwrap_or(false)
+    }
+
+    /// Records a `poll()` replay miss (its own `IoPollPoll` entry was not at the cursor) and
+    /// returns how many consecutive misses have now occurred *without the replay cursor moving
+    /// at all*. Any forward progress by any consumer resets the count.
+    ///
+    /// This bounds §13.7.2's "synthesize instead of consume" fallback: turning a permanent trap
+    /// into a retry is the whole point, but a retry that can never make progress would be an
+    /// unbounded spin. After the bound is exceeded the caller reverts to the original
+    /// unconditional read, restoring the previous (diagnosable) failure instead of hanging.
+    pub fn record_poll_replay_miss(&mut self) -> u32 {
+        let cursor = self.replay_state.last_replayed_index();
+        let count = match self.poll_replay_miss {
+            Some((at, count)) if at == cursor => count + 1,
+            _ => 1,
+        };
+        self.poll_replay_miss = Some((cursor, count));
+        count
+    }
+
+    /// Clears the `poll()` replay-miss streak — called whenever a `poll()` replay does consume
+    /// its own entry.
+    pub fn reset_poll_replay_miss(&mut self) {
+        self.poll_replay_miss = None;
     }
 
     /// Builds the stateful predicate for one stray-entry walk — see `StrayEntryScan`.

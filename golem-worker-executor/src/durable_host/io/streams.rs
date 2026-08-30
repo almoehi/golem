@@ -131,9 +131,7 @@ impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
                         },
                     )
                     .await
-            } else if let Some(cached) =
-                self.state.take_pre_resolved_http_stream_chunk(begin_idx)
-            {
+            } else if let Some(cached) = self.state.take_pre_resolved_http_stream_chunk(begin_idx) {
                 // A sibling concurrent stream's stray-scan already consumed this entry on our
                 // behalf (FINDING_B_FIX_DESIGN.md §8.7) — use it directly, oplog untouched.
                 Ok(cached)
@@ -348,7 +346,10 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
     async fn check_write(&mut self, self_: Resource<OutputStream>) -> Result<u64, StreamError> {
         let rep = self_.rep();
         let is_http = is_outgoing_http_body_stream(self, rep);
-        let open_reps: Vec<_> = self.state.open_http_requests.iter()
+        let open_reps: Vec<_> = self
+            .state
+            .open_http_requests
+            .iter()
             .map(|(k, v)| (*k, v.output_stream_rep))
             .collect();
         tracing::trace!(
@@ -440,7 +441,8 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                         matches!(
                             entry,
                             OplogEntry::HostCall {
-                                function_name: HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
+                                function_name:
+                                    HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
                                 ..
                             }
                         )

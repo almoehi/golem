@@ -14,9 +14,7 @@
 
 use crate::durable_host::durability::InFunctionRetryHost;
 use crate::durable_host::wasm_rpc::delete_future_invoke_result;
-use crate::durable_host::{
-    Durability, DurabilityHost, DurableWorkerCtx, SuspendForSleep, is_stray_concurrent_entry,
-};
+use crate::durable_host::{Durability, DurabilityHost, DurableWorkerCtx, SuspendForSleep};
 use crate::metrics::ephemeral::{dec_promise_waiting, inc_promise_waiting};
 use crate::services::oplog::OplogOps;
 use crate::services::{HasOplog, HasWorker};
@@ -36,6 +34,13 @@ use tracing::{debug, trace};
 use wasmtime::component::Resource;
 use wasmtime_wasi::IoView as _;
 use wasmtime_wasi::p2::bindings::io::poll::{Host, HostPollable, Pollable};
+
+/// How many consecutive `poll()` replay misses *at the same, unmoving replay cursor* are
+/// tolerated before reverting to the original unconditional read (see the call site). The
+/// synthesized "not ready yet" answer is self-correcting only while some other consumer can
+/// still claim the entry at the cursor; if nothing does across this many attempts, nothing ever
+/// will, and spinning is strictly worse than the diagnosable failure this restores.
+const MAX_POLL_REPLAY_MISSES: u32 = 64;
 
 impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
     async fn ready(&mut self, self_: Resource<Pollable>) -> wasmtime::Result<bool> {
@@ -80,7 +85,11 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
             );
             let durability = Durability::<IoPollReady>::new(self, durable_function_type).await?;
             let r = durability
-                .persist(self, HostRequestNoInput {}, HostResponsePollReady { result })
+                .persist(
+                    self,
+                    HostRequestNoInput {},
+                    HostResponsePollReady { result },
+                )
                 .await?;
             r.result.map_err(wasmtime::Error::msg)
         } else {
@@ -91,8 +100,7 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
             // HashMap-keyed waker set whose iteration order is per-process-randomized). If so,
             // the oplog has nothing left to find for this seq — this cached answer is
             // authoritative.
-            if let Some(pre_resolved) = self.state.take_pre_resolved_pollable_ready(pollable_seq)
-            {
+            if let Some(pre_resolved) = self.state.take_pre_resolved_pollable_ready(pollable_seq) {
                 trace!(
                     agent_id = %self.owned_agent_id,
                     rep = pollable_rep,
@@ -396,32 +404,82 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
             // existing crash path fires exactly as it does today. No batch-size or entry-kind
             // assumption: N stray entries of any recognized kind, in any order, is simply N
             // loop iterations.
-            let tracked = self.state.tracked_concurrent_op_seqs();
-            let reps_for_trace = in_.iter().map(|r| r.rep()).collect::<Vec<_>>();
-
-            let mut strays = Vec::new();
             self.state
-                .replay_state
-                .consume_stray_entries(
-                    |entry| is_stray_concurrent_entry(entry, &tracked, None, None),
-                    |idx, entry| strays.push((idx, entry)),
-                )
+                .consume_and_cache_stray_entries(None, None)
                 .await?;
-            for (idx, entry) in strays {
-                trace!(
-                    agent_id = %self.owned_agent_id,
-                    reps = ?reps_for_trace,
-                    matched_oplog_index = %idx,
-                    entry = ?entry,
-                    "POLLCALL_TRACE poll() REPLAY consumed stray concurrent-op entry, caching"
-                );
-                self.state.decode_and_cache_stray_entry(idx, entry).await?;
-            }
 
-            // Whatever's left (if anything) is not a recognized stray — defer entirely to the
-            // unchanged, existing path: either it's poll()'s own genuine entry (happy path) or
-            // a genuinely unexpected mismatch (existing crash path).
-            Ok(durability.replay(self).await?)
+            // Whatever's left is consumed only if it positively identifies as poll()'s own
+            // entry (FINDING_B_FIX_DESIGN.md §13.7.2): a replay consumer must never destroy an
+            // entry it has not identified as its own. The previous unconditional
+            // `durability.replay()` read-then-validate would consume whatever sat at the cursor
+            // — including a structural entry such as `FinishSpan` — and only then fail, turning
+            // any predicate/identity imperfection into a permanent, unrecoverable trap.
+            let peeked = self
+                .state
+                .replay_state
+                .try_get_oplog_entry(|entry| {
+                    matches!(
+                        entry,
+                        OplogEntry::HostCall {
+                            function_name: HostFunctionName::IoPollPoll,
+                            ..
+                        }
+                    )
+                })
+                .await?;
+
+            match peeked {
+                Some((idx, OplogEntry::HostCall { response, .. })) => {
+                    self.state.reset_poll_replay_miss();
+                    trace!(
+                        agent_id = %self.owned_agent_id,
+                        matched_oplog_index = %idx,
+                        "POLLCALL_TRACE poll() REPLAY matched own IoPollPoll entry"
+                    );
+                    let host_response = self
+                        .public_state
+                        .worker()
+                        .oplog()
+                        .download_payload(response)
+                        .await
+                        .map_err(wasmtime::Error::msg)?;
+                    let payload: HostResponsePollResult = host_response
+                        .try_into()
+                        .map_err(|e: String| wasmtime::Error::msg(e))?;
+                    Ok(payload)
+                }
+                _ if self.state.record_poll_replay_miss() > MAX_POLL_REPLAY_MISSES => {
+                    // The cursor has not moved across this many consecutive poll() misses, so
+                    // no other consumer is claiming the entry sitting there either. Synthesizing
+                    // again could only spin forever; fall back to the original unconditional
+                    // read so the failure is reported (and diagnosed) exactly as it was before.
+                    Ok(durability.replay(self).await?)
+                }
+                _ => {
+                    // "Not ready yet" — the legal, self-correcting answer, mirroring what
+                    // `ready()` already does on a predicate miss. Report as ready whichever
+                    // input pollables already have a pre-resolved answer waiting (a stray-scan
+                    // consumed their entry on their behalf, so replaying that answer to the
+                    // correct pollable is not a guess); if none do, wake everything so whichever
+                    // task owns the next entry gets a chance to claim it, rather than
+                    // livelocking on an empty ready-set.
+                    let mut ready: Vec<u32> = Vec::new();
+                    for (index, pollable) in in_.iter().enumerate() {
+                        if self.state.is_pollable_pre_resolved_ready(pollable.rep()) {
+                            ready.push(index as u32);
+                        }
+                    }
+                    if ready.is_empty() {
+                        ready = (0..in_.len() as u32).collect();
+                    }
+                    trace!(
+                        agent_id = %self.owned_agent_id,
+                        ?ready,
+                        "POLLCALL_TRACE poll() REPLAY no own entry at cursor, synthesizing"
+                    );
+                    Ok(HostResponsePollResult { result: Ok(ready) })
+                }
+            }
         };
 
         match result {
@@ -499,4 +557,3 @@ fn is_suspend_for_sleep<T>(result: &Result<T, wasmtime::Error>) -> Option<Durati
         None
     }
 }
-

@@ -117,7 +117,14 @@ impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
                 // this call's own `(function_name, begin_index)` identity — see
                 // FINDING_B_FIX_DESIGN.md §14.9. Every HTTP stream operation gets it, not just
                 // the handful that were retrofitted individually.
-                durability.replay(self).await
+                durability
+                    .replay_or(
+                        self,
+                        HostResponseStreamChunk {
+                            result: Err(SerializableStreamError::Closed),
+                        },
+                    )
+                    .await
             }?;
 
             end_http_request_if_closed(self, handle, &result.result).await?;
@@ -193,7 +200,14 @@ impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
                 // the cache was typed by response shape. Replay re-executes the same guest code
                 // and therefore the same variant, so the more precise key is also the correct
                 // one — and it lets a scan defer one entry of each, instead of one in total.
-                durability.replay(self).await
+                durability
+                    .replay_or(
+                        self,
+                        HostResponseStreamChunk {
+                            result: Err(SerializableStreamError::Closed),
+                        },
+                    )
+                    .await
             }?;
 
             end_http_request_if_closed(self, handle, &result.result).await?;
@@ -238,7 +252,14 @@ impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
-                durability.replay(self).await
+                durability
+                    .replay_or(
+                        self,
+                        HostResponseStreamSkip {
+                            result: Err(SerializableStreamError::Closed),
+                        },
+                    )
+                    .await
             }?;
 
             end_http_request_if_closed(self, handle, &result.result).await?;
@@ -288,7 +309,14 @@ impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
-                durability.replay(self).await
+                durability
+                    .replay_or(
+                        self,
+                        HostResponseStreamSkip {
+                            result: Err(SerializableStreamError::Closed),
+                        },
+                    )
+                    .await
             }?;
             end_http_request_if_closed(self, handle, &result.result).await?;
 
@@ -378,7 +406,14 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                 // it, an ordinary single fetch() with a multi-chunk request body is enough to
                 // strand a check_write entry at the cursor and trap a later poll() with
                 // "expected io::poll::poll, got http::types::outgoing_body_stream::check_write".
-                durability.replay(self).await
+                durability
+                    .replay_or(
+                        self,
+                        HostResponseStreamCheckWrite {
+                            result: Err(SerializableStreamError::Closed),
+                        },
+                    )
+                    .await
             }
             .map_err(StreamError::from)?;
 
@@ -394,7 +429,15 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
             )
             .await
             .map_err(StreamError::from)?;
-            let result = durability.replay(self).await.map_err(StreamError::from)?;
+            let result = durability
+                .replay_or(
+                    self,
+                    HostResponseStreamCheckWrite {
+                        result: Err(SerializableStreamError::Closed),
+                    },
+                )
+                .await
+                .map_err(StreamError::from)?;
             result.result.map_err(StreamError::from)
         } else {
             // Post-snapshot-restore: open_http_requests is empty (not persisted in snapshots) and
@@ -499,7 +542,14 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                 // `write` and `check_write` occur 1:1 in lockstep on every body chunk, so both
                 // must participate or the identical trap simply relocates one call later
                 // (FINDING_B_FIX_DESIGN.md §12.6). Both do, via `Durability::replay_raw`.
-                let replayed = durability.replay(self).await;
+                let replayed = durability
+                    .replay_or(
+                        self,
+                        HostResponseStreamWriteWithBytes {
+                            result: Err(SerializableStreamError::Closed),
+                        },
+                    )
+                    .await;
                 mark_replayed_body_write(self, state.request_handle);
                 replayed
             }
@@ -517,7 +567,15 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
             )
             .await
             .map_err(StreamError::from)?;
-            let result = durability.replay(self).await.map_err(StreamError::from)?;
+            let result = durability
+                .replay_or(
+                    self,
+                    HostResponseStreamWriteWithBytes {
+                        result: Err(SerializableStreamError::Closed),
+                    },
+                )
+                .await
+                .map_err(StreamError::from)?;
             result.result.map(|_bytes| ()).map_err(StreamError::from)
         } else {
             self.observe_function_call("io::streams::output_stream", "write");
@@ -641,7 +699,14 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                 // Records under the same `HostFunctionName` and the same response shape as
                 // write(), so it resolves to the same stray identity and consults the same
                 // cached answer — a stray-scan cannot tell the two apart, nor does it need to.
-                let replayed = durability.replay(self).await;
+                let replayed = durability
+                    .replay_or(
+                        self,
+                        HostResponseStreamWriteWithBytes {
+                            result: Err(SerializableStreamError::Closed),
+                        },
+                    )
+                    .await;
                 mark_replayed_body_write(self, state.request_handle);
                 replayed
             }
@@ -700,7 +765,14 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
-                durability.replay(self).await
+                durability
+                    .replay_or(
+                        self,
+                        HostResponseStreamWriteResult {
+                            result: Err(SerializableStreamError::Closed),
+                        },
+                    )
+                    .await
             }
             .map_err(StreamError::from)?;
 
@@ -753,7 +825,14 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
-                durability.replay(self).await
+                durability
+                    .replay_or(
+                        self,
+                        HostResponseStreamWriteResult {
+                            result: Err(SerializableStreamError::Closed),
+                        },
+                    )
+                    .await
             }
             .map_err(StreamError::from)?;
 
@@ -832,7 +911,14 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
-                let replayed = durability.replay(self).await;
+                let replayed = durability
+                    .replay_or(
+                        self,
+                        HostResponseStreamWriteZeroes {
+                            result: Err(SerializableStreamError::Closed),
+                        },
+                    )
+                    .await;
                 mark_replayed_body_write(self, state.request_handle);
                 replayed
             }
@@ -923,7 +1009,14 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
-                let replayed = durability.replay(self).await;
+                let replayed = durability
+                    .replay_or(
+                        self,
+                        HostResponseStreamWriteZeroes {
+                            result: Err(SerializableStreamError::Closed),
+                        },
+                    )
+                    .await;
                 mark_replayed_body_write(self, state.request_handle);
                 replayed
             }
@@ -982,7 +1075,14 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
-                durability.replay(self).await
+                durability
+                    .replay_or(
+                        self,
+                        HostResponseStreamSkip {
+                            result: Err(SerializableStreamError::Closed),
+                        },
+                    )
+                    .await
             }
             .map_err(StreamError::from)?;
 
@@ -1049,7 +1149,14 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                     )
                     .await
             } else {
-                durability.replay(self).await
+                durability
+                    .replay_or(
+                        self,
+                        HostResponseStreamSkip {
+                            result: Err(SerializableStreamError::Closed),
+                        },
+                    )
+                    .await
             }
             .map_err(StreamError::from)?;
 

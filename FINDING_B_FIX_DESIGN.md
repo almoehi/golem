@@ -2748,7 +2748,460 @@ newly-wired family (outgoing stream, incoming stream, trailers, RDBMS). Every pr
 `stray_entry_tests` and `replay_state::tests` case survives with only the mechanical identity-
 constructor change, except the one documented above.
 
-## 15. RCA of `character_sheet`'s residual `blocking_read`/`poll` trap — the "app-level reset non-determinism" hypothesis is refuted
+## 15. Fourteenth capture — one identity repeating back to back strands its own second entry
+
+Status: **IMPLEMENTED.** Branch `hrapp/scene-plates-sequential-poll-trap`.
+
+### 15.1 The live capture
+
+`WorkerAgent("workspace-smoketest@1.0","3e0f1d89-bd02-4bff-a96e-3374a03f2399@character_sheet")`,
+oplog entries `#02254` and `#02255` — both `HttpTypesIncomingBodyStreamBlockingRead`, both
+`WriteRemoteBatched(Some(OplogIndex(2190)))`, i.e. **the same `StrayEntryIdentity`, twice in a row**.
+The trap that followed:
+
+```
+Unexpected oplog entry during replay: expected io::poll::poll,
+got http::types::incoming_body_stream::blocking_read
+```
+
+Raw evidence: `oplog-backups/2026-08-30_WorkerAgent_workspace-smoketest_3e0f1d89-character_sheet_POSTFIX_CHECKWRITE-FIXED_BLOCKINGREAD-TRAP.oplog`.
+
+Two `blocking_read()` calls on one incoming body stream is not an exotic shape — it is what a chunked
+response body that doesn't arrive in a single call always produces, the incoming-direction twin of
+§12.2's 106 `check_write`/`write` pairs.
+
+### 15.2 Root cause: the one-answer-per-identity cache, and the scan bound built on top of it
+
+Both halves of §14's general mechanism assumed at most one pending answer per identity:
+
+- `pre_resolved_stray: HashMap<StrayEntryIdentity, HostResponse>` — one slot per key.
+- `StrayEntryScan` therefore refused a second entry for an identity it had already consumed, **or
+  one whose answer was still uncollected in the cache** (`cached_stray_identities()` seeded the
+  scan's `consumed` set). Documented in §12/§14.7(d) as protecting against a scan running away
+  through a whole write cluster and keeping only the last answer of each kind.
+
+The bound is correct given a single-slot cache, and it was correct that different *functions*
+sharing one namespace (`check_write` vs `write`) need distinct identities. What neither half handled
+is the same exact `(function_name, namespace)` pair repeating for genuinely distinct calls.
+
+The failure sequence, reconstructed against the code:
+
+1. `poll()`'s replay calls `consume_and_cache_stray_entries(None)` (`io/poll.rs`). The scan defers
+   `#02254`, caches it, then **refuses `#02255`** and stops, leaving it at the cursor.
+2. `poll()` then reads with `is_own_poll_entry` — misses, since `#02255` sits there.
+3. It synthesizes a ready-set and returns (§13.7.2's non-destructive miss), and the guest re-polls.
+4. On the retry, `stray_entry_scan()` re-seeds `consumed` from `cached_stray_identities()`. `#02254`'s
+   answer is still uncollected, so the identity is still blocked and `#02255` is refused **again**.
+   The cursor has not moved.
+5. `record_poll_replay_miss()` counts consecutive misses at that unmoved cursor. Once the streak
+   exceeds the entries remaining ahead of it, `poll()` falls back to the original unconditional
+   `durability.replay(self)` — which consumes `#02255` and reports the mismatch. Permanent trap.
+
+This also explains why the analogous `IoPollReady` shape never trapped this way: `ready()`'s owner
+*does* get scheduled between poll retries, collects the cached answer, frees the identity, and the
+next scan then consumes the second occurrence. `blocking_read`'s owner was not scheduled, so the
+streak ran to the bound. The mechanism's self-healing was load-bearing and merely happened to work.
+
+### 15.3 The fix
+
+**Key the cache on `(StrayEntryIdentity, occurrence_index)`, with the occurrence index carried
+implicitly as FIFO queue position** — `PreResolvedStrayCache`, a named type wrapping
+`HashMap<StrayEntryIdentity, VecDeque<HostResponse>>` with `record`/`take`/`peek`.
+
+This is the brief's design; the deviation is only in how `occurrence_index` is represented, and it
+is deliberate. An explicit index has to be agreed on by two parties — the scan that defers an entry
+and the owner that later collects it — and neither can derive it from the other without a shared
+counter that both mutate (the scan on defer, the owner on *every* collect, including collects that
+bypass the cache and read the oplog directly). That is a write index and a read index over one
+per-identity sequence, i.e. exactly a FIFO queue, with the counters made explicit and therefore
+capable of drifting. Making the position implicit removes the failure mode instead of managing it.
+
+Its correctness rests on one invariant, already established in §14.7(d) and unchanged here: **one
+identity's entries are produced, deferred and collected in oplog order.** The replay cursor advances
+monotonically, so entries enter a queue in oplog order; a `StrayEntryIdentity` corresponds to one
+WASI resource owned by one guest task (WASI resource ownership makes two tasks sharing a
+`Resource<InputStream>` impossible), so its calls are serialized and its Nth call wants its Nth
+entry. Pushing at the back and popping at the front therefore cannot get out of step.
+
+**Snapshot recovery needs no handling here, and this was verified rather than assumed.** Unlike
+`pollable_seq`/`invoke_result_seq` — whose values must stay consistent with *already-persisted*
+entries, hence their snapshot-restore machinery — the cache is pure per-replay-pass scratch state:
+constructed empty (`PreResolvedStrayCache::default()`), never serialized, never read outside a
+replay pass. Nothing about queue position spans a snapshot boundary.
+
+**The scan bound is removed entirely** (question 2 of the brief). §12's stated reason for it was
+cache collision, which no longer exists. No *other* reason survives scrutiny, and re-adding one
+would reintroduce this exact trap: a scan stops at the first entry it does not accept, so a
+contiguous run of foreign tracked entries must be cleared in full before the caller's own entry can
+be reached — consuming less than all of it cannot make progress, and whatever is left behind is
+reachable by nobody. `StrayEntryScan` is now bounded by the only two things that genuinely bound it,
+both already in `is_stray_concurrent_entry`: an entry belonging to no tracked operation, and an
+entry carrying the caller's OWN identity. It consequently became stateless (`accept(&self)`), and
+`cached_stray_identities()` was deleted.
+
+The trade-off, recorded in `StrayEntryScan`'s doc comment: one scan can now hold a whole contiguous
+foreign run's payloads in memory at once (a 106-pair body cluster) rather than leaving most in the
+oplog. That run has to be consumed before the caller can proceed either way — only retention
+differs, and it is released as each owner collects. Note this is not the common path: in-order
+replay defers nothing, because each consumer's own entry is at the cursor and its own identity is
+excluded, so the scan stops immediately at zero entries.
+
+**Question 3 (every consumer computing its own occurrence index) needs no per-consumer work.** All
+four collection paths — `Durability::replay_raw` (~92 sites), `ready()`, RPC `get()`,
+`future_incoming_response::get` — already funnel through `take_pre_resolved_stray(&identity)`, and
+`poll()`'s synthesis peek through `is_pollable_pre_resolved_ready`. Making those pop/peek the queue
+front is the entire consumer-side change; no call site learns a new concept. The positive-identity
+match against the live cursor is unaffected: it matches on identity, and successive occurrences are
+indistinguishable there by construction — whichever is at the cursor IS the caller's next one,
+because the cursor advances in oplog order.
+
+### 15.4 Test results
+
+`cargo build --release -p golem-worker-executor` clean; `cargo clippy --release --lib --tests` clean.
+`cargo test -p golem-worker-executor --lib --release` = **493 passed, 0 failed, 0 ignored, 0
+filtered** (488 before: −2 obsolete bound tests, +7 new).
+
+New tests, all asserting payload CONTENT rather than merely "no crash" — a wrong-slot bug here is a
+silent misdelivery (§14.2.1's failure mode), not necessarily a trap:
+
+| Test | Asserts |
+|---|---|
+| `two_blocking_reads_on_one_stream_each_replay_to_their_own_answer` (replay_state) | The capture verbatim: two same-identity `blocking_read` entries + `poll_entry`, at the real replay cursor. BOTH defer; each replays to its own chunk (`first`/`second`) in order; `poll()`'s own entry is then reachable. Fails on the old bound at the first assertion. |
+| `many_occurrences_of_one_identity_all_replay_in_order` (replay_state) | Same with N=5 — confirms N=2 is not special-cased. |
+| `a_repeated_identity_still_stops_its_own_owners_scan` (replay_state) | The surviving bound: a `blocking_read`'s own scan defers the foreign `check_write` but leaves both of its own entries at the cursor. |
+| `stray_scan_walks_every_occurrence_of_a_repeated_identity` (replay_state) | Rewrite of `stray_scan_stops_at_the_second_entry_for_one_identity` — same 4-entry `check_write`/`write` cluster, now asserting all 4 defer and `poll()` gets through. |
+| `repeated_occurrences_of_one_identity_are_returned_in_call_order` (mod) | `PreResolvedStrayCache` directly: 3 chunks in, `peek` and `take` both yield the owner's NEXT answer in order, queue drains to empty. |
+| `queues_of_different_identities_are_independent` (mod) | Interleaved `blocking_read`/`write` records; collecting one identity does not shift the other's ordering. |
+| `scan_accepts_every_occurrence_of_a_repeated_identity` (mod) | Replaces `scan_accepts_at_most_one_entry_per_identity` — the inverse assertion, plus the two surviving bounds. |
+| `scan_still_stops_at_every_occurrence_of_its_own_identity` (mod) | Exclusion is per-identity and repetition-insensitive. |
+
+Two tests were **deleted** as assertions of the now-removed bound, not adapted:
+`scan_accepts_at_most_one_entry_per_identity` and `scan_refuses_identities_whose_answer_is_already_cached`
+(the latter tested `cached_stray_identities()` seeding, the exact mechanism behind step 4 above).
+`each_deferred_entry_is_returned_to_its_own_owner` — §14.3's counterexample — was retargeted from a
+hand-rolled `HashMap` simulation onto the real `PreResolvedStrayCache`, so it now exercises
+production code rather than a re-implementation of it.
+
+`tests/rpc.rs` / `tests/durability.rs` compile clean under `cargo check --release --tests` but were
+**not run**: this worktree has only 5 of the ~21 `test-components/*.wasm` fixtures built, so the
+integration harness aborts during component cache warm-up before any test body executes. An
+environmental gap, unrelated to this change. Live verification is deliberately out of scope here.
+
+### 15.5 Live verification round 1 — the fix works, and exposes the defect the old bound was masking
+
+The §15.3 fix was built and live-verified against the same agent. **The target trap is gone**:
+`#02254`/`#02255` (the two same-identity `blocking_read` entries) now both replay cleanly to their
+own answers. A different trap appears immediately after, at the next entry:
+
+```
+retry_from: OplogIndex(2255)
+Unexpected oplog entry - expected OplogEntry :: HostCall |, got EndRemoteWrite { begin_index: OplogIndex(2190) }
+```
+
+The full oplog window, from the fresh dump — one outgoing `POST ollama.com/api/chat`, batch
+`BeginRemoteWrite` at `#02190`:
+
+```
+#02251: CALL io::poll::poll
+#02252: CALL io::poll::pollable::ready
+#02253: CALL http::types::future_incoming_response::get   -> headers-received(200)
+#02254: CALL http::types::incoming_body_stream::blocking_read -> ok([...470-byte body...])
+#02255: CALL http::types::incoming_body_stream::blocking_read -> err(closed)
+#02256: END REMOTE WRITE  (begin_index: 2190)
+#02257: FINISH SPAN
+```
+
+`retry_from: 2255` confirms `#02254` AND `#02255` both replayed successfully — the §15.3 fix doing
+exactly its job — and the failure is now at `#02256`.
+
+#### 15.5.1 The `matched: true` trace is not a loose predicate
+
+The accompanying trace,
+
+```
+TRYGET_TRACE try_get_oplog_entry peeked entry, oplog_index: 2256, entry: EndRemoteWrite { ... }, matched: true
+```
+
+looks like an identity predicate wrongly matching a structural entry — in particular one that might
+be comparing `begin_index` (which `EndRemoteWrite` also carries) without first checking the variant.
+It is not. `ReplayState::get_oplog_entry()` is implemented as `try_get_oplog_entry(|_| true)`
+(`replay_state.rs`), so **every unconditional read logs `matched: true` for whatever sits at the
+cursor**. The predicate that "matched" is the always-true closure.
+
+Every real identity predicate was audited and all are structurally sound: `stray_entry_identity`
+destructures `OplogEntry::HostCall { .. }` first and returns `None` for every other variant, so
+`is_stray_concurrent_entry`, `StrayEntryScan` and the cache key inherit that guard;
+`is_own_poll_entry` and `is_own_invoke_result_entry` both match on `OplogEntry::HostCall { .. }`
+patterns. No predicate compares an inner field before confirming the variant. Candidate (a) —
+a structurally loose identity check — is **ruled out**.
+
+Candidate (b) — the new FIFO design hunting a non-existent occurrence #3 — is **also ruled out** by
+the payloads: the guest makes exactly two `blocking_read` calls, `ok(body)` then `err(closed)`, and
+`err(closed)` is what terminates its read loop. Nothing looks for a third.
+
+#### 15.5.2 Root cause: the post-scan read was destructive, and the old scan bound was hiding it
+
+The culprit is `get_oplog_entry!(.., OplogEntry::HostCall)` — an unconditional,
+consume-then-validate read — at the two sites reached after a stray-entry scan:
+`read_persisted_durable_function_invocation` (`durability.rs`, i.e. `Durability::replay_raw`'s
+step 3, covering ~92 call sites) and `future_incoming_response::get`'s hand-wired replay
+(`http/types.rs`).
+
+A scan stops at the first entry it does not recognize. Structural entries — `EndRemoteWrite`,
+`FinishSpan`, `EndAtomicRegion` — are never recognized (they are not `HostCall`s, so they have no
+identity), which is correct. But it means **a scan that clears a whole run of tracked entries parks
+the cursor precisely on a structural entry**, and the consumer's next act was to consume it blindly
+and only then report the type mismatch — destroying the engine's own region bookkeeping and
+converting a retriable failure into a permanent one.
+
+The live sequence: the reactor re-polls the response future after `#02253` already resolved it, so
+`future_incoming_response::get` runs with its queue exhausted. Its identity
+(`FutureIncomingResponseGet`, `Batch(2190)`) differs from `blocking_read`'s, so its scan legitimately
+defers `#02254` and `#02255` — then its unconditional read eats `#02256`.
+
+**This is precisely §13.7.2's documented hazard, and §14.9 step 4 designed the fix for it; §14.13
+deviation 2 deliberately deferred it as "no evidence of a problem".** What supplied that apparent
+absence of evidence was the one-entry-per-identity scan bound: by stopping at the second occurrence
+of any identity, it left a `HostCall` at the cursor in almost every case, so the destructive read
+almost always landed on one. §15.3 removed that bound for the reasons given there — and with it, the
+accidental protection. The bound removal is not itself wrong; it exposed a latent defect that was
+always reachable and simply had not been hit.
+
+#### 15.5.3 Fix
+
+`DurableWorkerCtx::read_host_call_entry` becomes the single authoritative replay read for host-call
+entries. It consumes the entry at the cursor **only if it is an `OplogEntry::HostCall`**; anything
+else is left in place (`try_get_oplog_entry` rewinds on refusal) and reported back as the refused
+entry's debug string. Both public readers are thin wrappers, so they cannot drift:
+
+- `read_persisted_durable_function_invocation` → refusal becomes the same
+  `unexpected_oplog_entry("OplogEntry::HostCall", <entry debug>)` error as before, with the same
+  diagnostics (the entry's `Debug` is captured inside the predicate, since a rewind never hands the
+  entry back). **Only the destructive side effect is gone.** This covers `replay_raw`'s tracked and
+  untracked branches alike, and therefore also `poll()`'s bounded-miss fallback — which takes the
+  untracked branch (`IoPollPoll` is `ReadLocal`) and could otherwise have destroyed `#02256` itself
+  once the miss streak ran out.
+- `try_read_persisted_durable_function_invocation` → refusal becomes `None`, for consumers holding a
+  legal "not yet". Used by `future_incoming_response::get`, which returns
+  `SerializableHttpResponse::Pending` (`Ok(None)`) — the answer its own code already had an arm for,
+  and the one the guest's reactor is built to re-poll on. Gated on the stray protocol being active
+  for that request; with no identity (post-snapshot-restore mid-request) nothing can defer its
+  entries, so a miss there is still a genuine mismatch and is still reported.
+
+Deliberately a **variant** check, never an identity check: function-name validation stays exactly
+where it was, so no call site changes behaviour when a `HostCall` really is at the cursor. That
+sidesteps §14.13's objection to identity strictness across ~92 sites entirely — the change is
+"do not destroy what you are about to reject", nothing more. `future_incoming_response::get`'s
+hand-rolled read and its duplicate `download_payload` were replaced by the shared reader.
+
+#### 15.5.4 Test results
+
+`cargo build --release -p golem-worker-executor` clean; `cargo clippy --release --lib --tests` clean.
+`cargo test -p golem-worker-executor --lib --release` = **496 passed, 0 failed, 0 ignored, 0
+filtered** (493 after §15.3, +3).
+
+| Test | Asserts |
+|---|---|
+| `a_structural_entry_closing_the_batch_is_never_consumed_by_a_scan` | The live shape: two same-identity entries then the batch's own `EndRemoteWrite`. Both defer, the marker does not, and `stray_entry_identity` returns `None` for it — even though it carries a `begin_index` holding the identical `OplogIndex` the cluster is keyed by. |
+| `a_post_scan_read_refuses_a_structural_entry_without_consuming_it` | A before/after pair on the real primitives: the unconditional read (`get_oplog_entry()`) CONSUMES the `EndRemoteWrite` and it is then gone forever; the guarded read refuses it and the entry survives at the cursor for `end_function`. |
+| `every_structural_variant_is_refused_by_a_host_call_read` | Generality beyond `EndRemoteWrite`: `FinishSpan` (no `begin_index` at all) and `EndAtomicRegion` (has one) are refused identically and carry no stray identity. |
+
+Integration suites remain un-runnable in this worktree for the fixture reason recorded in §15.4.
+
+### 15.6 Live verification round 2 — the §15.5 fix is working; the remaining failure is a LIVELOCK, not a mismatch
+
+`84bbfa915` was live-verified and traps again with near-identical text. Reading the trace against the
+compiled source shows the §15.5 guard is doing exactly its job, and that the residual failure has a
+different cause.
+
+#### 15.6.1 The three peeks, traced to source
+
+```
+ready()  rep 19, seq 503
+  TRYGET peeked 2256 EndRemoteWrite matched: false   -> ready() synthesizes false, returns Ok(false)
+poll()   reps [19]
+  TRYGET peeked 2256 EndRemoteWrite matched: false   (1)
+  TRYGET peeked 2256 EndRemoteWrite matched: false   (2)
+  TRYGET peeked 2256 EndRemoteWrite matched: false   (3)
+  TRAP: expected OplogEntry::HostCall, got EndRemoteWrite{begin_index: 2190}
+```
+
+All three are inside ONE `poll()` call (`io/poll.rs`):
+
+1. `consume_and_cache_stray_entries(None)` — the scan's peek. `EndRemoteWrite` is not a `HostCall`,
+   so `stray_entry_identity` gives `None` and the scan stops having drained **zero** entries.
+2. `try_get_oplog_entry(is_own_poll_entry)` — refuses, cursor unmoved.
+3. `record_poll_replay_miss()` returns `true` → `durability.replay(self)` → `replay_raw`'s
+   **untracked** branch (`IoPollPoll` is tagged `ReadLocal`, so `stray_identity_of` is `None`) →
+   `read_persisted_durable_function_invocation` → `read_host_call_entry` → refuses → `Err`.
+
+Confirmation that this is the new reader and not the old macro: the error reads `expected
+OplogEntry::HostCall`, whereas `get_oplog_entry!`'s `stringify!` form emitted `expected OplogEntry ::
+HostCall |` (with the trailing pipe), which is what the §15.5 capture showed. **The §15.5 fix is
+live and correct — `#02256` is no longer consumed.** Neither hypothesis (a) nor (b) as posed holds:
+there is no unguarded read left on this path (every consumer routes through the guarded reader), and
+nothing is hunting a third occurrence.
+
+#### 15.6.2 What actually fails: a livelock, and a bound whose premise does not hold here
+
+`record_poll_replay_miss`'s bound is `misses > replay_target − cursor`. `replay_target` is the end of
+the whole replay region (~#02900 for this agent) and the cursor is #02255, so the bound is ~645, not
+3 — the three peeks are the FINAL `poll()` call, after roughly that many identical iterations. The
+trap is the bound firing at the end of a spin, not a one-shot mismatch.
+
+The spin is a **contradiction between the two synthesis paths**:
+
+- `poll()`, on a miss, reports every input pollable as ready (`ready = (0..in_.len())`, "wake
+  everything") — telling the guest rep 19 is ready.
+- `ready()`, on the same miss, returns `false` — telling the guest rep 19 is *not* ready.
+
+The guest therefore alternates between them forever. Meanwhile the cursor genuinely cannot move:
+`#02256` is `EndRemoteWrite{begin_index: 2190}`, whose only consumer is `end_function` for that
+still-open batch — and `end_function` is driven by GUEST CONTROL FLOW (the guest dropping the HTTP
+resource), not by consuming the replay cursor. So the one thing that can unblock replay is the guest
+finishing the request, and `ready()`'s `false` is precisely what prevents it from doing so.
+
+This is why the bound's reasoning fails: it counts oplog *consumers* remaining ahead of the cursor as
+a proxy for "someone else's turn will move it". That proxy is valid for host-call entries and invalid
+for structural ones, whose owner needs no oplog entry at all.
+
+§15.3's removal of the per-identity scan bound is what makes this state common rather than rare: a
+scan can now clear a batch's entire remaining run in one call, which parks the cursor on the closing
+marker. The contradiction itself is pre-existing.
+
+#### 15.6.3 Fix
+
+Both synthesis paths now agree, keyed on one fact neither had access to before: **is the replay
+cursor parked on a structural entry?** Captured inside the existing peek predicate (a refusal rewinds
+and never hands the entry back, so it must be recorded from inside) — no extra oplog read.
+
+- **`ready()`**: on a predicate miss, synthesizes `!cursor_is_host_call`. While host-call entries
+  remain at the cursor, `false` ("not ready yet") is still correct — this pollable's entry may be
+  further along and another consumer will claim what is here first. Once the cursor is parked on a
+  structural entry, `false` can only mean "wait forever", so it reports ready, agreeing with
+  `poll()`. This is not a guess about data: the read the guest then performs is itself replay-guarded
+  and non-destructive, so it either collects a pre-resolved answer or is correctly told nothing of
+  its own is at the cursor.
+- **`poll()`**: the give-up fallback is taken only when `cursor_is_host_call`. Against a structural
+  entry the fallback is guaranteed to fail and diagnoses nothing — it can only report "expected
+  HostCall, got EndRemoteWrite" — so it is suppressed and synthesis continues, letting the guest make
+  the control-flow progress that consumes the marker. Against a host-call entry the bound's counting
+  argument does hold and the original diagnosable failure is preserved unchanged.
+
+#### 15.6.4 Test results
+
+Release build and `cargo clippy --release --lib --tests` clean.
+`cargo test -p golem-worker-executor --lib --release` = **498 passed, 0 failed, 0 ignored, 0
+filtered** (496 after §15.5, +2).
+
+| Test | Asserts |
+|---|---|
+| `ready_then_poll_both_refuse_a_parked_structural_entry_without_consuming_it` | The live sequence end to end: a scan clears the two same-identity `blocking_read`s, parking the cursor on the batch's `EndRemoteWrite`; then all three peeks in order — `ready()`'s seq predicate, `poll()`'s own-entry predicate, `poll()`'s fallback host-call read — refuse it, each observes `cursor_is_host_call == false` (the flag that flips `ready()`'s answer and suppresses the fallback), and the marker survives all three for `end_function`. |
+| `a_host_call_cursor_is_still_reported_as_not_ready` | The converse: a foreign `HostCall` at the cursor is NOT treated as parked, so `ready()` keeps returning "not ready yet" and the give-up bound stays armed. |
+
+#### 15.6.5 Residual uncertainty, stated plainly
+
+The failure mode this converts is a spin, so the honest expectation is: replay either proceeds past
+`#02256` (the guest reads, collects its pre-resolved answers, drops the resource, `end_function`
+consumes the marker), or it makes no progress and **hangs instead of trapping**. A hang would prove
+the guest's blocker is something other than `ready()`'s answer, and would be strictly more
+informative than the current identical trap.
+
+If it does not clear, the evidence needed next is the trace window BEFORE the spin — specifically the
+`STRAY_TRACE record_pre_resolved_stray` lines for `Batch(2190)` (which consumer drained `#02254`/
+`#02255`, and whether their answers were ever collected by a `take_pre_resolved_stray`), plus the
+first `POLLCALL_TRACE ... synthesizing` after the cursor reached #02255. The oplog itself is not the
+limiting evidence here; the consumer ordering is.
+
+### 15.7 Live verification round 3 — the same defect, generalized once and for all
+
+`f055798b1` cleared the livelock: `poll()`/`ready()` stopped contradicting each other and the guest's
+control flow genuinely advanced into new code. It then trapped inside `OutputStream::check_write`
+with the identical text (`expected OplogEntry::HostCall, got EndRemoteWrite{begin_index: 2190}`).
+
+#### 15.7.1 There was no separate `check_write` fallback — it was the shared path all along
+
+`check_write` has three replay branches (`io/streams.rs`), and reading them rules out the
+"sibling call site has its own unguarded fallback" theory:
+
+| Branch | Read | Status |
+|---|---|---|
+| `is_http` | `durability.replay(self)` | the SHARED `replay_raw` path |
+| `replaying_http_batch` | `durability.replay(self)` | the SHARED `replay_raw` path |
+| post-snapshot-restore | its own `try_get_oplog_entry` with a name-specific predicate | already guarded, already non-destructive |
+
+So the trap came from `replay_raw` itself, via the §15.5 guarded reader — which correctly refused to
+consume `#02256` and then, having no answer, returned the error. **The guard worked; the error was
+the problem.** `poll()` needed a bespoke fix in §15.6 only because it never goes through
+`Durability` on that path at all.
+
+This reframes the whole class: it is not "each call site has its own fallback to patch". It is one
+shared behaviour — *what `replay_raw` does when the recorded region is exhausted* — that was wrong
+for every tracked consumer at once.
+
+#### 15.7.2 The general rule
+
+A parked structural cursor means the guest is executing MORE calls on a resource than the live run
+recorded. That is not a corrupt oplog and not a mis-ordering — there is genuinely nothing left to
+replay for that resource. Trapping is wrong twice over: the marker's owner (`end_function`, the span
+machinery) is driven by GUEST CONTROL FLOW rather than by consuming the cursor, so (a) the cursor can
+only move once the guest winds the operation down, and (b) trapping is exactly what stops it. The
+correct answer is the operation's own terminal value, which every affected function already has.
+
+#### 15.7.3 Fix — `Durability::replay_or`
+
+`replay_raw` is refactored into `replay_raw_opt`, returning `Ok(None)` for the parked case. Both
+branches (tracked and untracked) now use the `try_` reader, so the condition is detected uniformly.
+
+- `replay_raw`/`replay` — unchanged error surface. Callers with no terminal answer behave exactly as
+  before.
+- `replay_or(ctx, exhausted)` — returns `exhausted` on a parked cursor, after `end_durable_function`.
+  Fires ONLY on a parked structural cursor: a foreign `HostCall` at the cursor still errors, because
+  that entry has a real consumer that will claim it and move things along.
+
+**Wired at every tracked stream/HTTP consumer in one pass** — 16 sites, not just the two that had
+failed, so the failure cannot simply relocate one call later (§12.6's lockstep lesson):
+
+| Site | Terminal answer |
+|---|---|
+| `read`, `blocking_read` (`StreamChunk`) | `Err(SerializableStreamError::Closed)` |
+| `skip`, `blocking_skip`, `splice`, `blocking_splice` (`StreamSkip`) | `Err(Closed)` |
+| `check_write` ×2 (`StreamCheckWrite`) | `Err(Closed)` |
+| `write` ×2, `blocking_write_and_flush` (`StreamWriteWithBytes`) | `Err(Closed)` |
+| `flush`, `blocking_flush` (`StreamWriteResult`) | `Err(Closed)` |
+| `write_zeroes`, `blocking_write_zeroes_and_flush` (`StreamWriteZeroes`) | `Err(Closed)` |
+| `future_trailers::get` (`HttpFutureTrailersGet`) | `Ok(None)` |
+
+`future_incoming_response::get` already returns `Pending` on this condition (§15.5) and is unchanged.
+
+#### 15.7.4 Tracked list — what still has today's erroring behaviour
+
+Audited exhaustively rather than assumed. Every other `durability.replay(...)` in the crate
+(blobstore, clocks, sockets, websocket, keyvalue, the non-stream RDBMS calls) constructs an
+**untracked** `DurableFunctionType` — `WriteRemote`/`ReadRemote`/`ReadLocal` — so no scan can ever
+defer its entries and it cannot be parked by this mechanism. They are unaffected by design, not
+merely unfixed.
+
+The only tracked consumers left on the erroring path are **three RDBMS result-stream sites**, all
+`WriteRemoteBatched(Some(_))` (`rdbms/mod.rs`): `db_connection_durable_query_stream`,
+`db_result_stream_durable_get_columns`, `db_result_stream_durable_get_next`. They have the same shape
+and would take `Ok(None)`-style terminal answers, but there is no observed concurrent
+query-stream workload (§14.9's caveat) and no way to exercise them here, so they are listed rather
+than speculatively wired. The `WriteRemoteTransaction(Some(_))` sites remain out of scope per
+§14.7(c) — they do not participate in the stray mechanism at all.
+
+#### 15.7.5 Test results
+
+Release build and `cargo clippy --release --lib --tests` clean.
+`cargo test -p golem-worker-executor --lib --release` = **501 passed, 0 failed, 0 ignored, 0
+filtered** (498 after §15.6, +3).
+
+| Test | Asserts |
+|---|---|
+| `replay_or_returns_the_exhausted_answer_on_a_parked_cursor` | The live shape via the mock host: the reader reports a parked cursor and `replay_or` returns the caller's terminal answer instead of trapping — and `host_call_reads == 1`, proving the reader really was consulted rather than the result being faked by never reading. |
+| `replay_still_errors_on_a_parked_cursor` | The unchanged half: a caller with no terminal answer gets the same error as before on the same cursor. |
+| `replay_or_returns_the_recorded_answer_when_one_is_present` | `replay_or` must not shadow a real recorded answer — the wrong-way bug here would silently feed every replay a terminal value. |
+## 16. RCA of `character_sheet`'s residual `blocking_read`/`poll` trap — the "app-level reset non-determinism" hypothesis is refuted
 
 `oplog-backups/README.md`'s "Tracked follow-up" note (end of the Fourteenth-capture entry) flagged a
 candidate explanation for `WorkerAgent("workspace-smoketest@1.0", "...@character_sheet")`'s residual

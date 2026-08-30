@@ -124,7 +124,7 @@ use golem_service_base::model::{
 use golem_wasm::Uri;
 use golem_wasm::wasmtime::{ResourceStore, ResourceTypeId};
 use replay_state::ReplayEvent;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Debug, Display, Formatter};
 use std::path::{Path, PathBuf};
@@ -4165,9 +4165,12 @@ struct PrivateDurableWorkerState {
     /// `check_write` payload to a `write` consumer, since one HTTP request's `begin_index` is
     /// shared by thirteen host functions across eight response shapes (§14.3).
     ///
+    /// Each identity's answers are held in a FIFO queue, one slot per occurrence — see
+    /// `PreResolvedStrayCache` for why that is load-bearing rather than incidental.
+    ///
     /// Populated by `decode_and_cache_stray_entry`, drained by `take_pre_resolved_stray`.
     /// Always empty on the live path.
-    pre_resolved_stray: HashMap<StrayEntryIdentity, HostResponse>,
+    pre_resolved_stray: PreResolvedStrayCache,
 
     /// Every currently-open batched-remote-write region, by its `BeginRemoteWrite` oplog index
     /// — the `IdentityNamespace::Batch` half of `tracked_concurrent_op_seqs`.
@@ -4455,48 +4458,93 @@ pub fn is_own_poll_entry(entry: &OplogEntry) -> bool {
     )
 }
 
-/// Stateful predicate driving one `consume_stray_entries` walk.
+/// Answers consumed early by a stray-scan, held for their real owners to collect — one FIFO
+/// queue per `StrayEntryIdentity`.
 ///
-/// Recognition alone (`is_stray_concurrent_entry`) is not a safe consumption rule: every
-/// pre-resolved cache holds at most ONE pending answer per identity, so consuming a second entry
-/// for an identity whose answer is already held would silently destroy the first. That is not
-/// hypothetical — an ordinary `fetch()` with a multi-chunk body records `check_write`/`write`
-/// pairs for the SAME request back to back (106 of each in the capture behind
-/// FINDING_B_FIX_DESIGN.md §12), so a scan that only checked recognition would run away through
-/// an entire write cluster and keep only the last entry of each kind.
+/// The per-identity QUEUE (rather than a single slot) is the whole point: the same
+/// `(function_name, namespace)` pair legitimately repeats back to back in the oplog for
+/// genuinely distinct calls — two `blocking_read()` calls on one chunked incoming body stream,
+/// or the 106 `check_write`/`write` pairs of a multi-chunk request body. A single-slot cache
+/// forced `StrayEntryScan` to stop at the second occurrence and strand it at the cursor, where
+/// the next real consumer trapped on it (FINDING_B_FIX_DESIGN.md §15).
 ///
-/// This bounds the walk to at most one entry per distinct identity: the second occurrence stops
-/// the scan and is left at the cursor for its owner's own replay to consume.
+/// **Queue position is the occurrence index**, and keeping it implicit rather than an explicit
+/// shared counter is what keeps the deferring scan and the collecting owner in agreement by
+/// construction: both sides touch one identity's entries in oplog order — the replay cursor
+/// advances monotonically, and each identity belongs to exactly one guest task, so its calls are
+/// serialized (§14.7(d)) — so pushing at the back and popping at the front cannot get out of
+/// step. There is no counter to reset, and therefore nothing here needs snapshot-recovery
+/// handling (unlike `pollable_seq`/`invoke_result_seq`, whose values must stay consistent with
+/// already-persisted entries): this is pure per-replay-pass scratch state, built empty at
+/// construction and never serialized.
+#[derive(Debug, Default)]
+pub struct PreResolvedStrayCache {
+    queues: HashMap<StrayEntryIdentity, VecDeque<HostResponse>>,
+}
+
+impl PreResolvedStrayCache {
+    /// Appends one deferred answer to `identity`'s queue. Returns the queue's new depth (for
+    /// tracing). Never replaces: every occurrence is a distinct call's answer.
+    pub fn record(&mut self, identity: StrayEntryIdentity, response: HostResponse) -> usize {
+        let queue = self.queues.entry(identity).or_default();
+        queue.push_back(response);
+        queue.len()
+    }
+
+    /// Removes and returns the OLDEST uncollected answer for `identity` — the one belonging to
+    /// its owner's next call.
+    pub fn take(&mut self, identity: &StrayEntryIdentity) -> Option<HostResponse> {
+        let queue = self.queues.get_mut(identity)?;
+        let taken = queue.pop_front();
+        if queue.is_empty() {
+            self.queues.remove(identity);
+        }
+        taken
+    }
+
+    /// Non-consuming look at what `take` would return next.
+    pub fn peek(&self, identity: &StrayEntryIdentity) -> Option<&HostResponse> {
+        self.queues.get(identity).and_then(|q| q.front())
+    }
+}
+
+/// The consumption policy for one `consume_stray_entries` walk: which entries at the replay
+/// cursor this scan may durably consume on their owners' behalf.
+///
+/// The walk runs to the first entry it does NOT accept, so the policy is what bounds it. Two
+/// things bound it, and only those two: an entry belonging to no currently-tracked operation,
+/// and an entry carrying the caller's OWN identity (which the caller must read itself). Both
+/// are decided by `is_stray_concurrent_entry`.
+///
+/// **There is deliberately no per-identity occurrence bound.** An earlier revision refused a
+/// second entry for an identity it had already consumed (or whose answer was still uncollected
+/// in the cache), because `pre_resolved_stray` then held a single answer per identity and a
+/// second consumption would have destroyed the first. That reason is gone — the cache is a FIFO
+/// queue per identity, so every occurrence gets its own slot — and the bound was actively
+/// harmful without it: an identity that legitimately repeats back to back (two `blocking_read()`
+/// calls on one chunked incoming body) had its second entry left stranded at the cursor, with no
+/// consumer able to reach it, and the next real consumer trapped on it. Re-adding a bound would
+/// reintroduce that trap: a contiguous run of foreign tracked entries has to be cleared in full
+/// before the caller's own entry can be reached, so consuming less than all of it cannot make
+/// progress (FINDING_B_FIX_DESIGN.md §15).
+///
+/// The cost of the unbounded walk is that one scan can hold a whole contiguous foreign run's
+/// payloads in memory at once (a 106-pair `check_write`/`write` body cluster, §12.2) instead of
+/// leaving most of them in the oplog. That run has to be consumed before the caller can proceed
+/// either way; only the retention differs, and it is released as each owner collects.
 pub struct StrayEntryScan {
     tracked: TrackedConcurrentOpSeqs,
     exclude: Option<StrayEntryIdentity>,
-    consumed: HashSet<StrayEntryIdentity>,
 }
 
 impl StrayEntryScan {
-    /// `already_cached` are identities whose pre-resolved answer is still waiting to be
-    /// collected by its owner — treated exactly like "already consumed by this scan".
-    pub fn new(
-        tracked: TrackedConcurrentOpSeqs,
-        exclude: Option<StrayEntryIdentity>,
-        already_cached: HashSet<StrayEntryIdentity>,
-    ) -> Self {
-        Self {
-            tracked,
-            exclude,
-            consumed: already_cached,
-        }
+    pub fn new(tracked: TrackedConcurrentOpSeqs, exclude: Option<StrayEntryIdentity>) -> Self {
+        Self { tracked, exclude }
     }
 
     /// Decides whether the entry at the replay cursor may be consumed as a stray by this scan.
-    pub fn accept(&mut self, entry: &OplogEntry) -> bool {
-        if !is_stray_concurrent_entry(entry, &self.tracked, self.exclude.as_ref()) {
-            return false;
-        }
-        match stray_entry_identity(entry) {
-            Some(identity) => self.consumed.insert(identity),
-            None => false,
-        }
+    pub fn accept(&self, entry: &OplogEntry) -> bool {
+        is_stray_concurrent_entry(entry, &self.tracked, self.exclude.as_ref())
     }
 }
 
@@ -4582,6 +4630,22 @@ mod stray_entry_tests {
         )
     }
 
+    /// The live-capture shape behind FINDING_B_FIX_DESIGN.md §15: a chunked incoming body read.
+    /// `chunk` distinguishes successive calls' answers so wrong-slot delivery is detectable.
+    fn http_stream_blocking_read_chunk(begin_idx: OplogIndex, chunk: &[u8]) -> OplogEntry {
+        batched(
+            HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead,
+            begin_idx,
+            HostResponse::StreamChunk(HostResponseStreamChunk {
+                result: Ok(chunk.to_vec()),
+            }),
+        )
+    }
+
+    fn http_stream_blocking_read(begin_idx: OplogIndex) -> OplogEntry {
+        http_stream_blocking_read_chunk(begin_idx, &[])
+    }
+
     fn http_stream_check_write(begin_idx: OplogIndex) -> OplogEntry {
         batched(
             HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
@@ -4600,6 +4664,18 @@ mod stray_entry_tests {
                 result: Ok(vec![]),
             }),
         )
+    }
+
+    /// Unwraps a test entry's inline response payload — the same `HostResponse` that
+    /// `decode_and_cache_stray_entry` obtains via `Oplog::download_payload` in production.
+    fn inline_response(entry: OplogEntry) -> HostResponse {
+        let OplogEntry::HostCall { response, .. } = entry else {
+            unreachable!("test entries are HostCall entries")
+        };
+        let OplogPayload::Inline(boxed) = response else {
+            unreachable!("test entries are built inline")
+        };
+        *boxed
     }
 
     fn tracked(namespaces: impl IntoIterator<Item = IdentityNamespace>) -> TrackedConcurrentOpSeqs {
@@ -4781,28 +4857,22 @@ mod stray_entry_tests {
     #[test]
     fn each_deferred_entry_is_returned_to_its_own_owner() {
         let a = OplogIndex::from_u64(42);
-        let mut cache: HashMap<StrayEntryIdentity, HostResponse> = HashMap::new();
+        let mut cache = PreResolvedStrayCache::default();
         for entry in [
             http_stream_check_write(a),
             http_stream_write(a),
             http_stream_read(a),
         ] {
             let identity = stray_entry_identity(&entry).expect("tracked shape");
-            let OplogEntry::HostCall { response, .. } = entry else {
-                unreachable!()
-            };
-            let OplogPayload::Inline(boxed) = response else {
-                unreachable!("test entries are built inline")
-            };
-            assert!(
-                cache.insert(identity, *boxed).is_none(),
+            assert_eq!(
+                cache.record(identity, inline_response(entry)),
+                1,
                 "each function must occupy its own cache slot under one shared begin_index"
             );
         }
-        assert_eq!(cache.len(), 3);
 
         let check_write: HostResponseStreamCheckWrite = cache
-            .remove(&batch_identity(
+            .take(&batch_identity(
                 HostFunctionName::HttpTypesOutgoingBodyStreamCheckWrite,
                 a,
             ))
@@ -4812,7 +4882,7 @@ mod stray_entry_tests {
         assert_eq!(check_write.result, Ok(1048576));
 
         let write: HostResponseStreamWriteWithBytes = cache
-            .remove(&batch_identity(
+            .take(&batch_identity(
                 HostFunctionName::HttpTypesOutgoingBodyStreamWrite,
                 a,
             ))
@@ -4822,7 +4892,7 @@ mod stray_entry_tests {
         assert_eq!(write.result, Ok(vec![]));
 
         let chunk: HostResponseStreamChunk = cache
-            .remove(&batch_identity(
+            .take(&batch_identity(
                 HostFunctionName::HttpTypesIncomingBodyStreamRead,
                 a,
             ))
@@ -4832,36 +4902,138 @@ mod stray_entry_tests {
         assert_eq!(chunk.result, Ok(vec![]));
     }
 
-    /// The scan bound (§12.6 fallout): `check_write`/`write` occur in lockstep, many times per
-    /// request, so recognition alone would let one scan run away through a whole write cluster
-    /// and keep only the last answer of each kind (the cache holds one answer per identity).
-    /// A scan must accept at most ONE entry per identity and stop at the second.
+    /// FINDING_B_FIX_DESIGN.md §15, cache half: two `blocking_read()` calls on ONE stream share
+    /// an identity, and each needs its OWN answer. Asserts CONTENT, not merely "both present" —
+    /// a wrong-slot bug here would be a silent misdelivery (§14.2.1's failure mode), handing
+    /// chunk 2 to the call that read chunk 1, not a crash.
     #[test]
-    fn scan_accepts_at_most_one_entry_per_identity() {
+    fn repeated_occurrences_of_one_identity_are_returned_in_call_order() {
         let a = OplogIndex::from_u64(42);
-        let mut scan =
-            StrayEntryScan::new(tracked([IdentityNamespace::Batch(a)]), None, HashSet::new());
+        let identity = batch_identity(HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead, a);
+        let chunks: [&[u8]; 3] = [b"first", b"second", b"third"];
 
-        assert!(scan.accept(&http_stream_check_write(a)));
-        // Different identity (same request, other function) — still acceptable.
-        assert!(scan.accept(&http_stream_write(a)));
-        // Second occurrence of an identity already consumed by this scan: refused, so the
-        // entry stays at the cursor for its owner instead of overwriting the cached answer.
-        assert!(!scan.accept(&http_stream_check_write(a)));
-        assert!(!scan.accept(&http_stream_write(a)));
+        let mut cache = PreResolvedStrayCache::default();
+        for (n, chunk) in chunks.iter().enumerate() {
+            let entry = http_stream_blocking_read_chunk(a, chunk);
+            assert_eq!(stray_entry_identity(&entry).as_ref(), Some(&identity));
+            assert_eq!(
+                cache.record(identity.clone(), inline_response(entry)),
+                n + 1,
+                "each occurrence must add a slot, never replace the previous one"
+            );
+        }
+
+        // Three-plus in a row, to confirm N=2 is in no way special-cased.
+        for expected in chunks {
+            let peeked: HostResponseStreamChunk = cache
+                .peek(&identity)
+                .expect("an uncollected answer is waiting")
+                .clone()
+                .try_into()
+                .expect("narrows to the read consumer's own type");
+            assert_eq!(
+                peeked.result,
+                Ok(expected.to_vec()),
+                "peek must show the owner's NEXT answer, not an arbitrary one"
+            );
+
+            let taken: HostResponseStreamChunk = cache
+                .take(&identity)
+                .expect("an uncollected answer is waiting")
+                .try_into()
+                .expect("narrows to the read consumer's own type");
+            assert_eq!(
+                taken.result,
+                Ok(expected.to_vec()),
+                "the Nth call must get the Nth entry, in oplog order"
+            );
+        }
+
+        assert!(
+            cache.take(&identity).is_none(),
+            "a drained queue must report empty, so the owner falls through to its own oplog read"
+        );
+        assert!(cache.peek(&identity).is_none());
     }
 
-    /// Same bound, sourced from the cache rather than from this scan: an identity whose
-    /// pre-resolved answer has not been collected by its owner yet must not have a second
-    /// entry consumed on top of it.
+    /// Interleaved occurrences of two identities must not disturb each other's ordering — the
+    /// realistic shape, where a scan drains a run mixing both directions of one HTTP request.
     #[test]
-    fn scan_refuses_identities_whose_answer_is_already_cached() {
-        let mut scan = StrayEntryScan::new(
-            tracked([IdentityNamespace::Pollable(7)]),
-            None,
-            HashSet::from([pollable_identity(7)]),
+    fn queues_of_different_identities_are_independent() {
+        let a = OplogIndex::from_u64(42);
+        let read_id = batch_identity(HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead, a);
+        let write_id = batch_identity(HostFunctionName::HttpTypesOutgoingBodyStreamWrite, a);
+
+        let mut cache = PreResolvedStrayCache::default();
+        cache.record(
+            read_id.clone(),
+            inline_response(http_stream_blocking_read_chunk(a, b"r1")),
         );
-        assert!(!scan.accept(&io_poll_ready(7)));
+        cache.record(write_id.clone(), inline_response(http_stream_write(a)));
+        cache.record(
+            read_id.clone(),
+            inline_response(http_stream_blocking_read_chunk(a, b"r2")),
+        );
+
+        // Collecting the write answer must not shift the read queue.
+        let _: HostResponseStreamWriteWithBytes = cache
+            .take(&write_id)
+            .expect("write answer present")
+            .try_into()
+            .expect("narrows");
+        assert!(cache.take(&write_id).is_none());
+
+        for expected in [b"r1", b"r2"] {
+            let taken: HostResponseStreamChunk = cache
+                .take(&read_id)
+                .expect("read answer")
+                .try_into()
+                .expect("narrows");
+            assert_eq!(taken.result, Ok(expected.to_vec()));
+        }
+    }
+
+    /// The inverse of the bound this scan used to carry (FINDING_B_FIX_DESIGN.md §15): repeated
+    /// occurrences of ONE identity must ALL be accepted. `check_write`/`write` occur in lockstep
+    /// many times per request, and a chunked body records several `blocking_read()` calls on one
+    /// stream — under the old one-per-identity bound the second occurrence stopped the walk and
+    /// was left stranded at the cursor, where the next real consumer trapped on it. Each
+    /// occurrence now gets its own FIFO slot in `pre_resolved_stray`, so there is nothing left
+    /// to protect and refusing it only strands the entry.
+    #[test]
+    fn scan_accepts_every_occurrence_of_a_repeated_identity() {
+        let a = OplogIndex::from_u64(42);
+        let scan = StrayEntryScan::new(tracked([IdentityNamespace::Batch(a)]), None);
+
+        // The live capture's shape: the same identity twice in a row.
+        assert!(scan.accept(&http_stream_blocking_read(a)));
+        assert!(scan.accept(&http_stream_blocking_read(a)));
+        // Generality: nothing special about N=2, and interleaving with other identities of the
+        // same batch changes nothing.
+        assert!(scan.accept(&http_stream_blocking_read(a)));
+        assert!(scan.accept(&http_stream_check_write(a)));
+        assert!(scan.accept(&http_stream_check_write(a)));
+        assert!(scan.accept(&http_stream_write(a)));
+
+        // Still bounded by the two things that genuinely bound it: an untracked entry ...
+        assert!(!scan.accept(&io_poll_poll()));
+        // ... and an entry belonging to no open batch.
+        assert!(!scan.accept(&http_stream_blocking_read(OplogIndex::from_u64(99))));
+    }
+
+    /// The caller's own identity remains the other bound, unaffected by repetition: a scan run
+    /// on behalf of one `blocking_read()` call must not swallow the NEXT `blocking_read()` entry
+    /// on the same stream, however many of them are queued up.
+    #[test]
+    fn scan_still_stops_at_every_occurrence_of_its_own_identity() {
+        let a = OplogIndex::from_u64(42);
+        let own = batch_identity(HostFunctionName::HttpTypesIncomingBodyStreamBlockingRead, a);
+        let scan = StrayEntryScan::new(tracked([IdentityNamespace::Batch(a)]), Some(own));
+
+        assert!(!scan.accept(&http_stream_blocking_read(a)));
+        // A sibling function on the same batch is still a stray, as many times as it appears.
+        assert!(scan.accept(&http_stream_check_write(a)));
+        assert!(scan.accept(&http_stream_check_write(a)));
     }
 
     /// `stray_entry_identity` is the single source of truth the recognition predicate, the scan
@@ -4995,11 +5167,7 @@ mod stray_entry_tests {
             ),
         ];
 
-        let mut scan = StrayEntryScan::new(
-            tracked([IdentityNamespace::Batch(idx)]),
-            None,
-            HashSet::new(),
-        );
+        let scan = StrayEntryScan::new(tracked([IdentityNamespace::Batch(idx)]), None);
         for (function_name, response) in uncovered {
             let entry = batched(function_name.clone(), idx, response);
             assert_eq!(
@@ -5284,7 +5452,7 @@ impl PrivateDurableWorkerState {
             next_pollable_seq,
             invoke_result_seq: HashMap::new(),
             next_invoke_result_seq,
-            pre_resolved_stray: HashMap::new(),
+            pre_resolved_stray: PreResolvedStrayCache::default(),
             open_batches: HashSet::new(),
             poll_replay_miss: None,
             shard_service,
@@ -5399,28 +5567,37 @@ impl PrivateDurableWorkerState {
     /// Records an answer consumed early by a DIFFERENT operation's stray-scan, for
     /// `identity`'s real owner to collect — see `pre_resolved_stray`'s field doc comment.
     /// The payload is stored undecoded; the owner narrows it to its own response type.
+    ///
+    /// Appends to the identity's FIFO queue rather than replacing: an identity can have
+    /// several of its entries deferred within one scan (a chunked `blocking_read()` records
+    /// two in a row), and each is a distinct call's answer.
     pub fn record_pre_resolved_stray(
         &mut self,
         identity: StrayEntryIdentity,
         response: HostResponse,
     ) {
+        let queued = self.pre_resolved_stray.record(identity.clone(), response);
         debug!(
             agent_id = %self.owned_agent_id,
             ?identity,
+            queued,
             "STRAY_TRACE record_pre_resolved_stray"
         );
-        self.pre_resolved_stray.insert(identity, response);
     }
 
-    /// Takes (removes) the pre-resolved answer for `identity`, if a sibling operation's
-    /// stray-scan already consumed its entry on its behalf. Consulted BEFORE any oplog read: if
-    /// present, the oplog has nothing left to find for this identity (already durably
-    /// consumed), so this is the only remaining source of the answer.
+    /// Takes the OLDEST uncollected pre-resolved answer for `identity`, if a sibling
+    /// operation's stray-scan already consumed its entry on its behalf. Consulted BEFORE any
+    /// oplog read: if present, the oplog has nothing left to find for this call (already
+    /// durably consumed), so this is the only remaining source of the answer.
+    ///
+    /// FIFO is the whole correctness argument for multi-occurrence identities: the owner's Nth
+    /// call wants the Nth of its entries in oplog order, and entries only ever enter the queue
+    /// in oplog order (see `pre_resolved_stray`).
     pub fn take_pre_resolved_stray(
         &mut self,
         identity: &StrayEntryIdentity,
     ) -> Option<HostResponse> {
-        let taken = self.pre_resolved_stray.remove(identity);
+        let taken = self.pre_resolved_stray.take(identity);
         if taken.is_some() {
             debug!(
                 agent_id = %self.owned_agent_id,
@@ -5434,7 +5611,7 @@ impl PrivateDurableWorkerState {
     /// Non-consuming peek used by `poll()`'s ready-set synthesis: is a pre-resolved answer
     /// waiting for this identity? The answer stays in the cache for its owner to take.
     pub fn has_pre_resolved_stray(&self, identity: &StrayEntryIdentity) -> bool {
-        self.pre_resolved_stray.contains_key(identity)
+        self.pre_resolved_stray.peek(identity).is_some()
     }
 
     /// Returns the logical sequence number for `rep` (a `FutureInvokeResult` resource),
@@ -5497,7 +5674,7 @@ impl PrivateDurableWorkerState {
                     IdentityNamespace::Pollable(*seq),
                 )
             })
-            .and_then(|identity| self.pre_resolved_stray.get(&identity))
+            .and_then(|identity| self.pre_resolved_stray.peek(&identity))
             .map(|response| {
                 matches!(
                     response,
@@ -5564,15 +5741,9 @@ impl PrivateDurableWorkerState {
         self.poll_replay_miss = None;
     }
 
-    /// Builds the stateful predicate for one stray-entry walk — see `StrayEntryScan`.
+    /// Builds the consumption policy for one stray-entry walk — see `StrayEntryScan`.
     pub fn stray_entry_scan(&self, exclude: Option<StrayEntryIdentity>) -> StrayEntryScan {
-        StrayEntryScan::new(
-            self.tracked_concurrent_op_seqs(),
-            exclude,
-            // Pre-seeded with identities whose answer is already cached and uncollected — see
-            // `cached_stray_identities`.
-            self.cached_stray_identities(),
-        )
+        StrayEntryScan::new(self.tracked_concurrent_op_seqs(), exclude)
     }
 
     /// Walks the replay cursor past every stray entry belonging to a DIFFERENT concurrently-
@@ -5588,7 +5759,7 @@ impl PrivateDurableWorkerState {
         &mut self,
         exclude: Option<StrayEntryIdentity>,
     ) -> Result<(), WorkerExecutorError> {
-        let mut scan = self.stray_entry_scan(exclude);
+        let scan = self.stray_entry_scan(exclude);
         let mut strays = Vec::new();
         self.replay_state
             .consume_stray_entries(
@@ -5636,14 +5807,6 @@ impl PrivateDurableWorkerState {
                 .map(IdentityNamespace::Batch),
         );
         TrackedConcurrentOpSeqs::new(namespaces)
-    }
-
-    /// The identities whose pre-resolved answer is already held in the cache and has not been
-    /// collected by its owner yet — treated by `StrayEntryScan` exactly like "already consumed
-    /// during this scan", since the cache holds one answer per identity and a second
-    /// consumption could only overwrite the first.
-    fn cached_stray_identities(&self) -> HashSet<StrayEntryIdentity> {
-        self.pre_resolved_stray.keys().cloned().collect()
     }
 
     /// Decodes and caches one stray entry (as recognized by `is_stray_concurrent_entry`).

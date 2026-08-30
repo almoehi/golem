@@ -601,6 +601,11 @@ oplog_entry! {
             // durable_host/mod.rs and POLLABLE_SEQ_RECOVERY_DESIGN_OPTIONS.md ("Option 2") for
             // the full rationale.
             next_pollable_seq: u32,
+            // Same rationale as next_pollable_seq above, for
+            // PrivateDurableWorkerState::next_invoke_result_seq (the RPC future-invoke-result
+            // analog — see recover_next_invoke_result_seq's doc comment in durable_host/mod.rs
+            // and FINDING_B_FIX_DESIGN.md §8.2.2).
+            next_invoke_result_seq: u32,
         }
         public {
             data: PublicSnapshotData

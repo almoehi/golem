@@ -2,18 +2,21 @@
 
 **Status: RESOLVED (two structural fixes).** Root cause #1 (Eighth capture — `pollable_seq`
 counter scope mismatch across snapshot boundaries) confirmed and fixed; full detail in
-`ROUND_TWELVE_THIRTEEN_FIX.md`. Root cause #2 (Finding B below — a batched `poll()` call's replay
-crashing on a stray same-batch `ready()` entry recorded out of the guest's replayed structural
-check order) confirmed via the Tenth capture and fixed; full detail in
-`FINDING_B_FIX_DESIGN.md` (root cause, fix design, and implementation notes) and
-`ROUND_FIFTEEN_FINDINGS.md`/`ROUND_FOURTEEN_FINDINGS.md` (the synthetic-reproduction rounds that
-preceded it). Both fixes are empirically falsified (reverting each reproduces its exact trigger
-condition; restoring passes) and regression-tested. This document is left as-is below (the
-narrative up to and including the open findings that led to the Eighth capture, plus Finding B's
-own section further down) as the historical record of how the investigation got there; read the
-two fix docs above first for the resolutions themselves. This document consolidates everything
-known through Round Eleven — read it for the chronology and the falsified hypotheses if picking
-the work up cold, then read the fix docs for what actually happened next.
+`ROUND_TWELVE_THIRTEEN_FIX.md`. Root cause #2 (Finding B below — positional/unconditional replay
+consumption crashing, or in one case silently misattributing, on a stray entry recorded for a
+DIFFERENT concurrently-tracked operation, out of the guest's replayed structural check order)
+confirmed via the Tenth capture (`poll()` vs. a same-batch pollable) and generalized after the
+Eleventh capture showed the same mechanism also hits RPC `future-invoke-result::get()` calls and
+concurrent HTTP body-stream reads, not just same-batch pollables; full detail in
+`FINDING_B_FIX_DESIGN.md` (root cause, fix design across all three instances, and implementation
+notes) and `ROUND_FIFTEEN_FINDINGS.md`/`ROUND_FOURTEEN_FINDINGS.md` (the synthetic-reproduction
+rounds that preceded it). Both fixes are empirically falsified (reverting each reproduces its
+exact trigger condition; restoring passes) and regression-tested. This document is left as-is
+below (the narrative up to and including the open findings that led to the Eighth capture, plus
+Finding B's own section further down) as the historical record of how the investigation got
+there; read the two fix docs above first for the resolutions themselves. This document
+consolidates everything known through Round Eleven — read it for the chronology and the falsified
+hypotheses if picking the work up cold, then read the fix docs for what actually happened next.
 
 ## The symptom
 

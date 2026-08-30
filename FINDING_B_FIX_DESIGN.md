@@ -484,13 +484,13 @@ run before `consume_stray_ready_entries` existed, was a compile error — the st
 
 ## 8. v3/v4 — generalizing beyond `IoPollReady` (Eleventh capture), fully resolved
 
-Status: **DESIGN ONLY — not implemented, all open questions resolved (§8.10).** Presented for
-review before coding, per explicit request — larger scope than v1/v2: three call sites
-(`poll()`, `get()`, HTTP body streams), a new `DurableFunctionType` variant, and a new
-snapshot-recovered counter. §8.2's first draft (`begin_index` as the RPC identity) was found
-unsound during this revision's own re-verification and replaced (§8.2.1-8.2.2) — see §8.10 for
-the full resolution summary of all three original open questions plus the newly-completed HTTP
-investigation.
+Status: **IMPLEMENTED, approved, and committed.** See §11 ("v4 implementation notes") for what
+actually shipped, exact diffs from this design, and the falsification/regression-sweep results.
+Larger scope than v1/v2: three call sites (`poll()`, `get()`, HTTP incoming body-stream reads), a
+new `DurableFunctionType` variant, and a new snapshot-recovered counter. §8.2's first draft
+(`begin_index` as the RPC identity) was found unsound during this revision's own re-verification
+and replaced (§8.2.1-8.2.2) — see §8.10 for the full resolution summary of all three original
+open questions plus the HTTP investigation.
 
 ### 8.1 What the Eleventh capture showed
 
@@ -1027,3 +1027,147 @@ design uncertainty):
   remains unevaluated — flagged as before, out of scope unless a live capture or explicit request
   brings a specific one into scope, matching this investigation's standing discipline of fixing
   confirmed traps.
+
+## 11. v4 implementation notes (post-approval)
+
+Approved and implemented as designed in §8, with the HTTP lifecycle trace (§8.7's flagged item)
+completed during implementation as directed, confirming and narrowing the design's own scope.
+
+### HTTP lifecycle trace — confirmed, and the scope narrowed
+
+Traced `outgoing_handler::handle()` (`http/outgoing_http.rs:234-237`): `begin_idx =
+begin_durable_function(&WriteRemoteBatched(None))` — `WriteRemoteBatched(None)` **unconditionally**
+takes `begin_function`'s "write a real `BeginRemoteWrite` entry" branch (the `||
+WriteRemoteBatched(None)` arm of the guard, independent of `assume_idempotence` — unlike RPC's
+plain `WriteRemote`, which is gated behind `!assume_idempotence` and hardcoded `true`, §8.2.1).
+Confirms §8.7's premise exactly: HTTP's `begin_index` is always a real, independently-discoverable
+oplog position, immune to the hint-entry asymmetry that ruled out RPC's original `begin_index`
+identity — no further correction needed here, unlike RPC's.
+
+**The scope-narrowing finding**: `open_http_requests: HashMap<u32, HttpRequestState>`
+(`durable_host/mod.rs`) — the map `tracked_concurrent_op_seqs()` reads for HTTP's tracked
+identities — is populated by `handle()`'s own `self.state.open_http_requests.insert(...)`
+(`outgoing_http.rs:384`), called **unconditionally**, live or replay (no `is_live()` gate around
+it) — so for the common case this investigation's live captures actually exhibit (a full oplog
+replay that re-executes `handle()` itself — one long invocation, single snapshot near genesis,
+matching both the Tenth and Eleventh captures), `open_http_requests` is repopulated symmetrically
+on replay, exactly like `pollable_seq`/`invoke_result_seq`. But a documented comment
+(`durable_host/mod.rs`, `replaying_http_batch`'s field doc) states `open_http_requests` is "never
+populated during replay" for a **different, narrower** scenario: resuming past a snapshot taken
+*mid-HTTP-request* (replay reconstructs application state via snapshot + oplog replay only for
+entries *after* the snapshot — it never re-executes `handle()` in that case, since that call
+predates the snapshot). That scenario already has its own special-cased, single-value recovery
+path (`replaying_http_batch: Option<OplogIndex>` — one in-flight batch, not a set), pre-dating this
+fix and not extended to support multiple concurrently-tracked batches during THAT specific
+recovery path.
+
+**Decision (implemented as designed, scope stated precisely rather than assumed)**: HTTP
+stray-recognition is correct and effective for the full-replay case; it silently doesn't fire for
+the narrower mid-request-snapshot case (empty `open_http_requests` → empty tracked set → nothing
+recognized as a stray → falls to the existing, unchanged `durability.replay()` path — the exact
+same behavior as before this fix, not a regression). This is documented directly in
+`tracked_concurrent_op_seqs()`'s doc comment (`durable_host/mod.rs`) so it isn't a silent gap.
+Extending coverage to the mid-request-snapshot case would mean generalizing
+`replaying_http_batch` from a single value to a set — a materially bigger, separate change to an
+existing, working recovery path, not justified without a live capture showing it's actually hit.
+
+**Scoped to `HttpTypesIncomingBodyStreamRead` only** (not `blocking_read`/`skip`/`blocking_skip`/
+the output-stream `check_write`/`write`/`flush`/`splice` family), matching `download-manager.ts`'s
+actual usage (reading fetched bytes) — the confirmed, live-relevant instance. The output-stream
+side's `WriteRemoteBatched(Some(begin_idx))` shape was spot-checked (`check_write`,
+`io/streams.rs:330-334`) and confirmed identical, so extending coverage there later is
+mechanical — add the `HostFunctionName` variant(s) to `is_stray_concurrent_entry`'s HTTP arm and
+the matching `decode_and_cache_stray_entry` arm — not a redesign, but not implemented now absent
+live evidence of need.
+
+### What was implemented, file by file
+
+- **`golem-common/src/model/oplog/raw_types.rs`**: new `DurableFunctionType::WriteRemoteConcurrent(u32)`
+  variant (a seq value, like `ReadLocalPollable(u32)` — not an `OplogIndex`, correcting v3's first
+  draft).
+- **`golem-common/src/base_model/oplog/mod.rs`**: `Snapshot`'s `raw{}` block gains
+  `next_invoke_result_seq: u32`, alongside `next_pollable_seq`.
+- **`golem-common/src/model/oplog/{public_types,protobuf}.rs`,
+  `golem-worker-executor/src/model/public_oplog/wit.rs`,
+  `golem-worker-executor/src/services/oplog/tests.rs`, `golem-worker-executor/src/worker/status.rs`**:
+  exhaustiveness/construction touch points for both the new `DurableFunctionType` variant and the
+  new `Snapshot` field — same file list the Option 2 fix touched for `next_pollable_seq`, found via
+  `cargo check`'s own exhaustiveness errors, not pre-guessed.
+- **`golem-worker-executor/src/durable_host/durability.rs`**: `is_eligible_for_internal_retry` and
+  the `durability::DurableFunctionType` bridging `From` impl both gained a
+  `WriteRemoteConcurrent(_)` arm, mapped identically to plain `WriteRemote`.
+- **`golem-worker-executor/src/durable_host/replay_state.rs`**: `ReplayState::consume_stray_entries`
+  — the shared, entry-type-agnostic walking primitive (§8.4), built purely on the existing
+  `try_get_oplog_entry`.
+- **`golem-worker-executor/src/durable_host/mod.rs`**: `invoke_result_seq`/`next_invoke_result_seq`/
+  `recover_next_invoke_result_seq` (mirroring `pollable_seq` exactly, kept fully separate);
+  `pre_resolved_invoke_result`/`pre_resolved_http_stream_chunk` caches;
+  `TrackedConcurrentOpSeqs`/`tracked_concurrent_op_seqs()`/`is_stray_concurrent_entry` (the shared
+  identity predicate, all three kinds) and `decode_and_cache_stray_entry` (the shared decode+cache
+  dispatch, all three kinds) — the two functions every call site composes with, so `IoPollReady`,
+  `GolemRpcFutureInvokeResultGet`, and `HttpTypesIncomingBodyStreamRead` genuinely fall out as
+  instances rather than being duplicated per call site. `pollable_seq_if_assigned` (v1/v2, no
+  longer used once `tracked_concurrent_op_seqs()` replaced its one caller) removed rather than
+  left dead.
+- **`golem-worker-executor/src/durable_host/io/poll.rs`**: `Host::poll`'s replay branch widened —
+  same shape as the shipped fix, `is_stray_concurrent_entry`/`decode_and_cache_stray_entry` instead
+  of the old, `IoPollReady`-only `consume_stray_ready_entries` (removed).
+- **`golem-worker-executor/src/durable_host/wasm_rpc/mod.rs`**: `async_invoke_and_await` assigns
+  `invoke_result_seq(rep)` unconditionally right after resource creation (dispatch time, per
+  §8.8); `HostFutureInvokeResult::drop` clears it; `get()`'s live path tags its entry with
+  `WriteRemoteConcurrent(seq)`; `get()`'s replay path restructured to the
+  cache-then-scan-then-fallback shape (§8.4), excluding its own seq.
+- **`golem-worker-executor/src/durable_host/io/streams.rs`**: `HostInputStream::read`'s replay
+  branch restructured identically, excluding its own `begin_idx`.
+- **`golem-worker-executor/src/worker/invocation_loop.rs`**: the periodic-snapshot-save flow reads
+  and embeds `next_invoke_result_seq()` alongside `next_pollable_seq()`.
+
+### Test plan — what was actually built
+
+Per §8.9, adjusted for where the logic ended up living (`is_stray_concurrent_entry` is a pure,
+free function taking owned `TrackedConcurrentOpSeqs` — directly unit-testable without any heavy
+`PrivateDurableWorkerState` construction, unlike `decode_and_cache_stray_entry`, which needed the
+full state):
+
+- **`durable_host/mod.rs`'s `stray_entry_tests` module** (new): `is_stray_concurrent_entry`
+  seeded directly from the Tenth capture's shape (`recognizes_tracked_pollable_stray`) and the
+  Eleventh capture's shape (`recognizes_tracked_invoke_result_stray_from_poll_context`), plus the
+  "exclude my own identity" case for both RPC (`excludes_own_invoke_result_identity`) and HTTP
+  (`excludes_own_http_request_identity`, the symmetric case §8.6/§8.7 predicted), plus a rejection
+  test for genuinely unrelated entries.
+- **`durable_host/replay_state.rs`**: `consume_stray_entries_walks_past_n_matches_then_stops` /
+  `consume_stray_entries_no_op_when_nothing_matches` — the shared primitive's own N=0/N=2,
+  entry-type-agnostic coverage (replacing the narrower, `IoPollReady`-only coverage the deleted
+  `io/poll.rs` test module had). `old_unconditional_consume_would_have_hit_eleventh_capture_mismatch`
+  — the "before" half of bidirectional falsification, seeded from the Eleventh capture's exact
+  entry shape, proving the OLD unconditional mechanism (`get_oplog_entry()`) genuinely mismatches
+  on it — same approach as the shipped fix's own falsification, confirmed to still apply here
+  (a true integration-level live/replay-divergence repro remains not achievable, unchanged
+  conclusion from §4b/§7, now confirmed for RPC and HTTP too).
+- `io/poll.rs`'s own test module (round-16, testing the now-deleted `consume_stray_ready_entries`
+  directly) was removed rather than left testing dead code — its coverage is now provided by the
+  two modules above, which test the same underlying mechanism in its current, shared form.
+
+### Regression sweep results
+
+- Full `--lib` suite (`golem-worker-executor`): **467 passed, 0 failed** (up from 465 pre-this-round:
+  net +7 new tests in `replay_state`/`stray_entry_tests`, −9 tests removed with the deleted
+  `io/poll.rs` module, +4 elsewhere accounted for by the counted totals).
+- Full `rpc.rs` integration suite (23/24 tests not requiring the TS `agent_rpc` component, same
+  pre-existing environment gap as round 16): **22 passed**, 1 failure — the same, already-documented
+  `WorkerActivator` test-infra flake (`sequential_atomic_double_ready_rpc_calls_same_target_n4_survives_cold_replay`,
+  fails in isolation, confirmed unrelated to any change in this investigation across three separate
+  rounds now) — not a regression.
+- Full `durability.rs` integration suite: **16/16 passed**, including every snapshot-round-trip
+  test (`snapshot_based_recovery`, `automatic_snapshot_disabled/every_2nd_invocation/periodic`,
+  `periodic_snapshot_recovery_survives_a_second_snapshot_generation`) — these specifically exercise
+  the real `Snapshot` entry save/recover path through `invocation_loop.rs`, confirming the new
+  `next_invoke_result_seq` field's wiring end-to-end, not just via unit tests.
+- `golem-common --lib`: hit a pre-existing, unrelated flake (a random test process crash — exit
+  status 1, no panic message, different unrelated test module each run: `cache`, `one_shot`,
+  `optional_field_update`) on three consecutive runs. **Confirmed unrelated via `git stash`**: the
+  identical crash reproduces with this round's `golem-common` changes fully reverted. Not
+  investigated further (out of scope — pre-existing, and none of the crash sites are anywhere
+  near the `oplog`/`DurableFunctionType` code this round touched).
+- `http.rs`, `wasi.rs`, and other integration test files requiring components not built in this
+  worktree were not run — same pre-existing environment gap noted in every prior round.

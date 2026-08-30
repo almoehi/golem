@@ -2451,6 +2451,8 @@ impl TryFrom<PublicOplogEntry> for OplogEntry {
                     // (recover_next_pollable_seq, durable_host/mod.rs) never reads an entry
                     // that went through here.
                     next_pollable_seq: 0,
+                    // Same reasoning as next_pollable_seq immediately above.
+                    next_invoke_result_seq: 0,
                 })
             }
             PublicOplogEntry::OplogProcessorCheckpoint(p) => {
@@ -2754,6 +2756,12 @@ fn durable_function_type_to_proto(
         DurableFunctionType::ReadLocalPollable(_) => {
             golem_api_grpc::proto::golem::worker::WrappedFunctionType {
                 r#type: wrapped_function_type::Type::ReadLocal as i32,
+                oplog_index: None,
+            }
+        }
+        DurableFunctionType::WriteRemoteConcurrent(_) => {
+            golem_api_grpc::proto::golem::worker::WrappedFunctionType {
+                r#type: wrapped_function_type::Type::WriteRemote as i32,
                 oplog_index: None,
             }
         }
@@ -3557,6 +3565,8 @@ impl TryFrom<golem_api_grpc::proto::golem::worker::RawOplogEntry> for OplogEntry
                     // snapshot-take/resume path this field exists for never round-trips through
                     // this proto conversion at all.
                     next_pollable_seq: 0,
+                    // Same reasoning as next_pollable_seq immediately above.
+                    next_invoke_result_seq: 0,
                 })
             }
             Entry::OplogProcessorCheckpoint(p) => {

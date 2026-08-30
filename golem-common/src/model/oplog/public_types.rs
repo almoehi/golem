@@ -39,6 +39,9 @@ impl From<DurableFunctionType> for PublicDurableFunctionType {
             DurableFunctionType::ReadLocalPollable(_) => {
                 PublicDurableFunctionType::ReadLocal(Empty {})
             }
+            DurableFunctionType::WriteRemoteConcurrent(_) => {
+                PublicDurableFunctionType::WriteRemote(Empty {})
+            }
         }
     }
 }

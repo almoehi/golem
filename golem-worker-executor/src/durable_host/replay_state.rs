@@ -291,6 +291,33 @@ impl ReplayState {
         }
     }
 
+    /// Walks forward consuming (durably, via `try_get_oplog_entry` — never re-visits a consumed
+    /// entry) zero or more oplog entries matching `is_stray`, handing each one to `on_stray` for
+    /// caller-specific decode+cache. Returns as soon as an entry does NOT match — the caller
+    /// handles that entry itself (its own genuine entry, or a real mismatch) via its existing,
+    /// unchanged replay path.
+    ///
+    /// Entry-type-agnostic by design: this is the shared mechanism behind the fix for a class of
+    /// bug (`FINDING_B_FIX_DESIGN.md`) where a positional/unconditional replay consumer (poll(),
+    /// RPC's future-invoke-result::get(), concurrent HTTP body-stream reads) can find a "stray"
+    /// entry recorded for a DIFFERENT concurrently-tracked operation sitting where its own next
+    /// entry was expected — because real-world completion order among concurrently in-flight
+    /// operations doesn't have to match the guest's replayed structural check order. Callers
+    /// decide what "stray" means (via `is_stray`) and what to do with one (via `on_stray`); this
+    /// function only knows how to walk forward and consume matches.
+    pub async fn consume_stray_entries(
+        &mut self,
+        is_stray: impl Fn(&OplogEntry) -> bool,
+        mut on_stray: impl FnMut(OplogIndex, OplogEntry),
+    ) -> Result<(), WorkerExecutorError> {
+        loop {
+            match self.try_get_oplog_entry(&is_stray).await? {
+                Some((idx, entry)) => on_stray(idx, entry),
+                None => return Ok(()),
+            }
+        }
+    }
+
     fn rewind_replay_buffer(&mut self, idx: OplogIndex, entry: OplogEntry) {
         if self
             .replay_buffer
@@ -1728,5 +1755,258 @@ mod tests {
             .await
             .unwrap();
         assert!(poll_matched2.is_some());
+    }
+
+    /// `consume_stray_entries` (the generic primitive behind the Finding B fix's widened
+    /// mechanism — `FINDING_B_FIX_DESIGN.md` §8.4/§8.7) must walk forward consuming every
+    /// matching entry in a row, handing each to the callback, and stop (without consuming) the
+    /// moment an entry doesn't match — regardless of what "matching" means, since this
+    /// primitive is entirely entry-type-agnostic.
+    #[test]
+    async fn consume_stray_entries_walks_past_n_matches_then_stops() {
+        use golem_common::model::oplog::{
+            DurableFunctionType, HostRequest, HostRequestNoInput, HostRequestPollCount,
+            HostResponse, HostResponsePollReady, HostResponsePollResult, OplogPayload,
+        };
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+        let stray = |seq: u32| OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::IoPollReady,
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
+            response: OplogPayload::Inline(Box::new(HostResponse::PollReady(
+                HostResponsePollReady { result: Ok(true) },
+            ))),
+            durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
+        };
+        let genuine = OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::IoPollPoll,
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
+                HostRequestPollCount { count: 2 },
+            ))),
+            response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
+                HostResponsePollResult { result: Ok(vec![0]) },
+            ))),
+            durable_function_type: DurableFunctionType::ReadLocal,
+        };
+        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
+            (
+                OplogIndex::INITIAL,
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                },
+            ),
+            (OplogIndex::INITIAL.next(), stray(150)),
+            (OplogIndex::INITIAL.next().next(), stray(161)),
+            (OplogIndex::INITIAL.next().next().next(), genuine),
+        ])));
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            oplog,
+            DeletedRegions::new(),
+        )
+        .await
+        .unwrap();
+
+        let mut consumed = Vec::new();
+        state
+            .consume_stray_entries(
+                |e| {
+                    matches!(
+                        e,
+                        OplogEntry::HostCall {
+                            function_name: HostFunctionName::IoPollReady,
+                            ..
+                        }
+                    )
+                },
+                |idx, entry| consumed.push((idx, entry)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(consumed.len(), 2, "must consume both strays, in order");
+        assert!(matches!(
+            consumed[0].1,
+            OplogEntry::HostCall {
+                durable_function_type: DurableFunctionType::ReadLocalPollable(150),
+                ..
+            }
+        ));
+        assert!(matches!(
+            consumed[1].1,
+            OplogEntry::HostCall {
+                durable_function_type: DurableFunctionType::ReadLocalPollable(161),
+                ..
+            }
+        ));
+
+        // The genuine entry (not matching the predicate) must be left completely untouched.
+        let genuine_found = state
+            .try_get_oplog_entry(|e| {
+                matches!(
+                    e,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollPoll,
+                        ..
+                    }
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            genuine_found.is_some(),
+            "the non-matching entry must survive consume_stray_entries untouched"
+        );
+    }
+
+    /// N=0 case: when the very next entry doesn't match, `consume_stray_entries` must do
+    /// nothing and leave it for the caller — the common, unchanged happy path.
+    #[test]
+    async fn consume_stray_entries_no_op_when_nothing_matches() {
+        use golem_common::model::oplog::{
+            DurableFunctionType, HostRequest, HostRequestPollCount, HostResponse,
+            HostResponsePollResult, OplogPayload,
+        };
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+        let genuine = OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::IoPollPoll,
+            request: OplogPayload::Inline(Box::new(HostRequest::PollCount(
+                HostRequestPollCount { count: 1 },
+            ))),
+            response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
+                HostResponsePollResult { result: Ok(vec![0]) },
+            ))),
+            durable_function_type: DurableFunctionType::ReadLocal,
+        };
+        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
+            (
+                OplogIndex::INITIAL,
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                },
+            ),
+            (OplogIndex::INITIAL.next(), genuine),
+        ])));
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            oplog,
+            DeletedRegions::new(),
+        )
+        .await
+        .unwrap();
+
+        let mut consumed = Vec::new();
+        state
+            .consume_stray_entries(
+                |e| {
+                    matches!(
+                        e,
+                        OplogEntry::HostCall {
+                            function_name: HostFunctionName::IoPollReady,
+                            ..
+                        }
+                    )
+                },
+                |idx, entry| consumed.push((idx, entry)),
+            )
+            .await
+            .unwrap();
+
+        assert!(consumed.is_empty());
+        let genuine_found = state
+            .try_get_oplog_entry(|e| {
+                matches!(
+                    e,
+                    OplogEntry::HostCall {
+                        function_name: HostFunctionName::IoPollPoll,
+                        ..
+                    }
+                )
+            })
+            .await
+            .unwrap();
+        assert!(genuine_found.is_some(), "poll()'s entry must remain, untouched");
+    }
+
+    /// "Before" half of the bidirectional falsification for the Eleventh capture: reproduces
+    /// the OLD, pre-fix consumption mechanism (`get_oplog_entry()`, i.e. unconditional
+    /// consumption — what `poll()`'s replay used before this round's widening) directly
+    /// against a crafted oplog matching the Eleventh capture's exact shape — a stray
+    /// `GolemRpcFutureInvokeResultGet` entry sitting where `poll()`'s own `IoPollPoll` entry
+    /// was expected — proving it genuinely mismatches (the exact production crash: "expected
+    /// io::poll::poll, got golem::rpc::future-invoke-result::get"). The "after" half is
+    /// `stray_entry_tests::recognizes_tracked_invoke_result_stray_from_poll_context` and the
+    /// actual `Host::poll` implementation (`io/poll.rs`), which now widens its scan to
+    /// recognize and defer to exactly this entry shape before ever reaching this unconditional
+    /// fallback.
+    #[test]
+    async fn old_unconditional_consume_would_have_hit_eleventh_capture_mismatch() {
+        use golem_common::model::oplog::{
+            DurableFunctionType, HostRequest, HostRequestNoInput, HostResponse,
+            HostResponseGolemRpcInvokeGet, OplogPayload,
+        };
+        use golem_common::model::oplog::types::SerializableInvokeResult;
+
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+        let stray_rpc_entry = OplogEntry::HostCall {
+            timestamp: Timestamp::now_utc(),
+            function_name: HostFunctionName::GolemRpcFutureInvokeResultGet,
+            request: OplogPayload::Inline(Box::new(HostRequest::NoInput(HostRequestNoInput {}))),
+            response: OplogPayload::Inline(Box::new(HostResponse::GolemRpcInvokeGet(
+                HostResponseGolemRpcInvokeGet {
+                    result: SerializableInvokeResult::Pending,
+                },
+            ))),
+            durable_function_type: DurableFunctionType::WriteRemoteConcurrent(5),
+        };
+        let oplog = Arc::new(MutableBatchOplog::new(BTreeMap::from([
+            (
+                OplogIndex::INITIAL,
+                OplogEntry::NoOp {
+                    timestamp: Timestamp::now_utc(),
+                },
+            ),
+            (OplogIndex::INITIAL.next(), stray_rpc_entry),
+        ])));
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            oplog,
+            DeletedRegions::new(),
+        )
+        .await
+        .unwrap();
+
+        // The OLD mechanism: consume the next entry unconditionally — no per-operation identity
+        // check, whatever's there MUST be poll()'s own entry.
+        let (_idx, entry) = state.get_oplog_entry().await.unwrap();
+        let OplogEntry::HostCall { function_name, .. } = entry else {
+            panic!("crafted entry is always a HostCall variant");
+        };
+
+        assert_eq!(
+            function_name,
+            HostFunctionName::GolemRpcFutureInvokeResultGet,
+            "sanity check: this crafted oplog must genuinely reproduce the Eleventh capture's \
+             trigger — if this ever fails, the test no longer represents a real reproduction"
+        );
+        assert_ne!(
+            function_name,
+            HostFunctionName::IoPollPoll,
+            "the OLD unconditional mechanism would crash here (expected io::poll::poll, got \
+             golem::rpc::future-invoke-result::get) — exactly the defect the widened \
+             is_stray_concurrent_entry mechanism (durable_host/mod.rs) fixes by checking \
+             identity FIRST, before ever reaching this unconditional read"
+        );
     }
 }

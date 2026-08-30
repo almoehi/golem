@@ -1369,11 +1369,14 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
                                 Ok(payload) => {
                                     let next_pollable_seq =
                                         self.store.data().durable_ctx().next_pollable_seq();
+                                    let next_invoke_result_seq =
+                                        self.store.data().durable_ctx().next_invoke_result_seq();
                                     self.parent
                                         .add_and_commit_oplog(OplogEntry::snapshot(
                                             payload,
                                             snapshot.mime_type,
                                             next_pollable_seq,
+                                            next_invoke_result_seq,
                                         ))
                                         .await;
                                     debug!("Periodic snapshot saved successfully");

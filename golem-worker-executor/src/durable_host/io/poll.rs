@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::durable_host::durability::InFunctionRetryHost;
-use crate::durable_host::{Durability, DurabilityHost, DurableWorkerCtx, SuspendForSleep};
+use crate::durable_host::{
+    Durability, DurabilityHost, DurableWorkerCtx, SuspendForSleep, is_stray_concurrent_entry,
+};
 use crate::metrics::ephemeral::{dec_promise_waiting, inc_promise_waiting};
 use crate::services::oplog::OplogOps;
 use crate::services::{HasOplog, HasWorker};
@@ -81,6 +83,25 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
                 .await?;
             r.result.map_err(wasmtime::Error::msg)
         } else {
+            // Finding B (FINDING_B_FIX_DESIGN.md): a batched poll() call's replay may have
+            // already consumed THIS pollable's own IoPollReady entry on our behalf — it can
+            // appear in the oplog before the guest's replayed structural check order reaches
+            // this ready() call (wstd's Reactor batches concurrently-pending pollables via a
+            // HashMap-keyed waker set whose iteration order is per-process-randomized). If so,
+            // the oplog has nothing left to find for this seq — this cached answer is
+            // authoritative.
+            if let Some(pre_resolved) = self.state.take_pre_resolved_pollable_ready(pollable_seq)
+            {
+                trace!(
+                    agent_id = %self.owned_agent_id,
+                    rep = pollable_rep,
+                    seq = pollable_seq,
+                    result = pre_resolved,
+                    "POLLREADY_TRACE ready() REPLAY using answer pre-resolved by an earlier poll() call"
+                );
+                return Ok(pre_resolved);
+            }
+
             // Replay: consume the next IoPollReady entry only if it was recorded for THIS
             // specific pollable (matched by logical seq — see pollable_seq's doc comment).
             // This prevents a timer pollable from stealing an IoPollReady=true entry that was
@@ -344,8 +365,55 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
             // the first place (snapshots only ever fire between fully completed external
             // invocations — see `on_external_invocation_completed`/the `Periodic` check above in
             // `invocation_loop.rs`). So ready() no longer produces spurious mismatches for a
-            // pollable that legitimately owns an upcoming entry, and poll() can rely on the
-            // normal replay path unconditionally.
+            // pollable that legitimately owns an upcoming entry.
+            //
+            // Finding B (FINDING_B_FIX_DESIGN.md): a batch of 2+ pollables — or a pollable
+            // racing a concurrently-dispatched RPC call (Eleventh capture) — CAN leave a stray
+            // entry positioned before poll()'s own next entry: recorded live for a DIFFERENT
+            // concurrently-tracked operation, but out of the guest's replayed structural check
+            // order (`wstd`'s `Reactor` batches concurrently-pending operations via a
+            // `HashMap`-keyed waker set whose iteration order is per-process-randomized, so
+            // live's real completion order isn't guaranteed to match replay's structural check
+            // order). `ready()`'s own seq-predicate correctly refuses to consume such an entry
+            // when asked about the wrong pollable (leaving it in place) — but poll()'s replay
+            // previously had no equivalent identity check, so it would try to consume that same
+            // still-pending entry as if it must be its own `IoPollPoll` type and crash. Walk
+            // forward, consuming (for real — `try_get_oplog_entry` durably advances past a
+            // match) zero or more such stray entries of ANY known kind (`IoPollReady` for any
+            // currently-tracked pollable, `GolemRpcFutureInvokeResultGet` for any currently-
+            // tracked RPC call — poll() has no RPC identity of its own to exclude), caching each
+            // one's answer for its real owner's own later replay to consult — until the next
+            // entry is NOT one of those, at which point defer entirely to the unchanged,
+            // existing `durability.replay()` path: either it's poll()'s own genuine entry
+            // (happy path, byte-for-byte unchanged), or it's genuinely unexpected and the
+            // existing crash path fires exactly as it does today. No batch-size or entry-kind
+            // assumption: N stray entries of any recognized kind, in any order, is simply N
+            // loop iterations.
+            let tracked = self.state.tracked_concurrent_op_seqs();
+            let reps_for_trace = in_.iter().map(|r| r.rep()).collect::<Vec<_>>();
+
+            let mut strays = Vec::new();
+            self.state
+                .replay_state
+                .consume_stray_entries(
+                    |entry| is_stray_concurrent_entry(entry, &tracked, None, None),
+                    |idx, entry| strays.push((idx, entry)),
+                )
+                .await?;
+            for (idx, entry) in strays {
+                trace!(
+                    agent_id = %self.owned_agent_id,
+                    reps = ?reps_for_trace,
+                    matched_oplog_index = %idx,
+                    entry = ?entry,
+                    "POLLCALL_TRACE poll() REPLAY consumed stray concurrent-op entry, caching"
+                );
+                self.state.decode_and_cache_stray_entry(idx, entry).await?;
+            }
+
+            // Whatever's left (if anything) is not a recognized stray — defer entirely to the
+            // unchanged, existing path: either it's poll()'s own genuine entry (happy path) or
+            // a genuinely unexpected mismatch (existing crash path).
             Ok(durability.replay(self).await?)
         };
 
@@ -424,3 +492,4 @@ fn is_suspend_for_sleep<T>(result: &Result<T, wasmtime::Error>) -> Option<Durati
         None
     }
 }
+

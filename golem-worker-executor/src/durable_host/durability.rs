@@ -592,6 +592,7 @@ impl From<DurableFunctionType> for durability::DurableFunctionType {
             DurableFunctionType::ReadRemote => durability::DurableFunctionType::ReadRemote,
             DurableFunctionType::ReadLocal => durability::DurableFunctionType::ReadLocal,
             DurableFunctionType::ReadLocalPollable(_) => durability::DurableFunctionType::ReadLocal,
+            DurableFunctionType::WriteRemoteConcurrent(_) => durability::DurableFunctionType::WriteRemote,
             DurableFunctionType::WriteRemoteTransaction(oplog_index) => {
                 durability::DurableFunctionType::WriteRemoteTransaction(
                     oplog_index.map(|idx| idx.into()),
@@ -1211,7 +1212,9 @@ impl<Pair: HostPayloadPair> Durability<Pair> {
             | DurableFunctionType::ReadLocal
             | DurableFunctionType::ReadLocalPollable(_)
             | DurableFunctionType::WriteLocal => true,
-            DurableFunctionType::WriteRemote => self.durable_execution_state.assume_idempotence,
+            DurableFunctionType::WriteRemote | DurableFunctionType::WriteRemoteConcurrent(_) => {
+                self.durable_execution_state.assume_idempotence
+            }
             DurableFunctionType::WriteRemoteBatched(_)
             | DurableFunctionType::WriteRemoteTransaction(_) => false,
         }
@@ -1285,7 +1288,7 @@ impl<Pair: HostPayloadPair> Durability<Pair> {
         let oplog_entry = ctx.read_persisted_durable_function_invocation().await?;
 
         let function_name = Pair::FQFN;
-        Self::validate_oplog_entry(&oplog_entry, function_name)?;
+        Self::validate_oplog_entry(&oplog_entry, function_name, self.begin_index)?;
 
         ctx.end_durable_function(&self.function_type, self.begin_index, false)
             .await?;
@@ -1296,9 +1299,18 @@ impl<Pair: HostPayloadPair> Durability<Pair> {
     fn validate_oplog_entry(
         oplog_entry: &PersistedDurableFunctionInvocation,
         expected_function_name: &str,
+        begin_index: OplogIndex,
     ) -> Result<(), WorkerExecutorError> {
         if oplog_entry.function_name != expected_function_name {
+            // `oplog_entry.function_type` is the actual entry's durable_function_type (e.g.
+            // ReadLocalPollable(seq) for a stray IoPollReady) — logging it alongside the
+            // function-name mismatch turns "expected io::poll::poll, got
+            // io::poll::pollable::ready" into an actionable trace: which specific pollable's
+            // entry got read out of order. `begin_index` is where this replay attempt started
+            // reading, i.e. approximately where the mismatched entry sits.
             error!(
+                begin_index = %begin_index,
+                actual_durable_function_type = ?oplog_entry.function_type,
                 "Unexpected imported function call entry in oplog: expected {}, got {}",
                 expected_function_name, oplog_entry.function_name
             );

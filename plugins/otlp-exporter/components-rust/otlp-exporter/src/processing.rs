@@ -1001,6 +1001,112 @@ fn handle_oplog_processor_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use golem_rust::wasip2::clocks::wall_clock::Datetime;
+
+    fn ts(seconds: u64) -> Datetime {
+        Datetime {
+            seconds,
+            nanoseconds: 0,
+        }
+    }
+
+    fn fresh_state() -> WorkerState {
+        WorkerState {
+            trace_id: String::new(),
+            trace_states: Vec::new(),
+            pending_spans: HashMap::new(),
+            implicit_spans: Vec::new(),
+            terminal_error: None,
+            inherited_span_parents: HashMap::new(),
+            invocation_start_ns: None,
+            total_memory_bytes: 0,
+            active_resources: 0,
+        }
+    }
+
+    // Regression test for a production bug: `OtlpExporterComponent::process()` used to
+    // commit `WorkerState` back to the shared cache only AFTER a successful OTLP export,
+    // using `?` on the fallible send. Any export failure (e.g. the collector being briefly
+    // unreachable) discarded the whole batch's derived state, silently orphaning any span
+    // whose StartSpan/FinishSpan pair straddled two separate process() batches. The fix
+    // commits state unconditionally, right after process_entries() runs, before any
+    // network I/O is attempted. This test proves the mechanism that fix depends on: a span
+    // opened in one batch is correctly completed by a later batch, as long as the SAME
+    // WorkerState is carried forward between calls (exactly what the unconditional commit
+    // in lib.rs now guarantees on every call, regardless of export outcome).
+    #[test]
+    fn span_completes_across_batches_when_state_is_carried_forward() {
+        let mut state = fresh_state();
+
+        // Batch 1: only a StartSpan — nothing completed yet, so under both the old and
+        // new code this batch has nothing to export and always committed its state.
+        let entries_batch_1 = vec![OplogEntry::StartSpan(StartSpanParameters {
+            timestamp: ts(100),
+            span_id: "s1".to_string(),
+            parent: None,
+            linked_context_id: None,
+            attributes: Vec::new(),
+        })];
+        let output_1 = process_entries(&mut state, entries_batch_1);
+        assert!(
+            output_1.spans.is_empty(),
+            "span must not be exportable before it finishes"
+        );
+        assert!(
+            state.pending_spans.contains_key("s1"),
+            "the open span must be tracked in WorkerState across batches"
+        );
+
+        // Batch 2 (a separate process() call, using the SAME carried-forward state, as
+        // the fixed lib.rs now always guarantees): FinishSpan for s1.
+        let entries_batch_2 = vec![OplogEntry::FinishSpan(FinishSpanParameters {
+            timestamp: ts(200),
+            span_id: "s1".to_string(),
+        })];
+        let output_2 = process_entries(&mut state, entries_batch_2);
+
+        assert_eq!(
+            output_2.spans.len(),
+            1,
+            "the span must complete once its FinishSpan arrives in a later batch"
+        );
+        assert_eq!(output_2.spans[0].span_id, "s1");
+        assert!(
+            state.pending_spans.is_empty(),
+            "the completed span must be removed from pending state"
+        );
+    }
+
+    // Documents the exact failure mode the fix prevents: if a batch's derived state is
+    // NOT carried forward (e.g. discarded because an export attempt failed before the old
+    // code's late WORKER_STATES commit was reached), a later FinishSpan for a span opened
+    // in the lost batch can never be matched, and the span is silently dropped forever.
+    #[test]
+    fn finish_span_is_silently_dropped_if_prior_batch_state_was_lost() {
+        let mut lost_state = fresh_state();
+        let entries_batch_1 = vec![OplogEntry::StartSpan(StartSpanParameters {
+            timestamp: ts(100),
+            span_id: "s1".to_string(),
+            parent: None,
+            linked_context_id: None,
+            attributes: Vec::new(),
+        })];
+        // Batch 1 runs and derives a pending span, but (simulating the old bug) its
+        // resulting state is never committed — the next batch starts from fresh state.
+        let _ = process_entries(&mut lost_state, entries_batch_1);
+        let mut fresh = fresh_state();
+
+        let entries_batch_2 = vec![OplogEntry::FinishSpan(FinishSpanParameters {
+            timestamp: ts(200),
+            span_id: "s1".to_string(),
+        })];
+        let output_2 = process_entries(&mut fresh, entries_batch_2);
+
+        assert!(
+            output_2.spans.is_empty(),
+            "without carried-forward state, the span's completion is unrecoverable"
+        );
+    }
 
     #[test]
     fn resolves_inherited_chain_to_external_boundary() {

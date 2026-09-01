@@ -68,19 +68,31 @@ impl OplogProcessorGuest for OtlpExporterComponent {
 
         let output = process_entries(&mut working_state, entries);
 
+        // Commit the derived state unconditionally, right after processing — before any
+        // fallible network I/O below. `working_state` (pending_spans, invocation_start_ns,
+        // inherited_span_parents, ...) is the ONLY record of how this batch's oplog entries
+        // were interpreted; the batch itself is never redelivered once handed to this
+        // function (redelivery, where it happens, retries the OTLP send, not
+        // re-derivation — see the is_empty() cleanup below, unchanged). If the commit were
+        // deferred until after a successful export (the previous behavior), any export
+        // failure — including a transient one, e.g. the collector being briefly
+        // unreachable — would silently discard this batch's derived spans/timestamps,
+        // permanently orphaning any StartSpan/AgentInvocationStarted whose matching
+        // FinishSpan/AgentInvocationFinished arrives in a later, successful batch.
+        WORKER_STATES.with(|states| {
+            let mut states = states.borrow_mut();
+            if working_state.is_empty() {
+                states.remove(&key);
+            } else {
+                states.insert(key, working_state);
+            }
+        });
+
         let has_traces = exporter_config.signals.traces && !output.spans.is_empty();
         let has_logs = exporter_config.signals.logs && !output.log_records.is_empty();
         let has_metrics = exporter_config.signals.metrics && !output.metrics.is_empty();
 
         if !has_traces && !has_logs && !has_metrics {
-            WORKER_STATES.with(|states| {
-                let mut states = states.borrow_mut();
-                if working_state.is_empty() {
-                    states.remove(&key);
-                } else {
-                    states.insert(key, working_state);
-                }
-            });
             return Ok(());
         }
 
@@ -105,8 +117,21 @@ impl OplogProcessorGuest for OtlpExporterComponent {
                     }],
                 }],
             };
-            send_spans(&exporter_config, request_body)?;
-            println!("OTLP: exported {span_count} trace span(s)");
+            // Export failures are deliberately NOT propagated as `Err` from `process()` —
+            // see the state-commit comment above. Returning `Err` here previously made
+            // golem treat a transient export failure (e.g. collector briefly down) the
+            // same as a genuine plugin crash: it can trigger the platform's oplog
+            // redelivery/retry path, which — combined with this being a single shared,
+            // multi-tenant worker instance — risks stalling delivery to ALL source
+            // workers behind a permanently-retrying batch, not just losing this one
+            // batch's telemetry. Best effort: log and move on.
+            if let Err(e) = send_spans(&exporter_config, request_body) {
+                eprintln!(
+                    "OTLP exporter: failed to export {span_count} trace span(s), dropping this batch's traces: {e}"
+                );
+            } else {
+                println!("OTLP: exported {span_count} trace span(s)");
+            }
         }
 
         if has_logs {
@@ -122,8 +147,13 @@ impl OplogProcessorGuest for OtlpExporterComponent {
                     }],
                 }],
             };
-            send_logs(&exporter_config, request_body)?;
-            println!("OTLP: exported {log_count} log record(s)");
+            if let Err(e) = send_logs(&exporter_config, request_body) {
+                eprintln!(
+                    "OTLP exporter: failed to export {log_count} log record(s), dropping this batch's logs: {e}"
+                );
+            } else {
+                println!("OTLP: exported {log_count} log record(s)");
+            }
         }
 
         if has_metrics {
@@ -139,18 +169,14 @@ impl OplogProcessorGuest for OtlpExporterComponent {
                     }],
                 }],
             };
-            send_metrics(&exporter_config, request_body)?;
-            println!("OTLP: exported {metric_count} metric(s)");
-        }
-
-        WORKER_STATES.with(|states| {
-            let mut states = states.borrow_mut();
-            if working_state.is_empty() {
-                states.remove(&key);
+            if let Err(e) = send_metrics(&exporter_config, request_body) {
+                eprintln!(
+                    "OTLP exporter: failed to export {metric_count} metric(s), dropping this batch's metrics: {e}"
+                );
             } else {
-                states.insert(key, working_state);
+                println!("OTLP: exported {metric_count} metric(s)");
             }
-        });
+        }
 
         Ok(())
     }

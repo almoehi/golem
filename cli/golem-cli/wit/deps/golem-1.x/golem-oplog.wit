@@ -81,7 +81,18 @@ interface oplog {
         /// this entry's index as the parameter. In batched remote writes it is the caller's responsibility
         /// to manually write an `EndRemoteWrite` entry (using `end_function`) when the operation is completed.
         write-remote-batched(option<oplog-index>),
-        write-remote-transaction(option<oplog-index>)
+        write-remote-transaction(option<oplog-index>),
+        /// Like read-local, but also carries the WASM resource handle (rep) of the pollable.
+        /// Used by io::poll::pollable::ready() to distinguish per-pollable oplog entries during
+        /// replay, preventing the wrong pollable from consuming a ready=true entry recorded for
+        /// a different pollable.
+        read-local-pollable(u32),
+        /// Like write-remote, but also carries a logical, call-order-derived sequence number
+        /// identifying which concurrently-tracked RPC call this entry belongs to. Used by
+        /// golem::rpc::future-invoke-result::get() to distinguish per-call oplog entries during
+        /// replay, preventing a sibling concurrently-dispatched call's completion from being
+        /// consumed as if it were this call's own.
+        write-remote-concurrent(u32)
     }
 
     record plugin-installation-description {

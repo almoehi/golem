@@ -613,6 +613,12 @@ impl From<durability::DurableFunctionType> for DurableFunctionType {
             durability::DurableFunctionType::WriteRemoteTransaction(oplog_index) => {
                 DurableFunctionType::WriteRemoteTransaction(oplog_index.map(OplogIndex::from_u64))
             }
+            durability::DurableFunctionType::ReadLocalPollable(rep) => {
+                DurableFunctionType::ReadLocalPollable(rep)
+            }
+            durability::DurableFunctionType::WriteRemoteConcurrent(seq) => {
+                DurableFunctionType::WriteRemoteConcurrent(seq)
+            }
         }
     }
 }

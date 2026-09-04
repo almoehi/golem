@@ -289,8 +289,29 @@ impl<Ctx: WorkerCtx> OplogProcessorPlugin for PerExecutorOplogProcessorPlugin<Ct
         let is_local = self.is_local(target_agent_id).await?;
 
         if is_local {
-            // Local path: activate and invoke directly
-            let target_owned = OwnedAgentId::new(worker_metadata.environment_id, target_agent_id);
+            // Local path: activate and invoke directly.
+            //
+            // Must use the target plugin worker's OWN environment_id (already resolved
+            // above via resolve_plugin_worker, from the plugin component's authoritative
+            // metadata) — NOT worker_metadata.environment_id, which belongs to the SOURCE
+            // agent whose oplog is being flushed. When the plugin component lives in a
+            // different environment than the source agent (the common case for a shared,
+            // per-executor oplog-processor plugin), using the source's environment_id here
+            // constructs an OwnedAgentId that disagrees with the one used to key this
+            // worker's own oplog-payload blob storage namespace on recovery
+            // (FileSystemBlobStorage's BlobStorageNamespace::OplogPayload path includes
+            // environment_id). The mismatch is invisible while the worker stays resident
+            // in memory (the live in-process payload cache masks it), but on any cold
+            // recovery (process restart, eviction) `download_raw_payload` looks up the
+            // wrong environment_id directory and permanently fails with "Payload not
+            // found" — even though the payload is physically present under the correct
+            // (plugin's own) environment_id. This traps the worker in `recover_instance_state`
+            // forever, so every future flush to this shared plugin worker enqueues
+            // successfully but is never confirmed complete.
+            let target_owned = OwnedAgentId::new(
+                running_plugin.owned_agent_id.environment_id,
+                target_agent_id,
+            );
 
             let worker = self
                 .worker_activator

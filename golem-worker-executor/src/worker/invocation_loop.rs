@@ -705,6 +705,7 @@ impl<Ctx: WorkerCtx> InnerInvocationLoop<'_, Ctx> {
                     pickup_span.record("idempotency_key", tracing::field::display(idempotency_key));
                 }
 
+                let invocation_kind = timestamped_invocation.invocation.kind();
                 let outcome = async {
                     let mut store = self.store.lock().await;
                     let mut invocation = Invocation {
@@ -728,12 +729,31 @@ impl<Ctx: WorkerCtx> InnerInvocationLoop<'_, Ctx> {
                         // agents get a chance to run. The worker will self-wake
                         // and re-acquire its permit through the FIFO queue if
                         // more durable work remains.
-                        let status = self.parent.get_non_detached_last_known_status().await;
-                        if !status.pending_invocations.is_empty() {
-                            // More durable work remains — self-wake so we return
-                            // to the outer loop, release the permit (entering
-                            // idle), and re-enter through the scheduler queue.
-                            break CommandOutcome::WaitForWakeup;
+                        //
+                        // Exemption: ProcessOplogEntries invocations are the shared,
+                        // per-executor oplog-processor plugin workers (e.g.
+                        // golem-otlp-exporter) draining a backlog fed by EVERY other
+                        // agent's own oplog activity — not a peer application agent
+                        // competing for its own turn. Forcing this worker through the
+                        // same one-invocation-then-requeue-via-FIFO cycle as everyone
+                        // else means its backlog (fed by N other agents) must win N
+                        // times as many FIFO races just to keep up, and falls
+                        // permanently behind under a concurrent-agent burst — confirmed
+                        // live: a shared plugin worker's queue grew unboundedly under a
+                        // ~19-agent burst while every other agent's own backlog drained
+                        // normally. Draining its whole backlog in one FIFO win is safe:
+                        // it holds no resources other peers need released quickly (no
+                        // filesystem/memory grant contention), and it is exactly the
+                        // "let a queue-drain worker keep its turn" case fairness
+                        // yielding was never meant to penalize.
+                        if invocation_kind != AgentInvocationKind::ProcessOplogEntries {
+                            let status = self.parent.get_non_detached_last_known_status().await;
+                            if !status.pending_invocations.is_empty() {
+                                // More durable work remains — self-wake so we return
+                                // to the outer loop, release the permit (entering
+                                // idle), and re-enter through the scheduler queue.
+                                break CommandOutcome::WaitForWakeup;
+                            }
                         }
                         continue;
                     }

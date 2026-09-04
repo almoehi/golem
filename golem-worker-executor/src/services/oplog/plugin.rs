@@ -67,7 +67,18 @@ struct LivePluginState {
     sending_up_to: OplogIndex,
     send_in_progress: bool,
     last_batch_start: OplogIndex,
+    /// When the current `sending_up_to` batch was (last) enqueued. `None` means either
+    /// there's nothing unconfirmed, or this state was seeded from a checkpoint (e.g.
+    /// after a restart) with no record of when the send happened — treated as already
+    /// past the retry grace window, so its status gets checked on the very next flush.
+    sending_since: Option<Instant>,
 }
+
+/// How long an enqueued-but-unconfirmed batch is given to actually complete (as observed
+/// via `lookup_invocation_status`) before it's treated as failed/lost and retried. Checked
+/// on every flush tick (see `plugin_max_elapsed_time`, default 5s) rather than via a single
+/// long-lived wait, so a stuck batch is retried promptly instead of silently discarded.
+const PENDING_BATCH_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 #[async_trait]
 pub trait OplogProcessorPlugin: Send + Sync {
@@ -792,6 +803,10 @@ impl ForwardingOplog {
                         sending_up_to: cp.sending_up_to,
                         send_in_progress: false,
                         last_batch_start: cp.last_batch_start,
+                        // Unknown how long ago this was sent (e.g. seeded after a
+                        // restart) — treated as already past the retry grace window,
+                        // so any unconfirmed range gets its status checked immediately.
+                        sending_since: None,
                     },
                 );
             }
@@ -803,6 +818,7 @@ impl ForwardingOplog {
                     sending_up_to: OplogIndex::NONE,
                     send_in_progress: false,
                     last_batch_start: OplogIndex::NONE,
+                    sending_since: None,
                 });
             }
             state
@@ -827,7 +843,6 @@ impl ForwardingOplog {
             plugin_state,
             pending_direct_commits: BTreeMap::new(),
             worker_event_service: None,
-            monitor_tasks: Vec::new(),
         }));
 
         let timer = tokio::spawn({
@@ -881,13 +896,6 @@ impl Drop for ForwardingOplog {
         }
         if let Some(timer) = self.timer.take() {
             timer.abort();
-        }
-        // Abort all background monitor tasks to prevent them from
-        // outliving this oplog and causing resource contention.
-        if let Some(mut state) = self.state.try_lock() {
-            for task in state.monitor_tasks.drain(..) {
-                task.abort();
-            }
         }
     }
 }
@@ -988,7 +996,6 @@ struct ForwardingOplogState {
     /// so the Worker folds them into `AgentStatusRecord`.
     pending_direct_commits: BTreeMap<OplogIndex, OplogEntry>,
     worker_event_service: Option<Arc<dyn WorkerEventService>>,
-    monitor_tasks: Vec<JoinHandle<()>>,
 }
 
 impl ForwardingOplogState {
@@ -1036,6 +1043,7 @@ impl ForwardingOplogState {
                         sending_up_to: cp.sending_up_to,
                         send_in_progress: false,
                         last_batch_start: cp.last_batch_start,
+                        sending_since: None,
                     }
                 } else {
                     LivePluginState {
@@ -1044,6 +1052,7 @@ impl ForwardingOplogState {
                         sending_up_to: OplogIndex::NONE,
                         send_in_progress: false,
                         last_batch_start: OplogIndex::NONE,
+                        sending_since: None,
                     }
                 };
                 e.insert(live);
@@ -1123,6 +1132,88 @@ impl ForwardingOplogState {
             Some(p) => p.clone(),
             None => return,
         };
+
+        // A previously-sent batch is still unconfirmed. `confirmed_up_to` only ever
+        // advances on OBSERVED completion (never on successful enqueue — see the
+        // `Ok(())` arm of `send()` below) so this is reached both right after a normal
+        // send and on every subsequent flush tick until the batch is confirmed one way
+        // or another. Check its real status here, synchronously, using the `&mut self`
+        // this function already has — this is what lets a lost/failed/never-run
+        // invocation actually get retried by the batch selection below, instead of
+        // being silently and permanently skipped.
+        let mut live = live;
+        if live.sending_up_to > live.confirmed_up_to
+            && let Some(target_agent_id) = live.target_agent_id.clone()
+        {
+            let idempotency_key = oplog_processor_idempotency_key(
+                &self.initial_worker_metadata.agent_id,
+                &grant_id,
+                live.last_batch_start,
+                live.sending_up_to,
+            );
+            match self
+                .oplog_plugins
+                .lookup_invocation_status(
+                    metadata.environment_id,
+                    &plugin,
+                    &target_agent_id,
+                    metadata.created_by,
+                    &idempotency_key,
+                )
+                .await
+            {
+                Ok(InvocationStatus::Complete) => {
+                    self.write_checkpoint(
+                        grant_id,
+                        &target_agent_id,
+                        live.sending_up_to,
+                        live.sending_up_to,
+                        live.last_batch_start,
+                    )
+                    .await;
+                    live.confirmed_up_to = live.sending_up_to;
+                    if let Some(s) = self.plugin_state.get_mut(&grant_id) {
+                        s.confirmed_up_to = live.sending_up_to;
+                    }
+                }
+                other => {
+                    let still_pending = matches!(other, Ok(InvocationStatus::Pending));
+                    let elapsed = live
+                        .sending_since
+                        .map(|t| t.elapsed())
+                        .unwrap_or(Duration::MAX);
+                    if still_pending && elapsed < PENDING_BATCH_RETRY_AFTER {
+                        // Genuinely still in flight and within the grace window — leave
+                        // it be, don't attempt to send anything new on top of it, and
+                        // check again on the next flush tick.
+                        return;
+                    }
+                    tracing::warn!(
+                        plugin_name = plugin.plugin_name,
+                        source_agent = %self.initial_worker_metadata.agent_id,
+                        batch_start = %live.last_batch_start,
+                        batch_end = %live.sending_up_to,
+                        ?other,
+                        elapsed_secs = elapsed.as_secs(),
+                        "Oplog processor: unconfirmed batch did not complete, will retry"
+                    );
+                    if let Some(event_service) = &self.worker_event_service {
+                        event_service.emit_event(
+                            InternalWorkerEvent::plugin_error(
+                                &format!("{grant_id}"),
+                                &format!(
+                                    "Batch [{}..{}] did not complete ({other:?}), retrying",
+                                    live.last_batch_start, live.sending_up_to
+                                ),
+                            ),
+                            true,
+                        );
+                    }
+                    // Fall through — the batch selection below re-selects this exact
+                    // range as a retry, since sending_up_to is still > confirmed_up_to.
+                }
+            }
+        }
 
         let batch = if live.sending_up_to > live.confirmed_up_to {
             // RETRY: exact same range — never widen
@@ -1256,106 +1347,19 @@ impl ForwardingOplogState {
                     batch_end = %batch_end,
                     "Oplog processor: batch enqueued successfully"
                 );
-                // Enqueue succeeded — immediately confirm
-                self.write_checkpoint(
-                    grant_id,
-                    &target_agent_id,
-                    batch_end,
-                    batch_end,
-                    batch_start,
-                )
-                .await;
+                // Deliberately NOT confirmed here — enqueue succeeding only means the
+                // invocation was accepted into the target plugin worker's queue, not
+                // that it ran. `confirmed_up_to` only advances once a later flush tick
+                // observes `InvocationStatus::Complete` for this exact batch (see the
+                // status-check block at the top of this function) — that's what makes
+                // a lost/failed/never-run invocation retryable instead of a permanent,
+                // silent loss of this batch's telemetry.
                 if let Some(s) = self.plugin_state.get_mut(&grant_id) {
-                    s.confirmed_up_to = batch_end;
                     s.sending_up_to = batch_end;
                     s.send_in_progress = false;
                     s.last_batch_start = batch_start;
+                    s.sending_since = Some(Instant::now());
                 }
-
-                // Spawn background monitoring task to observe errors.
-                // Compute the idempotency key here so only lightweight data
-                // needs to be moved into the task.
-                let idempotency_key = oplog_processor_idempotency_key(
-                    &metadata.agent_id,
-                    &plugin.environment_plugin_grant_id,
-                    batch_start,
-                    batch_end,
-                );
-                let worker_event_service = self.worker_event_service.clone();
-                let oplog_plugins = self.oplog_plugins.clone();
-                let environment_id = metadata.environment_id;
-                let caller_account_id = metadata.created_by;
-                let plugin_clone = plugin.clone();
-                let target_clone = target_agent_id.clone();
-                // The task polls on after this flush returned, so it links back to
-                // the flush rather than running inside its span. See `TraceOrigin`.
-                let monitor_span = related_span!(
-                    TraceOrigin::capture_current(),
-                    tracing::Level::INFO,
-                    "oplog_plugin_batch_monitor",
-                    agent_id = %metadata.agent_id,
-                    grant_id = %grant_id,
-                    batch_start = %batch_start,
-                    batch_end = %batch_end
-                );
-                let monitor = tokio::spawn(
-                    async move {
-                        // Poll until the invocation completes, with a timeout
-                        let deadline = Instant::now() + Duration::from_secs(300);
-                        loop {
-                            if Instant::now() >= deadline {
-                                tracing::warn!(
-                                    "Plugin {grant_id}: monitoring timed out for batch [{batch_start}..{batch_end}]"
-                                );
-                                break;
-                            }
-
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-
-                            match oplog_plugins
-                                .lookup_invocation_status(
-                                    environment_id,
-                                    &plugin_clone,
-                                    &target_clone,
-                                    caller_account_id,
-                                    &idempotency_key,
-                                )
-                                .await
-                            {
-                                Ok(InvocationStatus::Complete) => {
-                                    // Completed — nothing to do
-                                    break;
-                                }
-                                Ok(InvocationStatus::Unknown) => {
-                                    tracing::warn!(
-                                        "Plugin {grant_id}: invocation status unknown for batch [{batch_start}..{batch_end}]"
-                                    );
-                                    break;
-                                }
-                                Ok(_) => {
-                                    // Still pending — continue polling
-                                }
-                                Err(err) => {
-                                    tracing::error!(
-                                        "Plugin {grant_id} error monitoring batch [{batch_start}..{batch_end}]: {err}"
-                                    );
-                                    if let Some(event_service) = &worker_event_service {
-                                        event_service.emit_event(
-                                            InternalWorkerEvent::plugin_error(
-                                                &format!("{grant_id}"),
-                                                &format!("Error monitoring batch [{batch_start}..{batch_end}]: {err}"),
-                                            ),
-                                            true,
-                                        );
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    .instrument(monitor_span),
-                );
-                self.monitor_tasks.push(monitor);
             }
             Err(err) => {
                 tracing::error!("Failed to enqueue oplog entries to plugin {grant_id}: {err}");
@@ -1481,8 +1485,6 @@ impl ForwardingOplogState {
     fn finish_flush_cycle(&mut self) {
         self.last_send = Instant::now();
         self.commit_count = 0;
-        // Prune completed monitor tasks
-        self.monitor_tasks.retain(|h| !h.is_finished());
     }
 
     /// Periodic locality recovery: for each plugin whose target worker is on a
@@ -1813,6 +1815,9 @@ mod tests {
     struct RecordingOplogProcessorPlugin {
         sends: async_lock::Mutex<Vec<RecordedSend>>,
         lookups: async_lock::Mutex<Vec<RecordedLookup>>,
+        /// Status returned by `lookup_invocation_status`. Defaults to `Unknown` (matches
+        /// the previous hardcoded behavior); override via `set_status` per test.
+        status: async_lock::Mutex<InvocationStatus>,
     }
 
     #[derive(Debug, Clone)]
@@ -1832,6 +1837,7 @@ mod tests {
             Self {
                 sends: async_lock::Mutex::new(Vec::new()),
                 lookups: async_lock::Mutex::new(Vec::new()),
+                status: async_lock::Mutex::new(InvocationStatus::Unknown),
             }
         }
 
@@ -1845,6 +1851,10 @@ mod tests {
 
         async fn lookups(&self) -> Vec<RecordedLookup> {
             self.lookups.lock().await.clone()
+        }
+
+        async fn set_status(&self, status: InvocationStatus) {
+            *self.status.lock().await = status;
         }
     }
 
@@ -1904,7 +1914,7 @@ mod tests {
                 .lock()
                 .await
                 .push(RecordedLookup { caller_account_id });
-            Ok(InvocationStatus::Unknown)
+            Ok(*self.status.lock().await)
         }
     }
 
@@ -2173,11 +2183,11 @@ mod tests {
                     sending_up_to: OplogIndex::NONE,
                     send_in_progress: false,
                     last_batch_start: OplogIndex::NONE,
+                    sending_since: None,
                 },
             )]),
             pending_direct_commits: BTreeMap::new(),
             worker_event_service: None,
-            monitor_tasks: Vec::new(),
         };
 
         // No committed entries (last_committed_idx = NONE) — try_flush should be a no-op
@@ -2219,7 +2229,6 @@ mod tests {
             plugin_state: HashMap::new(),
             pending_direct_commits: BTreeMap::new(),
             worker_event_service: None,
-            monitor_tasks: Vec::new(),
         };
 
         state.try_flush().await;
@@ -2277,11 +2286,11 @@ mod tests {
                     sending_up_to: OplogIndex::NONE,
                     send_in_progress: false,
                     last_batch_start: OplogIndex::NONE,
+                    sending_since: None,
                 },
             )]),
             pending_direct_commits: BTreeMap::new(),
             worker_event_service: None,
-            monitor_tasks: Vec::new(),
         };
 
         state.try_flush().await;
@@ -2291,29 +2300,29 @@ mod tests {
         assert_eq!(sends[0].entry_count, 2, "Batch should contain 2 entries");
     }
 
-    #[test]
-    async fn plugin_monitor_looks_up_status_as_original_worker_owner() {
-        let grant_id = EnvironmentPluginGrantId::new();
+    /// Shared setup for the unconfirmed-batch tests below: one committed entry, one
+    /// active plugin, nothing sent yet.
+    async fn unconfirmed_batch_test_state(
+        grant_id: EnvironmentPluginGrantId,
+        recording_plugin: Arc<RecordingOplogProcessorPlugin>,
+    ) -> ForwardingOplogState {
         let (metadata, status_lock) = test_worker_metadata(HashSet::from([grant_id]));
-        let worker_owner = metadata.created_by;
-        let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
         let components: Arc<dyn ComponentService> = Arc::new(
             FakeComponentService::with_one_oplog_processor_plugin(grant_id),
         );
         let inner: Arc<dyn Oplog> = Arc::new(InMemoryOplog::new());
-
         let entry = OplogEntry::GrowMemory {
             timestamp: Timestamp::now_utc(),
             delta: 100,
         };
         inner.add(entry.clone()).await;
 
-        let mut state = ForwardingOplogState {
+        ForwardingOplogState {
             buffer: VecDeque::from([entry]),
             buffer_start_idx: OplogIndex::INITIAL,
             commit_count: 0,
             last_send: Instant::now(),
-            oplog_plugins: recording_plugin.clone(),
+            oplog_plugins: recording_plugin,
             initial_worker_metadata: metadata,
             last_known_status: status_lock,
             last_oplog_idx: OplogIndex::from_u64(1),
@@ -2328,22 +2337,119 @@ mod tests {
                     sending_up_to: OplogIndex::NONE,
                     send_in_progress: false,
                     last_batch_start: OplogIndex::NONE,
+                    sending_since: None,
                 },
             )]),
             pending_direct_commits: BTreeMap::new(),
             worker_event_service: None,
-            monitor_tasks: Vec::new(),
-        };
-
-        state.try_flush().await;
-
-        assert_eq!(state.monitor_tasks.len(), 1, "Expected a monitoring task");
-        for task in state.monitor_tasks.drain(..) {
-            let _ = task.await;
         }
+    }
 
+    #[test]
+    async fn unconfirmed_batch_status_checked_as_original_worker_owner() {
+        let grant_id = EnvironmentPluginGrantId::new();
+        let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
+        let mut state =
+            unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
+        let worker_owner = state.initial_worker_metadata.created_by;
+
+        // First tick: nothing sent yet, so this just enqueues — no status check.
+        state.try_flush().await;
+        assert_eq!(recording_plugin.send_count().await, 1);
+        assert!(
+            recording_plugin.lookups().await.is_empty(),
+            "First send has nothing prior to check the status of"
+        );
+
+        // Second tick: the first batch is still unconfirmed, so this checks its status
+        // before considering anything else.
+        state.try_flush().await;
         let lookups = recording_plugin.lookups().await;
         assert_eq!(lookups.len(), 1, "Expected exactly one status lookup");
         assert_eq!(lookups[0].caller_account_id, worker_owner);
+    }
+
+    /// Regression test for the checkpoint-advance-on-enqueue bug: previously
+    /// `confirmed_up_to` advanced the moment `send()` returned `Ok(())` (meaning only
+    /// that the batch was accepted into the target plugin worker's queue, not that it
+    /// ran) — so a batch whose invocation never actually completed (crash, eviction, a
+    /// wedged shared plugin worker) was confirmed and therefore never retried,
+    /// permanently and silently losing that range's telemetry. This asserts the
+    /// opposite: an unconfirmed batch whose status comes back anything other than
+    /// `Complete` gets resent.
+    #[test]
+    async fn unconfirmed_batch_is_retried_when_status_is_not_complete() {
+        let grant_id = EnvironmentPluginGrantId::new();
+        let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
+        recording_plugin.set_status(InvocationStatus::Unknown).await;
+        let mut state =
+            unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
+
+        state.try_flush().await; // original send
+        state.try_flush().await; // status check (Unknown) -> immediate retry
+
+        let sends = recording_plugin.sends().await;
+        assert_eq!(
+            sends.len(),
+            2,
+            "A batch whose status is Unknown must be resent, not silently dropped"
+        );
+        let live = state.plugin_state.get(&grant_id).unwrap();
+        assert_eq!(
+            live.confirmed_up_to,
+            OplogIndex::NONE,
+            "Must not be confirmed until status is actually observed as Complete"
+        );
+    }
+
+    /// The mirror-image case: once the plugin actually reports `Complete`, the batch
+    /// must be confirmed and must NOT be resent on the next tick.
+    #[test]
+    async fn unconfirmed_batch_is_confirmed_and_not_resent_when_complete() {
+        let grant_id = EnvironmentPluginGrantId::new();
+        let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
+        let mut state =
+            unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
+
+        state.try_flush().await; // original send
+        recording_plugin
+            .set_status(InvocationStatus::Complete)
+            .await;
+        state.try_flush().await; // status check (Complete) -> confirm, no resend
+
+        assert_eq!(
+            recording_plugin.send_count().await,
+            1,
+            "A confirmed batch must not be resent"
+        );
+        let live = state.plugin_state.get(&grant_id).unwrap();
+        assert_eq!(
+            live.confirmed_up_to, live.sending_up_to,
+            "Must be confirmed once status is observed as Complete"
+        );
+    }
+
+    /// A genuinely still-in-flight batch (`Pending`, within the grace window) must be
+    /// left alone rather than eagerly resent on every tick.
+    #[test]
+    async fn unconfirmed_batch_not_resent_while_genuinely_pending() {
+        let grant_id = EnvironmentPluginGrantId::new();
+        let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
+        let mut state =
+            unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
+
+        state.try_flush().await; // original send
+        recording_plugin
+            .set_status(InvocationStatus::Pending)
+            .await;
+        state.try_flush().await; // status check (Pending, fresh) -> wait, no resend
+
+        assert_eq!(
+            recording_plugin.send_count().await,
+            1,
+            "A genuinely pending batch within the grace window must not be resent yet"
+        );
+        let live = state.plugin_state.get(&grant_id).unwrap();
+        assert_eq!(live.confirmed_up_to, OplogIndex::NONE);
     }
 }

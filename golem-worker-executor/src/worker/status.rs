@@ -1796,6 +1796,66 @@ mod test {
         run_test_case(test_case).await;
     }
 
+    // Regression test for a busy-loop bug in `Invocation::external_invocation`
+    // (invocation_loop.rs): a `PendingAgentInvocation` whose idempotency key already has a
+    // recorded result (e.g. a duplicate/re-sent request using the same deterministic key —
+    // this is exactly how the oplog-processor plugin's own retry-with-unwidened-range logic
+    // behaves) is never routed through `invoke_agent`/`AgentInvocationStarted`, which is the
+    // only oplog entry `calculate_pending_invocations` recognizes as removing an entry from
+    // `pending_invocations`. Left unpruned, `drain_pending_from_status` re-selects the same
+    // entry forever. The fix explicitly records `CancelPendingInvocation` for the duplicate
+    // key. This test asserts the fold correctly prunes only the later, duplicate pending
+    // entry while leaving the original completed result in `invocation_results` untouched.
+    #[test]
+    async fn duplicate_pending_invocation_after_completion_is_pruned_by_cancellation() {
+        let k1 = IdempotencyKey::fresh();
+
+        let test_case = TestCase::builder(0)
+            .pending_invocation(AgentInvocation::AgentMethod {
+                idempotency_key: k1.clone(),
+                method_name: "a".to_string(),
+                input: UntypedDataValue::Tuple(vec![UntypedElementValue::ComponentModel(
+                    Value::Bool(true),
+                )]),
+                invocation_context: InvocationContextStack::fresh(),
+                principal: Principal::anonymous(),
+            })
+            .agent_invocation_started("a", vec![], k1.clone())
+            .agent_invocation_finished(
+                AgentInvocationResult::AgentInitialization,
+                k1.clone(),
+                ComponentRevision::INITIAL,
+            )
+            // A duplicate submission of the same idempotency key arrives after the original
+            // already completed — e.g. a re-sent retry. Without the fix this entry would sit
+            // in `pending_invocations` forever.
+            .pending_invocation(AgentInvocation::AgentMethod {
+                idempotency_key: k1.clone(),
+                method_name: "a".to_string(),
+                input: UntypedDataValue::Tuple(vec![UntypedElementValue::ComponentModel(
+                    Value::Bool(true),
+                )]),
+                invocation_context: InvocationContextStack::fresh(),
+                principal: Principal::anonymous(),
+            })
+            .cancel_pending_invocation(k1.clone())
+            .build();
+
+        // The fold must not treat the cancellation as clearing the already-recorded result —
+        // otherwise a legitimate lookup for the original (successful) invocation would regress
+        // from `Complete` back to `New`/`Pending`.
+        let final_status = test_case.entries.last().unwrap().expected_status.clone();
+        assert!(final_status.invocation_results.contains_key(&k1));
+        assert!(
+            !final_status
+                .pending_invocations
+                .iter()
+                .any(|p| p.has_idempotency_key(&k1))
+        );
+
+        run_test_case(test_case).await;
+    }
+
     #[test]
     async fn snapshot_tracking() {
         let k1 = IdempotencyKey::fresh();

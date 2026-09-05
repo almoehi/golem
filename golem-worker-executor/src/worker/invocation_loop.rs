@@ -748,7 +748,10 @@ impl<Ctx: WorkerCtx> InnerInvocationLoop<'_, Ctx> {
                         // yielding was never meant to penalize.
                         if invocation_kind != AgentInvocationKind::ProcessOplogEntries {
                             let status = self.parent.get_non_detached_last_known_status().await;
-                            if !status.pending_invocations.is_empty() {
+                            if should_yield_for_fairness(
+                                invocation_kind,
+                                !status.pending_invocations.is_empty(),
+                            ) {
                                 // More durable work remains — self-wake so we return
                                 // to the outer loop, release the permit (entering
                                 // idle), and re-enter through the scheduler queue.
@@ -945,6 +948,26 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
                         debug!(
                             "Skipping enqueued invocation with idempotency key {idempotency_key} as it already has a result"
                         );
+                        // This pending invocation is a duplicate of an already-completed one
+                        // (same idempotency key, e.g. a re-sent/retried request) — its result
+                        // is already known, so it is never routed through `invoke_agent`/
+                        // `AgentInvocationStarted`, which is the ONLY oplog entry
+                        // `calculate_pending_invocations` (status.rs) recognizes as removing an
+                        // entry from `pending_invocations`. Left alone, this entry is
+                        // permanently un-prunable: `drain_pending_from_status` re-selects it,
+                        // re-hits this same skip branch, and `continue`s — an unbounded,
+                        // CPU-pegging busy loop that never yields back to `next_wakeup()`.
+                        // Recording a `CancelPendingInvocation` explicitly removes it from the
+                        // pending queue via the same status-fold rule used for genuine
+                        // cancellations, without re-publishing a completion (the original
+                        // invocation already did that).
+                        if let Err(error) =
+                            self.parent.cancel_invocation(idempotency_key.clone()).await
+                        {
+                            warn!(
+                                "Failed to prune duplicate pending invocation {idempotency_key}: {error}"
+                            );
+                        }
                         CommandOutcome::Continue
                     }
                 } else {
@@ -1592,6 +1615,22 @@ fn should_cleanup_terminal_ephemeral_invocation(
         && !(is_agent_component && kind == AgentInvocationKind::AgentInitialization)
 }
 
+/// Whether the invocation loop should yield its turn (release the concurrent-agent permit and
+/// require an external wakeup to resume) after completing one external durable invocation, rather
+/// than immediately continuing to drain further pending work in the same turn.
+///
+/// `ProcessOplogEntries` invocations are the shared, per-executor oplog-processor plugin workers
+/// (e.g. `golem-otlp-exporter`) draining a backlog fed by EVERY other agent's own oplog activity —
+/// not a peer application agent competing for its own turn. Forcing this worker through the same
+/// one-invocation-then-requeue-via-FIFO cycle as everyone else means its backlog (fed by N other
+/// agents) must win N times as many FIFO races just to keep up, and falls permanently behind under
+/// a concurrent-agent burst — confirmed live: a shared plugin worker's queue grew unboundedly
+/// under a ~19-agent burst while every other agent's own backlog drained normally. It is exempt
+/// unconditionally, regardless of `more_pending_work`.
+fn should_yield_for_fairness(kind: AgentInvocationKind, more_pending_work: bool) -> bool {
+    kind != AgentInvocationKind::ProcessOplogEntries && more_pending_work
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum PeriodicSnapshotAction {
     NotNeeded,
@@ -1641,8 +1680,8 @@ fn snapshot_action_at(
 mod tests {
     use super::{
         CommandOutcome, PeriodicSnapshotAction, failed_agent_invocation_outcome,
-        periodic_snapshot_failure_outcome, snapshot_action_at, snapshot_baseline_timestamp,
-        successful_agent_invocation_outcome,
+        periodic_snapshot_failure_outcome, should_yield_for_fairness, snapshot_action_at,
+        snapshot_baseline_timestamp, successful_agent_invocation_outcome,
     };
     use crate::worker::RetryDecision;
     use crate::worker::invocation::InvokeResult;
@@ -1769,5 +1808,42 @@ mod tests {
             failed_agent_invocation_outcome(AgentMode::Durable, RetryDecision::None),
             CommandOutcome::BreakInnerLoop(RetryDecision::None)
         );
+    }
+
+    // Regression tests for the shared oplog-processor plugin worker (e.g. golem-otlp-exporter)
+    // falling permanently behind under a concurrent-agent burst: without this exemption, a busy
+    // plugin worker was forced through the same one-invocation-then-requeue-via-FIFO cycle as
+    // every ordinary application agent, and its backlog — fed by every other agent's oplog
+    // activity — could never win enough FIFO races to keep up.
+    #[test]
+    fn process_oplog_entries_never_yields_even_with_pending_work() {
+        assert!(!should_yield_for_fairness(
+            AgentInvocationKind::ProcessOplogEntries,
+            true
+        ));
+    }
+
+    #[test]
+    fn process_oplog_entries_never_yields_when_queue_is_empty() {
+        assert!(!should_yield_for_fairness(
+            AgentInvocationKind::ProcessOplogEntries,
+            false
+        ));
+    }
+
+    #[test]
+    fn ordinary_agent_method_yields_when_pending_work_remains() {
+        assert!(should_yield_for_fairness(
+            AgentInvocationKind::AgentMethod,
+            true
+        ));
+    }
+
+    #[test]
+    fn ordinary_agent_method_does_not_yield_when_queue_is_empty() {
+        assert!(!should_yield_for_fairness(
+            AgentInvocationKind::AgentMethod,
+            false
+        ));
     }
 }

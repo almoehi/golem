@@ -956,9 +956,18 @@ impl Oplog for PrimaryOplog {
     async fn drop_prefix(&self, last_dropped_id: OplogIndex) -> u64 {
         let state = self.state.lock().await;
         let before = state.length().await;
+        eprintln!(
+            "DEBUG_PRIMARY_DROP_PREFIX_BEFORE key={} last_dropped_id={last_dropped_id} before_length={before}",
+            state.key
+        );
         state.drop_prefix(last_dropped_id).await;
         let remaining = state.length().await;
+        eprintln!(
+            "DEBUG_PRIMARY_DROP_PREFIX_AFTER key={} remaining_length={remaining}",
+            state.key
+        );
         if remaining == 0 {
+            eprintln!("DEBUG_PRIMARY_DROP_PREFIX_DELETING key={}", state.key);
             state.delete().await;
         }
         let dropped = before - remaining;

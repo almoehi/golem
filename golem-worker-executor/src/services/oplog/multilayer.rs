@@ -1099,7 +1099,6 @@ impl Oplog for MultiLayerOplog {
             debug!(
                 "Enqueuing transfer of {count} oplog entries from the primary oplog to the next layer up to {last_committed_idx}"
             );
-            eprintln!("DEBUG_MLO_ENQUEUE_TRANSFER agent_id={} last_transferred_idx_being_sent={last_committed_idx}", self.owned_agent_id.agent_id());
             let _ = self.transfer.send(TransferFromPrimary {
                 last_transferred_idx: last_committed_idx,
                 keep_alive: None,
@@ -1231,23 +1230,14 @@ trait BackgroundTransfer {
 
     async fn run(&self) -> Result<(), String> {
         let entries: Vec<_> = self.read_source().await;
-        eprintln!(
-            "DEBUG_BG_TRANSFER_READ count={} first_idx={:?} last_idx={:?}",
-            entries.len(),
-            entries.first().map(|e| e.0),
-            entries.last().map(|e| e.0)
-        );
         match entries.last() {
             Some(last_entry) => {
                 let last_dropped_id = last_entry.0;
                 self.append_target(entries).await;
-                eprintln!("DEBUG_BG_TRANSFER_APPENDED last_dropped_id={last_dropped_id}");
                 self.drop_source_prefix(last_dropped_id).await;
-                eprintln!("DEBUG_BG_TRANSFER_DROPPED last_dropped_id={last_dropped_id}");
             }
             None => {
                 warn!("No entries to transfer from the primary oplog");
-                eprintln!("DEBUG_BG_TRANSFER_NO_ENTRIES");
             }
         }
         Ok(())
@@ -1371,11 +1361,6 @@ impl BackgroundTransferFromPrimary {
 #[async_trait]
 impl BackgroundTransfer for BackgroundTransferFromPrimary {
     async fn read_source(&self) -> Vec<(OplogIndex, OplogEntry)> {
-        eprintln!(
-            "DEBUG_TRANSFER_FROM_PRIMARY_READ_SOURCE agent_id={} requested_last_transferred_idx={}",
-            self.owned_agent_id.agent_id(),
-            self.last_transferred_idx
-        );
         self.multi_layer_oplog_service
             .primary
             .read_prefix(
@@ -1393,10 +1378,6 @@ impl BackgroundTransfer for BackgroundTransferFromPrimary {
     }
 
     async fn drop_source_prefix(&self, last_dropped_id: OplogIndex) {
-        eprintln!(
-            "DEBUG_TRANSFER_FROM_PRIMARY_BEFORE_DROP agent_id={} last_dropped_id={last_dropped_id}",
-            self.owned_agent_id.agent_id()
-        );
         self.primary.drop_prefix(last_dropped_id).await;
     }
 }

@@ -11,11 +11,11 @@ use crate::otlp_json::{
 use crate::state::{PendingSpan, WorkerState};
 use golem_rust::bindings::golem::api::oplog::{
     FailedUpdateParameters, FinishSpanParameters, GrowMemoryParameters, LogLevel, LogParameters,
-    OplogEntry, OplogPayload, RawAgentInvocationFinishedParameters,
-    RawAgentInvocationStartedParameters, RawCreateParameters, RawCreateResourceParameters,
-    RawDropResourceParameters, RawHostCallParameters, RawOplogProcessorCheckpointParameters,
-    RawSnapshotParameters, RawSuccessfulUpdateParameters, RemoteTransactionParameters,
-    SetSpanAttributeParameters, SpanData, StartSpanParameters, WrappedFunctionType,
+    OplogEntry, RawAgentInvocationFinishedParameters, RawAgentInvocationStartedParameters,
+    RawCreateParameters, RawCreateResourceParameters, RawDropResourceParameters,
+    RawHostCallParameters, RawOplogProcessorCheckpointParameters, RawSnapshotParameters,
+    RawSuccessfulUpdateParameters, RemoteTransactionParameters, SetSpanAttributeParameters,
+    SpanData, StartSpanParameters,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -986,6 +986,7 @@ fn handle_oplog_processor_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use golem_rust::bindings::golem::api::oplog::{OplogPayload, WrappedFunctionType};
     use golem_rust::wasip2::clocks::wall_clock::Datetime;
 
     fn ts(seconds: u64) -> Datetime {

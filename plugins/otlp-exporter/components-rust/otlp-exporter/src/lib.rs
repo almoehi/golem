@@ -1,4 +1,5 @@
 mod config;
+mod counters;
 mod export;
 mod helpers;
 mod otlp_json;

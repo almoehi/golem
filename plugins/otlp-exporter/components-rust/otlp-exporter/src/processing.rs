@@ -1,3 +1,4 @@
+use crate::counters::CounterAccumulator;
 use crate::export::build_otel_span;
 use crate::helpers::{
     attribute_value_to_string, datetime_to_nanos, oplog_payload_size, timestamp_to_nanos,
@@ -10,11 +11,11 @@ use crate::otlp_json::{
 use crate::state::{PendingSpan, WorkerState};
 use golem_rust::bindings::golem::api::oplog::{
     FailedUpdateParameters, FinishSpanParameters, GrowMemoryParameters, LogLevel, LogParameters,
-    OplogEntry, RawAgentInvocationFinishedParameters, RawAgentInvocationStartedParameters,
-    RawCreateParameters, RawCreateResourceParameters, RawDropResourceParameters,
-    RawHostCallParameters, RawOplogProcessorCheckpointParameters, RawSnapshotParameters,
-    RawSuccessfulUpdateParameters, RemoteTransactionParameters, SetSpanAttributeParameters,
-    SpanData, StartSpanParameters,
+    OplogEntry, OplogPayload, RawAgentInvocationFinishedParameters,
+    RawAgentInvocationStartedParameters, RawCreateParameters, RawCreateResourceParameters,
+    RawDropResourceParameters, RawHostCallParameters, RawOplogProcessorCheckpointParameters,
+    RawSnapshotParameters, RawSuccessfulUpdateParameters, RemoteTransactionParameters,
+    SetSpanAttributeParameters, SpanData, StartSpanParameters, WrappedFunctionType,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -31,6 +32,7 @@ pub(crate) fn process_entries(
     let mut completed_spans: Vec<OtlpSpan> = Vec::new();
     let mut log_records: Vec<OtlpLogRecord> = Vec::new();
     let mut metrics: Vec<OtlpMetric> = Vec::new();
+    let mut counters = CounterAccumulator::default();
 
     for entry in entries {
         match entry {
@@ -38,7 +40,7 @@ pub(crate) fn process_entries(
                 handle_create(state, params, &mut metrics);
             }
             OplogEntry::AgentInvocationStarted(params) => {
-                handle_invocation_started(state, params, &mut metrics);
+                handle_invocation_started(state, params, &mut counters);
             }
             OplogEntry::StartSpan(params) => {
                 handle_start_span(state, params);
@@ -60,18 +62,19 @@ pub(crate) fn process_entries(
 
                 handle_terminal(state, time_ns, true, &mut completed_spans);
 
-                metrics.push(counter_metric(
+                counters.add(
                     "golem.error.count",
                     "1",
                     "Agent errors",
-                    &time_ns.to_string(),
+                    time_ns,
+                    1,
                     vec![KeyValue {
                         key: "error.type".to_string(),
                         value: OtlpValue {
                             string_value: worker_error_variant_name(&params.error),
                         },
                     }],
-                ));
+                );
 
                 log_records.push(OtlpLogRecord {
                     time_unix_nano: time_ns.to_string(),
@@ -96,13 +99,14 @@ pub(crate) fn process_entries(
                 state.terminal_error = Some("interrupted".to_string());
                 handle_terminal(state, time_ns, true, &mut completed_spans);
 
-                metrics.push(counter_metric(
+                counters.add(
                     "golem.interruption.count",
                     "1",
                     "Agent interruptions",
-                    &time_ns.to_string(),
+                    time_ns,
+                    1,
                     Vec::new(),
-                ));
+                );
 
                 log_records.push(OtlpLogRecord {
                     time_unix_nano: time_ns.to_string(),
@@ -122,13 +126,14 @@ pub(crate) fn process_entries(
                 state.terminal_error = Some("exited".to_string());
                 handle_terminal(state, time_ns, true, &mut completed_spans);
 
-                metrics.push(counter_metric(
+                counters.add(
                     "golem.exit.count",
                     "1",
                     "Agent exits",
-                    &time_ns.to_string(),
+                    time_ns,
+                    1,
                     Vec::new(),
-                ));
+                );
 
                 log_records.push(OtlpLogRecord {
                     time_unix_nano: time_ns.to_string(),
@@ -144,64 +149,67 @@ pub(crate) fn process_entries(
                 });
             }
             OplogEntry::Log(params) => {
-                let time_ns = datetime_to_nanos(&params.timestamp).to_string();
-                metrics.push(counter_metric(
+                let time_ns = datetime_to_nanos(&params.timestamp);
+                counters.add(
                     "golem.log.count",
                     "1",
                     "Log message count",
-                    &time_ns,
+                    time_ns,
+                    1,
                     vec![KeyValue {
                         key: "level".to_string(),
                         value: OtlpValue {
                             string_value: log_level_severity_text(&params.level).to_string(),
                         },
                     }],
-                ));
+                );
                 handle_log(state, params, &mut log_records);
             }
             OplogEntry::GrowMemory(params) => {
-                handle_grow_memory(state, params, &mut metrics);
+                handle_grow_memory(state, params, &mut counters, &mut metrics);
             }
             OplogEntry::HostCall(params) => {
-                handle_host_call(params, &mut metrics);
+                handle_host_call(params, &mut counters);
             }
             OplogEntry::PendingAgentInvocation(params) => {
-                let time_ns = datetime_to_nanos(&params.timestamp).to_string();
-                metrics.push(counter_metric(
+                let time_ns = datetime_to_nanos(&params.timestamp);
+                counters.add(
                     "golem.invocation.pending_count",
                     "1",
                     "Pending invocation requests",
-                    &time_ns,
+                    time_ns,
+                    1,
                     Vec::new(),
-                ));
+                );
             }
             OplogEntry::CreateResource(params) => {
-                handle_create_resource(state, params, &mut metrics);
+                handle_create_resource(state, params, &mut counters, &mut metrics);
             }
             OplogEntry::DropResource(params) => {
-                handle_drop_resource(state, params, &mut metrics);
+                handle_drop_resource(state, params, &mut counters, &mut metrics);
             }
             OplogEntry::Restart(ts) => {
-                let time_ns = timestamp_to_nanos(&ts).to_string();
-                metrics.push(counter_metric(
+                let time_ns = timestamp_to_nanos(&ts);
+                counters.add(
                     "golem.restart.count",
                     "1",
                     "Agent restarts",
-                    &time_ns,
+                    time_ns,
+                    1,
                     Vec::new(),
-                ));
+                );
             }
             OplogEntry::SuccessfulUpdate(params) => {
-                handle_successful_update(params, &mut metrics);
+                handle_successful_update(params, &mut counters, &mut metrics);
             }
             OplogEntry::FailedUpdate(params) => {
-                handle_failed_update(params, &mut metrics);
+                handle_failed_update(params, &mut counters);
             }
             OplogEntry::CommittedRemoteTransaction(params) => {
-                handle_committed_transaction(params, &mut metrics);
+                handle_committed_transaction(params, &mut counters);
             }
             OplogEntry::RolledBackRemoteTransaction(params) => {
-                handle_rolled_back_transaction(params, &mut metrics);
+                handle_rolled_back_transaction(params, &mut counters);
             }
             OplogEntry::Snapshot(params) => {
                 handle_snapshot(params, &mut metrics);
@@ -212,6 +220,8 @@ pub(crate) fn process_entries(
             _ => {} // ignore all other entry types
         }
     }
+
+    counters.flush_into(&mut metrics);
 
     ProcessingOutput {
         spans: completed_spans,
@@ -339,32 +349,6 @@ fn handle_log(state: &WorkerState, params: LogParameters, log_records: &mut Vec<
     });
 }
 
-fn counter_metric(
-    name: &str,
-    unit: &str,
-    description: &str,
-    time_ns: &str,
-    attributes: Vec<KeyValue>,
-) -> OtlpMetric {
-    OtlpMetric {
-        name: name.to_string(),
-        unit: unit.to_string(),
-        description: description.to_string(),
-        sum: Some(OtlpSum {
-            aggregation_temporality: 1,
-            is_monotonic: true,
-            data_points: vec![OtlpNumberDataPoint {
-                start_time_unix_nano: time_ns.to_string(),
-                time_unix_nano: time_ns.to_string(),
-                as_int: Some("1".to_string()),
-                as_double: None,
-                attributes,
-            }],
-        }),
-        gauge: None,
-    }
-}
-
 fn gauge_metric(
     name: &str,
     unit: &str,
@@ -426,89 +410,73 @@ fn handle_create(
 fn handle_grow_memory(
     state: &mut WorkerState,
     params: GrowMemoryParameters,
+    counters: &mut CounterAccumulator,
     metrics: &mut Vec<OtlpMetric>,
 ) {
-    let time_ns = datetime_to_nanos(&params.timestamp).to_string();
+    let time_ns = datetime_to_nanos(&params.timestamp);
 
     state.total_memory_bytes += params.delta;
 
-    metrics.push(OtlpMetric {
-        name: "golem.memory.growth_bytes".to_string(),
-        unit: "By".to_string(),
-        description: "Linear memory growth".to_string(),
-        sum: Some(OtlpSum {
-            aggregation_temporality: 1,
-            is_monotonic: true,
-            data_points: vec![OtlpNumberDataPoint {
-                start_time_unix_nano: time_ns.clone(),
-                time_unix_nano: time_ns.clone(),
-                as_int: Some(params.delta.to_string()),
-                as_double: None,
-                attributes: Vec::new(),
-            }],
-        }),
-        gauge: None,
-    });
+    counters.add(
+        "golem.memory.growth_bytes",
+        "By",
+        "Linear memory growth",
+        time_ns,
+        params.delta as i128,
+        Vec::new(),
+    );
 
     metrics.push(gauge_metric(
         "golem.memory.total_bytes",
         "By",
         "Total linear memory size",
-        &time_ns,
+        &time_ns.to_string(),
         state.total_memory_bytes,
     ));
 }
 
-fn handle_host_call(params: RawHostCallParameters, metrics: &mut Vec<OtlpMetric>) {
-    let time_ns = datetime_to_nanos(&params.timestamp).to_string();
+fn handle_host_call(params: RawHostCallParameters, counters: &mut CounterAccumulator) {
+    let time_ns = datetime_to_nanos(&params.timestamp);
     let fn_type = wrapped_function_type_name(&params.durable_function_type);
-    metrics.push(OtlpMetric {
-        name: "golem.host_call.count".to_string(),
-        unit: "1".to_string(),
-        description: "Host function calls".to_string(),
-        sum: Some(OtlpSum {
-            aggregation_temporality: 1,
-            is_monotonic: true,
-            data_points: vec![OtlpNumberDataPoint {
-                start_time_unix_nano: time_ns.clone(),
-                time_unix_nano: time_ns,
-                as_int: Some("1".to_string()),
-                as_double: None,
-                attributes: vec![
-                    KeyValue {
-                        key: "function.name".to_string(),
-                        value: OtlpValue {
-                            string_value: params.function_name,
-                        },
-                    },
-                    KeyValue {
-                        key: "durable_function_type".to_string(),
-                        value: OtlpValue {
-                            string_value: fn_type.to_string(),
-                        },
-                    },
-                ],
-            }],
-        }),
-        gauge: None,
-    });
+    counters.add(
+        "golem.host_call.count",
+        "1",
+        "Host function calls",
+        time_ns,
+        1,
+        vec![
+            KeyValue {
+                key: "function.name".to_string(),
+                value: OtlpValue {
+                    string_value: params.function_name,
+                },
+            },
+            KeyValue {
+                key: "durable_function_type".to_string(),
+                value: OtlpValue {
+                    string_value: fn_type.to_string(),
+                },
+            },
+        ],
+    );
 }
 
 fn handle_invocation_started(
     state: &mut WorkerState,
     params: RawAgentInvocationStartedParameters,
-    metrics: &mut Vec<OtlpMetric>,
+    counters: &mut CounterAccumulator,
 ) {
     let time_ns = datetime_to_nanos(&params.timestamp);
     state.invocation_start_ns = Some(time_ns);
 
-    metrics.push(counter_metric(
+    counters.add(
         "golem.invocation.count",
         "1",
         "Invocation count",
-        &time_ns.to_string(),
+        time_ns,
+        1,
         Vec::new(),
-    ));
+    );
 
     if !state.pending_spans.is_empty() || !state.implicit_spans.is_empty() {
         println!(
@@ -824,20 +792,26 @@ fn flush_remaining_explicit_spans(
 fn handle_create_resource(
     state: &mut WorkerState,
     params: RawCreateResourceParameters,
+    counters: &mut CounterAccumulator,
     metrics: &mut Vec<OtlpMetric>,
 ) {
-    let time_ns = datetime_to_nanos(&params.timestamp).to_string();
+    let time_ns = datetime_to_nanos(&params.timestamp);
 
     state.active_resources += 1;
 
-    metrics.push(counter_metric(
+    counters.add(
         "golem.resources.created",
         "1",
         "Resource instances created",
-        &time_ns,
+        time_ns,
+        1,
         Vec::new(),
-    ));
+    );
 
+    // `golem.resources.active` reports the CURRENT count after this create, not an
+    // independent event — a non-monotonic Sum. Summing two such state snapshots would
+    // be meaningless, so this stays a direct per-entry push, never through the
+    // monotonic-only CounterAccumulator (see counters.rs module doc).
     metrics.push(OtlpMetric {
         name: "golem.resources.active".to_string(),
         unit: "1".to_string(),
@@ -846,8 +820,8 @@ fn handle_create_resource(
             aggregation_temporality: 1,
             is_monotonic: false,
             data_points: vec![OtlpNumberDataPoint {
-                start_time_unix_nano: time_ns.clone(),
-                time_unix_nano: time_ns,
+                start_time_unix_nano: time_ns.to_string(),
+                time_unix_nano: time_ns.to_string(),
                 as_int: Some(state.active_resources.to_string()),
                 as_double: None,
                 attributes: Vec::new(),
@@ -860,20 +834,23 @@ fn handle_create_resource(
 fn handle_drop_resource(
     state: &mut WorkerState,
     params: RawDropResourceParameters,
+    counters: &mut CounterAccumulator,
     metrics: &mut Vec<OtlpMetric>,
 ) {
-    let time_ns = datetime_to_nanos(&params.timestamp).to_string();
+    let time_ns = datetime_to_nanos(&params.timestamp);
 
     state.active_resources = (state.active_resources - 1).max(0);
 
-    metrics.push(counter_metric(
+    counters.add(
         "golem.resources.dropped",
         "1",
         "Resource instances dropped",
-        &time_ns,
+        time_ns,
+        1,
         Vec::new(),
-    ));
+    );
 
+    // See handle_create_resource: non-monotonic state snapshot, never aggregated.
     metrics.push(OtlpMetric {
         name: "golem.resources.active".to_string(),
         unit: "1".to_string(),
@@ -882,8 +859,8 @@ fn handle_drop_resource(
             aggregation_temporality: 1,
             is_monotonic: false,
             data_points: vec![OtlpNumberDataPoint {
-                start_time_unix_nano: time_ns.clone(),
-                time_unix_nano: time_ns,
+                start_time_unix_nano: time_ns.to_string(),
+                time_unix_nano: time_ns.to_string(),
                 as_int: Some(state.active_resources.to_string()),
                 as_double: None,
                 attributes: Vec::new(),
@@ -893,63 +870,71 @@ fn handle_drop_resource(
     });
 }
 
-fn handle_successful_update(params: RawSuccessfulUpdateParameters, metrics: &mut Vec<OtlpMetric>) {
-    let time_ns = datetime_to_nanos(&params.timestamp).to_string();
+fn handle_successful_update(
+    params: RawSuccessfulUpdateParameters,
+    counters: &mut CounterAccumulator,
+    metrics: &mut Vec<OtlpMetric>,
+) {
+    let time_ns = datetime_to_nanos(&params.timestamp);
 
-    metrics.push(counter_metric(
+    counters.add(
         "golem.update.success_count",
         "1",
         "Successful component updates",
-        &time_ns,
+        time_ns,
+        1,
         Vec::new(),
-    ));
+    );
 
     metrics.push(gauge_metric(
         "golem.component.size_bytes",
         "By",
         "Component size",
-        &time_ns,
+        &time_ns.to_string(),
         params.new_component_size,
     ));
 }
 
-fn handle_failed_update(params: FailedUpdateParameters, metrics: &mut Vec<OtlpMetric>) {
-    let time_ns = datetime_to_nanos(&params.timestamp).to_string();
-    metrics.push(counter_metric(
+fn handle_failed_update(params: FailedUpdateParameters, counters: &mut CounterAccumulator) {
+    let time_ns = datetime_to_nanos(&params.timestamp);
+    counters.add(
         "golem.update.failure_count",
         "1",
         "Failed component updates",
-        &time_ns,
+        time_ns,
+        1,
         Vec::new(),
-    ));
+    );
 }
 
 fn handle_committed_transaction(
     params: RemoteTransactionParameters,
-    metrics: &mut Vec<OtlpMetric>,
+    counters: &mut CounterAccumulator,
 ) {
-    let time_ns = datetime_to_nanos(&params.timestamp).to_string();
-    metrics.push(counter_metric(
+    let time_ns = datetime_to_nanos(&params.timestamp);
+    counters.add(
         "golem.transaction.committed",
         "1",
         "Committed remote transactions",
-        &time_ns,
+        time_ns,
+        1,
         Vec::new(),
-    ));
+    );
 }
 
 fn handle_rolled_back_transaction(
     params: RemoteTransactionParameters,
-    metrics: &mut Vec<OtlpMetric>,
+    counters: &mut CounterAccumulator,
 ) {
-    let time_ns = datetime_to_nanos(&params.timestamp).to_string();
-    metrics.push(counter_metric(
+    let time_ns = datetime_to_nanos(&params.timestamp);
+    counters.add(
         "golem.transaction.rolled_back",
         "1",
         "Rolled back remote transactions",
-        &time_ns,
+        time_ns,
+        1,
         Vec::new(),
-    ));
+    );
 }
 
 fn handle_snapshot(params: RawSnapshotParameters, metrics: &mut Vec<OtlpMetric>) {
@@ -1022,6 +1007,79 @@ mod tests {
             total_memory_bytes: 0,
             active_resources: 0,
         }
+    }
+
+    // Fix verification: a batch containing many `HostCall` entries across a few distinct
+    // (function_name, durable_function_type) pairs must collapse into one merged metric
+    // per distinct pair, not one metric per entry — see counters.rs module doc for why.
+    // Confirms the aggregation is wired all the way through process_entries(), not just
+    // unit-tested in isolation on CounterAccumulator itself.
+    #[test]
+    fn host_call_entries_collapse_into_one_metric_per_distinct_function() {
+        let mut state = fresh_state();
+
+        fn host_call(sec: u64, function_name: &str, fn_type: WrappedFunctionType) -> OplogEntry {
+            OplogEntry::HostCall(RawHostCallParameters {
+                timestamp: ts(sec),
+                function_name: function_name.to_string(),
+                request: OplogPayload::Inline(Vec::new()),
+                response: OplogPayload::Inline(Vec::new()),
+                durable_function_type: fn_type,
+            })
+        }
+
+        // 50 entries across 3 distinct (function_name, durable_function_type) pairs.
+        let mut entries = Vec::new();
+        for i in 0..20 {
+            entries.push(host_call(100 + i, "fetch", WrappedFunctionType::WriteRemote));
+        }
+        for i in 0..20 {
+            entries.push(host_call(
+                200 + i,
+                "filesystem::write",
+                WrappedFunctionType::WriteLocal,
+            ));
+        }
+        for i in 0..10 {
+            entries.push(host_call(
+                300 + i,
+                "filesystem::read",
+                WrappedFunctionType::ReadLocal,
+            ));
+        }
+
+        let output = process_entries(&mut state, entries);
+
+        let host_call_metrics: Vec<_> = output
+            .metrics
+            .iter()
+            .filter(|m| m.name == "golem.host_call.count")
+            .collect();
+        assert_eq!(
+            host_call_metrics.len(),
+            3,
+            "50 host calls across 3 distinct function/type pairs must merge into exactly 3 metrics, got: {:?}",
+            host_call_metrics.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+
+        let sums: HashMap<String, i64> = host_call_metrics
+            .iter()
+            .map(|m| {
+                let dp = &m.sum.as_ref().unwrap().data_points[0];
+                let attr = dp
+                    .attributes
+                    .iter()
+                    .find(|a| a.key == "function.name")
+                    .unwrap();
+                (
+                    attr.value.string_value.clone(),
+                    dp.as_int.as_ref().unwrap().parse::<i64>().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(sums.get("fetch"), Some(&20));
+        assert_eq!(sums.get("filesystem::write"), Some(&20));
+        assert_eq!(sums.get("filesystem::read"), Some(&10));
     }
 
     // Regression test for a production bug: `OtlpExporterComponent::process()` used to

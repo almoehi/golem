@@ -4138,6 +4138,23 @@ struct PrivateDurableWorkerState {
     /// actual file growth instead of requested write size.
     open_filesystem_output_streams: HashMap<u32, FilesystemOutputStreamState>,
 
+    /// Reps of wasi input streams opened on files (`descriptor::read-via-stream`), so
+    /// `input-stream::subscribe` can tell a file stream's pollable apart — see
+    /// `filesystem_stream_pollables`.
+    open_filesystem_input_streams: HashSet<u32>,
+
+    /// Reps of pollables subscribed from a filesystem input or output stream.
+    ///
+    /// A durable resource's pollable (HTTP, RPC, promise) has its readiness answered from the
+    /// oplog during replay, and that answer is authoritative. A file stream is different: it is
+    /// NOT durable, so its reads/writes are re-executed LIVE during replay — and wasmtime's file
+    /// streams only leave their `Waiting` state inside `Pollable::ready`. Whenever replay's
+    /// answer (recorded or synthesized) reports one of these pollables ready, `poll()`/`ready()`
+    /// must therefore also drive it for real (`drive_replayed_filesystem_pollables`); otherwise the guest's next read / check-write
+    /// still sees the pre-readiness state and calls `block()` again, consuming the recorded poll
+    /// entries of later operations or spinning forever once they run out (video-harness #216).
+    filesystem_stream_pollables: HashSet<u32>,
+
     /// Maps outgoing body rep → output stream rep, set during outgoing_body::write()
     /// before outgoing_handler::handle() is called. Used by handle() to populate
     /// output_stream_rep in HttpRequestState for streams created before dispatch.
@@ -5513,6 +5530,8 @@ impl PrivateDurableWorkerState {
             pending_http_outgoing_body_stream: HashMap::new(),
             pending_http_retry_eligibility: HashMap::new(),
             open_filesystem_output_streams: HashMap::new(),
+            open_filesystem_input_streams: HashSet::new(),
+            filesystem_stream_pollables: HashSet::new(),
             snapshotting_mode: None,
             replaying_http_batch: None,
             component_metadata,

@@ -329,7 +329,17 @@ impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
 
     fn subscribe(&mut self, self_: Resource<InputStream>) -> wasmtime::Result<Resource<Pollable>> {
         self.observe_function_call("io::streams::input_stream", "subscribe");
-        HostInputStream::subscribe(self.table(), self_)
+        let is_filesystem_stream = self
+            .state
+            .open_filesystem_input_streams
+            .contains(&self_.rep());
+        let pollable = HostInputStream::subscribe(self.table(), self_)?;
+        if is_filesystem_stream {
+            self.state
+                .filesystem_stream_pollables
+                .insert(pollable.rep());
+        }
+        Ok(pollable)
     }
 
     async fn drop(&mut self, rep: Resource<InputStream>) -> wasmtime::Result<()> {
@@ -344,6 +354,7 @@ impl<Ctx: WorkerCtx> HostInputStream for DurableWorkerCtx<Ctx> {
             }
         }
 
+        self.state.open_filesystem_input_streams.remove(&rep.rep());
         HostInputStream::drop(self.table(), rep).await
     }
 }
@@ -860,7 +871,14 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
                 .or_default()
                 .output_stream_subscribed = true;
         }
-        HostOutputStream::subscribe(self.table(), self_)
+        let is_filesystem_stream = self.state.open_filesystem_output_streams.contains_key(&rep);
+        let pollable = HostOutputStream::subscribe(self.table(), self_)?;
+        if is_filesystem_stream {
+            self.state
+                .filesystem_stream_pollables
+                .insert(pollable.rep());
+        }
+        Ok(pollable)
     }
 
     async fn write_zeroes(

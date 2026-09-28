@@ -769,6 +769,86 @@ async fn file_write_read(
     Ok(())
 }
 
+/// Regression (video-harness #216): a completed invocation that read and wrote a file with the
+/// non-blocking `read`/`check-write` + `subscribe().block()` pattern must replay after a restart.
+///
+/// File streams are re-executed LIVE during replay (they are not durable), but each `block()` is
+/// a durable `io::poll::poll` whose replay used to hand back the recorded "ready" answer without
+/// ever driving the stream's pollable. wasmtime's file streams only leave their `Waiting` state
+/// inside `Pollable::ready`, so the replayed guest kept seeing an empty read / a zero write permit,
+/// called `block()` again, and — once the recorded poll entries ran out — spun forever (executor
+/// busy-loop, agent never resumes; a later host-call entry instead turned it into an
+/// `expected io::poll::poll, got ...` replay trap).
+#[test]
+#[tracing::instrument]
+async fn file_polling_read_write_replays_after_restart(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("host_api_tests")] host_api_tests: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    use golem_common::{agent_id, data_value};
+
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let component = executor
+        .component_dep(&context.default_environment_id, host_api_tests)
+        .store()
+        .await?;
+    let agent_id = agent_id!("FileSystem", "file-polling-replay-1");
+    let worker_id = executor
+        .start_agent(&component.id, agent_id.clone())
+        .await?;
+
+    // Several 4 KiB read chunks, so replay has to cross multiple recorded polls.
+    let contents = "0123456789abcdef".repeat(1024);
+    let expected = Value::Result(Ok(Some(Box::new(Value::String(contents.clone())))));
+
+    executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "write_file_polling",
+            data_value!("/polled.txt", contents.clone()),
+        )
+        .await?;
+    let first_read = executor
+        .invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "read_file_polling",
+            data_value!("/polled.txt"),
+        )
+        .await?
+        .into_return_value()
+        .ok_or_else(|| anyhow!("expected return value"))?;
+    assert_eq!(first_read, expected);
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    // Restart: the next invocation first replays both polling invocations above.
+    drop(executor);
+    let executor = start(deps, &context).await?;
+
+    let replayed_read = tokio::time::timeout(
+        Duration::from_secs(60),
+        executor.invoke_and_await_agent(
+            &component,
+            &agent_id,
+            "read_file_polling",
+            data_value!("/polled.txt"),
+        ),
+    )
+    .await
+    .map_err(|_| anyhow!("replay of the polling file read/write never finished (livelock)"))??
+    .into_return_value()
+    .ok_or_else(|| anyhow!("expected return value"))?;
+    assert_eq!(replayed_read, expected);
+
+    Ok(())
+}
+
 #[test]
 #[tracing::instrument]
 async fn file_update_1(

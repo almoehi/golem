@@ -89,7 +89,8 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
                 HostFunctionName::IoPollReady,
                 IdentityNamespace::Pollable(pollable_seq),
             );
-            if let Some(pre_resolved) = self.state.take_pre_resolved_stray(&my_identity) {
+            let ready = if let Some(pre_resolved) = self.state.take_pre_resolved_stray(&my_identity)
+            {
                 let payload: HostResponsePollReady = pre_resolved
                     .try_into()
                     .map_err(|e: String| wasmtime::Error::msg(e))?;
@@ -104,101 +105,106 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
                     result = ready,
                     "POLLREADY_TRACE ready() REPLAY using answer pre-resolved by an earlier poll() call"
                 );
-                return Ok(ready);
-            }
-
-            // Replay: consume the next IoPollReady entry only if it was recorded for THIS
-            // specific pollable (matched by logical seq — see pollable_seq's doc comment).
-            // This prevents a timer pollable from stealing an IoPollReady=true entry that was
-            // recorded for an output-stream pollable, which would cause the WASM to think the
-            // timer fired, drop the FutureIncomingResponse early, and crash with "expected
-            // EndRemoteWrite, got CheckWrite".
-            // Legacy ReadLocal entries (pre-dating per-pollable tagging) are consumed by any
-            // pollable, matching the original (pre-Bug-2-fix) behavior for old oplogs.
-            // Captured from inside the predicate (which sees the entry a refusal never hands
-            // back): is the replay cursor parked on a STRUCTURAL entry — one no host-call
-            // consumer can ever claim? See the miss branch below for why that changes the
-            // answer this call must synthesize.
-            let mut cursor_is_host_call = false;
-            let peeked = self
-                .state
-                .replay_state
-                .try_get_oplog_entry(|entry| {
-                    cursor_is_host_call = matches!(entry, OplogEntry::HostCall { .. });
-                    match entry {
-                        OplogEntry::HostCall {
-                            function_name: HostFunctionName::IoPollReady,
-                            durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
-                            ..
-                        } => *seq == pollable_seq,
-                        OplogEntry::HostCall {
-                            function_name: HostFunctionName::IoPollReady,
-                            durable_function_type: DurableFunctionType::ReadLocal,
-                            ..
-                        } => true,
-                        _ => false,
+                ready
+            } else {
+                // Replay: consume the next IoPollReady entry only if it was recorded for THIS
+                // specific pollable (matched by logical seq — see pollable_seq's doc comment).
+                // This prevents a timer pollable from stealing an IoPollReady=true entry that was
+                // recorded for an output-stream pollable, which would cause the WASM to think the
+                // timer fired, drop the FutureIncomingResponse early, and crash with "expected
+                // EndRemoteWrite, got CheckWrite".
+                // Legacy ReadLocal entries (pre-dating per-pollable tagging) are consumed by any
+                // pollable, matching the original (pre-Bug-2-fix) behavior for old oplogs.
+                // Captured from inside the predicate (which sees the entry a refusal never hands
+                // back): is the replay cursor parked on a STRUCTURAL entry — one no host-call
+                // consumer can ever claim? See the miss branch below for why that changes the
+                // answer this call must synthesize.
+                let mut cursor_is_host_call = false;
+                let peeked = self
+                    .state
+                    .replay_state
+                    .try_get_oplog_entry(|entry| {
+                        cursor_is_host_call = matches!(entry, OplogEntry::HostCall { .. });
+                        match entry {
+                            OplogEntry::HostCall {
+                                function_name: HostFunctionName::IoPollReady,
+                                durable_function_type: DurableFunctionType::ReadLocalPollable(seq),
+                                ..
+                            } => *seq == pollable_seq,
+                            OplogEntry::HostCall {
+                                function_name: HostFunctionName::IoPollReady,
+                                durable_function_type: DurableFunctionType::ReadLocal,
+                                ..
+                            } => true,
+                            _ => false,
+                        }
+                    })
+                    .await?;
+                match peeked {
+                    Some((_, OplogEntry::HostCall { response, .. })) => {
+                        let host_response = self
+                            .public_state
+                            .worker()
+                            .oplog()
+                            .download_payload(response)
+                            .await
+                            .map_err(wasmtime::Error::msg)?;
+                        let payload: HostResponsePollReady = host_response
+                            .try_into()
+                            .map_err(|e: String| wasmtime::Error::msg(e))?;
+                        payload.result.map_err(wasmtime::Error::msg)?
                     }
-                })
-                .await?;
-            match peeked {
-                Some((_, OplogEntry::HostCall { response, .. })) => {
-                    let host_response = self
-                        .public_state
-                        .worker()
-                        .oplog()
-                        .download_payload(response)
-                        .await
-                        .map_err(wasmtime::Error::msg)?;
-                    let payload: HostResponsePollReady = host_response
-                        .try_into()
-                        .map_err(|e: String| wasmtime::Error::msg(e))?;
-                    payload.result.map_err(wasmtime::Error::msg)
+                    // No entry matched this pollable's seq — it genuinely hasn't become ready yet.
+                    // Unlike the old rep-based scheme, this can no longer be a false negative caused
+                    // by rep drift across a restore (seq is call-order-derived, not resource-table-
+                    // derived — see pollable_seq's doc comment), so no RPC-specific recovery fallback
+                    // is needed here any more (see the corresponding removal in poll()'s replay path,
+                    // with a regression test covering the original "rpc pollable infinite replay loop
+                    // after snapshot restore" scenario this fallback used to guard against).
+                    _ => {
+                        // "Not ready yet" is the right answer while the cursor still holds host-call
+                        // entries: this pollable's own entry may simply be further along, and some
+                        // other consumer will claim what is here first.
+                        //
+                        // It is the WRONG answer once the cursor is parked on a STRUCTURAL entry
+                        // (`EndRemoteWrite` closing an open batch, `FinishSpan`, ...). No host-call
+                        // consumer can ever claim such an entry; its owner is `end_function`/the
+                        // span machinery, which run from GUEST CONTROL FLOW, not by consuming the
+                        // replay cursor. So the cursor cannot move until the guest stops waiting and
+                        // finishes the operation — and answering `false` here tells it to keep
+                        // waiting, which it can only do forever.
+                        //
+                        // `poll()`'s own synthesis already resolves this the other way: on the same
+                        // miss it reports every input pollable as ready ("wake everything"). The two
+                        // paths contradicting each other is precisely the livelock observed in
+                        // FINDING_B_FIX_DESIGN.md §15.6 — `poll()` says ready, `ready()` says false,
+                        // and the guest spins between them until `record_poll_replay_miss`'s bound
+                        // converts the spin into a trap. Agreeing with `poll()` is what lets the
+                        // guest proceed to the read that collects its (already pre-resolved) answer
+                        // and then drop the resource, which is what finally consumes the marker.
+                        //
+                        // Reporting ready is not a guess about the data: the actual read is itself
+                        // replay-guarded and non-destructive, so a guest that reads on this hint
+                        // either collects a cached answer or is told, correctly, that nothing of
+                        // its own is at the cursor.
+                        let synthesized = !cursor_is_host_call;
+                        trace!(
+                            agent_id = %self.owned_agent_id,
+                            rep = pollable_rep,
+                            seq = pollable_seq,
+                            cursor_is_host_call,
+                            synthesized,
+                            "POLLREADY_TRACE ready() REPLAY no match, synthesizing"
+                        );
+                        synthesized
+                    }
                 }
-                // No entry matched this pollable's seq — it genuinely hasn't become ready yet.
-                // Unlike the old rep-based scheme, this can no longer be a false negative caused
-                // by rep drift across a restore (seq is call-order-derived, not resource-table-
-                // derived — see pollable_seq's doc comment), so no RPC-specific recovery fallback
-                // is needed here any more (see the corresponding removal in poll()'s replay path,
-                // with a regression test covering the original "rpc pollable infinite replay loop
-                // after snapshot restore" scenario this fallback used to guard against).
-                _ => {
-                    // "Not ready yet" is the right answer while the cursor still holds host-call
-                    // entries: this pollable's own entry may simply be further along, and some
-                    // other consumer will claim what is here first.
-                    //
-                    // It is the WRONG answer once the cursor is parked on a STRUCTURAL entry
-                    // (`EndRemoteWrite` closing an open batch, `FinishSpan`, ...). No host-call
-                    // consumer can ever claim such an entry; its owner is `end_function`/the
-                    // span machinery, which run from GUEST CONTROL FLOW, not by consuming the
-                    // replay cursor. So the cursor cannot move until the guest stops waiting and
-                    // finishes the operation — and answering `false` here tells it to keep
-                    // waiting, which it can only do forever.
-                    //
-                    // `poll()`'s own synthesis already resolves this the other way: on the same
-                    // miss it reports every input pollable as ready ("wake everything"). The two
-                    // paths contradicting each other is precisely the livelock observed in
-                    // FINDING_B_FIX_DESIGN.md §15.6 — `poll()` says ready, `ready()` says false,
-                    // and the guest spins between them until `record_poll_replay_miss`'s bound
-                    // converts the spin into a trap. Agreeing with `poll()` is what lets the
-                    // guest proceed to the read that collects its (already pre-resolved) answer
-                    // and then drop the resource, which is what finally consumes the marker.
-                    //
-                    // Reporting ready is not a guess about the data: the actual read is itself
-                    // replay-guarded and non-destructive, so a guest that reads on this hint
-                    // either collects a cached answer or is told, correctly, that nothing of
-                    // its own is at the cursor.
-                    let synthesized = !cursor_is_host_call;
-                    trace!(
-                        agent_id = %self.owned_agent_id,
-                        rep = pollable_rep,
-                        seq = pollable_seq,
-                        cursor_is_host_call,
-                        synthesized,
-                        "POLLREADY_TRACE ready() REPLAY no match, synthesizing"
-                    );
-                    Ok(synthesized)
-                }
+            };
+            if ready {
+                self.drive_replayed_filesystem_pollables(&[pollable_rep])
+                    .await?;
             }
+            Ok(ready)
         }
     }
 
@@ -218,6 +224,7 @@ impl<Ctx: WorkerCtx> HostPollable for DurableWorkerCtx<Ctx> {
         // pollable — clear its seq assignment so that pollable gets a fresh one instead of
         // wrongly inheriting this one's identity (see pollable_seq's doc comment).
         self.state.clear_pollable_seq(child_rep);
+        self.state.filesystem_stream_pollables.remove(&child_rep);
 
         // Check if this pollable is a child of a FutureInvokeResult
         let parent_rep = self.state.rpc_pollable_to_parent.get(&child_rep).copied();
@@ -295,6 +302,14 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
 
         let durability =
             Durability::<IoPollPoll>::new(self, DurableFunctionType::ReadLocal).await?;
+        let replaying = !durability.is_live();
+        // Replay only: keep the input reps for `drive_replayed_filesystem_pollables` below
+        // (skipped on the live path, which hands `in_` itself to the real poll).
+        let in_reps: Vec<u32> = if replaying {
+            in_.iter().map(|pollable| pollable.rep()).collect()
+        } else {
+            Vec::new()
+        };
 
         let result: Result<HostResponsePollResult, Duration> = if durability.is_live() {
             let interrupt_signal = self
@@ -500,7 +515,18 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
         };
 
         match result {
-            Ok(result) => result.result.map_err(wasmtime::Error::msg),
+            Ok(result) => {
+                let ready = result.result.map_err(wasmtime::Error::msg)?;
+                if replaying {
+                    let ready_reps: Vec<u32> = ready
+                        .iter()
+                        .filter_map(|index| in_reps.get(*index as usize).copied())
+                        .collect();
+                    self.drive_replayed_filesystem_pollables(&ready_reps)
+                        .await?;
+                }
+                Ok(ready)
+            }
             Err(duration) => {
                 if self.agent_mode() == AgentMode::Ephemeral {
                     let max = self.state.config.suspend.ephemeral_max_sleep;
@@ -516,6 +542,39 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                 }
             }
         }
+    }
+}
+
+impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
+    /// Replay only: actually wait for every filesystem-stream pollable among `ready_reps` — the
+    /// pollables the replayed `poll()`/`ready()` answer just reported as ready.
+    ///
+    /// File streams are re-executed live during replay (they are not durable), but wasmtime's
+    /// file streams only move out of `Waiting` inside `Pollable::ready`. Returning the recorded
+    /// answer alone would leave the stream exactly where live execution found it BEFORE it
+    /// waited, so the guest's next read would still return nothing (or check-write still grant
+    /// no permit) and it would `block()` again: consuming later operations' recorded poll
+    /// entries, then spinning forever once they run out (video-harness #216).
+    ///
+    /// The wait always terminates, even when the answer was synthesized rather than recorded
+    /// (`poll()`'s "wake everything" / `ready()`'s structural-cursor fallback): a file stream's
+    /// readiness is a pending local file read/write finishing, and an idle input stream's
+    /// `ready()` simply starts a read-ahead. (It does not observe interrupts — acceptable for
+    /// regular files; a FIFO in the agent filesystem could delay an interrupt during replay.)
+    /// It calls wasmtime's own `block`, not the durable wrapper, so it never touches the oplog.
+    /// Durable resources' pollables are never driven: their replayed readiness is
+    /// authoritative, and their real operations are not re-issued during replay.
+    async fn drive_replayed_filesystem_pollables(
+        &mut self,
+        ready_reps: &[u32],
+    ) -> wasmtime::Result<()> {
+        for rep in ready_reps {
+            if self.state.filesystem_stream_pollables.contains(rep) {
+                let mut view = self.as_wasi_view();
+                HostPollable::block(&mut view.io_data(), Resource::new_borrow(*rep)).await?;
+            }
+        }
+        Ok(())
     }
 }
 

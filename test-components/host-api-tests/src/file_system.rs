@@ -5,7 +5,7 @@ use std::fs;
 use std::fs::{File, create_dir_all, read_dir, read_to_string, remove_file, write};
 use std::hash::{Hash, Hasher};
 use wasi::filesystem::types::{Descriptor, DescriptorFlags, OpenFlags, PathFlags};
-use wasi::io::streams::OutputStream;
+use wasi::io::streams::{OutputStream, StreamError};
 
 #[derive(Clone, Schema, Serialize, Deserialize)]
 pub struct DirEntry {
@@ -77,6 +77,16 @@ pub trait FileSystem {
     /// Read from `src_path` and splice into a new file at `dst_path` using
     /// the non-blocking `output-stream.splice`.
     fn splice(&self, src_path: String, dst_path: String) -> Result<u64, String>;
+    /// Read a whole file with non-blocking `input-stream.read` calls, parking on
+    /// `input-stream.subscribe().block()` whenever a read returns no bytes yet — the
+    /// read/subscribe/block pattern language runtimes (e.g. the JS runtime's
+    /// `readFileSync`) use. Each `block()` records an `io::poll::poll` oplog entry, while
+    /// the file stream's own reads are re-executed live during replay.
+    fn read_file_polling(&self, path: String) -> Result<String, String>;
+    /// Write `contents` with non-blocking `output-stream.check-write`/`write`/`flush`
+    /// calls, parking on `output-stream.subscribe().block()` while no write permit is
+    /// available — the write-side counterpart of `read_file_polling`.
+    fn write_file_polling(&self, path: String, contents: String) -> Result<(), String>;
 }
 
 pub struct FileSystemImpl {
@@ -427,5 +437,67 @@ impl FileSystem for FileSystemImpl {
         }
 
         Ok(total)
+    }
+
+    fn read_file_polling(&self, path: String) -> Result<String, String> {
+        let dirs = wasi::filesystem::preopens::get_directories();
+        let (root, _) = dirs.into_iter().next().ok_or("no preopened directory")?;
+        let fd: Descriptor = root
+            .open_at(
+                PathFlags::empty(),
+                path.trim_start_matches('/'),
+                OpenFlags::empty(),
+                DescriptorFlags::READ,
+            )
+            .map_err(|e| format!("open: {e:?}"))?;
+        let input = fd
+            .read_via_stream(0)
+            .map_err(|e| format!("read_via_stream: {e:?}"))?;
+        let mut bytes = Vec::new();
+        loop {
+            match input.read(4096) {
+                Ok(chunk) if chunk.is_empty() => input.subscribe().block(),
+                Ok(chunk) => bytes.extend_from_slice(&chunk),
+                Err(StreamError::Closed) => break,
+                Err(e) => return Err(format!("read: {e:?}")),
+            }
+        }
+        String::from_utf8(bytes).map_err(|e| e.to_string())
+    }
+
+    fn write_file_polling(&self, path: String, contents: String) -> Result<(), String> {
+        let dirs = wasi::filesystem::preopens::get_directories();
+        let (root, _) = dirs.into_iter().next().ok_or("no preopened directory")?;
+        let fd: Descriptor = root
+            .open_at(
+                PathFlags::empty(),
+                path.trim_start_matches('/'),
+                OpenFlags::CREATE | OpenFlags::TRUNCATE,
+                DescriptorFlags::WRITE,
+            )
+            .map_err(|e| format!("open: {e:?}"))?;
+        let output: OutputStream = fd
+            .write_via_stream(0)
+            .map_err(|e| format!("write_via_stream: {e:?}"))?;
+        let wait_for_permit = |output: &OutputStream| -> Result<u64, String> {
+            loop {
+                match output.check_write() {
+                    Ok(0) => output.subscribe().block(),
+                    Ok(permit) => return Ok(permit),
+                    Err(e) => return Err(format!("check_write: {e:?}")),
+                }
+            }
+        };
+        let mut remaining = contents.as_bytes();
+        while !remaining.is_empty() {
+            let permit = wait_for_permit(&output)?;
+            let n = remaining.len().min(permit as usize);
+            output
+                .write(&remaining[..n])
+                .map_err(|e| format!("write: {e:?}"))?;
+            remaining = &remaining[n..];
+        }
+        output.flush().map_err(|e| format!("flush: {e:?}"))?;
+        wait_for_permit(&output).map(|_| ())
     }
 }

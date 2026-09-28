@@ -34,7 +34,7 @@ use golem_common::model::agent::{AgentFileContentHash, AgentTypeName};
 use golem_common::model::component::{
     AgentFilePath, ArchiveFilePath, ComponentCreation, ComponentId, ComponentRevision,
     ComponentUpdate, InitialAgentFile, InstalledPlugin, PluginInstallation,
-    PluginInstallationAction,
+    PluginInstallationAction, PluginPriority,
 };
 use golem_common::model::component::{
     AgentTypeProvisionConfigCreation, AgentTypeProvisionConfigUpdate,
@@ -578,6 +578,8 @@ impl ComponentWriteService {
             })
     }
 
+    /// Resolves the grants referenced by `Install` actions in one query, then applies the
+    /// actions to the previous installations (see [`apply_plugin_installation_actions`]).
     async fn update_plugin_installations(
         &self,
         environment: &Environment,
@@ -585,112 +587,22 @@ impl ComponentWriteService {
         updates: Vec<PluginInstallationAction>,
         auth: &AuthCtx,
     ) -> Result<Vec<InstalledPlugin>, ComponentError> {
-        let mut updated = previous;
-
-        for update in updates {
-            match update {
-                PluginInstallationAction::Uninstall(inner) => {
-                    let plugin_index = updated
-                        .iter()
-                        .position(|p| {
-                            p.environment_plugin_grant_id == inner.environment_plugin_grant_id
-                        })
-                        .ok_or(ComponentError::PluginInstallationNotFound(
-                            inner.environment_plugin_grant_id,
-                        ))?;
-
-                    updated.swap_remove(plugin_index);
-                }
-                PluginInstallationAction::Update(inner) => {
-                    let plugin_index = updated
-                        .iter()
-                        .position(|p| {
-                            p.environment_plugin_grant_id == inner.environment_plugin_grant_id
-                        })
-                        .ok_or(ComponentError::PluginInstallationNotFound(
-                            inner.environment_plugin_grant_id,
-                        ))?;
-
-                    // Currently it's ok to update a plugin even if it was removed from the enviroment / deleted.
-                    // Fetch the environment_grant_here if you want to restrict that.
-
-                    if let Some(new_priority) = inner.new_priority {
-                        // ensure the plugin priority is not already used
-                        if updated.iter().any(|p| p.priority == new_priority) {
-                            return Err(ComponentError::ConflictingPluginPriority(new_priority));
-                        };
-                    };
-
-                    let plugin = updated.get_mut(plugin_index).unwrap();
-
-                    if let Some(new_priority) = inner.new_priority {
-                        plugin.priority = new_priority;
-                    };
-
-                    if let Some(new_parameters) = inner.new_parameters {
-                        plugin.parameters = new_parameters;
-                    };
-                }
-                PluginInstallationAction::Install(inner) => {
-                    // ensure the plugin priority and environment_plugin_grant_id is not already used
-                    if updated.iter().any(|p| p.priority == inner.priority) {
-                        return Err(ComponentError::ConflictingPluginPriority(inner.priority));
-                    };
-
-                    if updated
-                        .iter()
-                        .any(|p| p.environment_plugin_grant_id == inner.environment_plugin_grant_id)
-                    {
-                        return Err(ComponentError::ConflictingEnvironmentPluginGrantId(
-                            inner.environment_plugin_grant_id,
-                        ));
-                    };
-
-                    // get the plugin details and ensure the plugin is installed to the environment
-                    let environment_plugin_grant = self
-                        .environment_plugin_grant_service
-                        .get_active_by_id_for_environment(
-                            inner.environment_plugin_grant_id,
-                            environment,
-                            auth,
-                        )
-                        .await
-                        .map_err(|err| match err {
-                            EnvironmentPluginGrantError::EnvironmentPluginGrantNotFound(
-                                grant_id,
-                            ) => ComponentError::EnvironmentPluginNotFound(grant_id),
-                            other => other.into(),
-                        })?;
-
-                    updated.push(InstalledPlugin {
-                        environment_plugin_grant_id: environment_plugin_grant.id,
-                        parameters: inner.parameters,
-                        priority: inner.priority,
-                        plugin_registration_id: environment_plugin_grant.plugin.id,
-                        oplog_processor_component_id: environment_plugin_grant
-                            .plugin
-                            .oplog_processor_component_id(),
-                        oplog_processor_component_revision: environment_plugin_grant
-                            .plugin
-                            .oplog_processor_component_revision(),
-                        plugin_name: environment_plugin_grant.plugin.name,
-                        plugin_version: environment_plugin_grant.plugin.version,
-                    });
-                }
-            }
-        }
-
-        let non_unique_priorities = updated
+        let install_grant_ids: HashSet<EnvironmentPluginGrantId> = updates
             .iter()
-            .into_group_map_by(|p| p.priority)
-            .into_iter()
-            .filter(|(_, plugins)| plugins.len() > 1)
-            .collect::<HashMap<_, _>>();
-        if let Some((priority, _)) = non_unique_priorities.iter().next() {
-            return Err(ComponentError::ConflictingPluginPriority(*priority));
-        }
+            .filter_map(|update| match update {
+                PluginInstallationAction::Install(inner) => Some(inner.environment_plugin_grant_id),
+                _ => None,
+            })
+            .collect();
 
-        Ok(updated)
+        let resolved_grants = if install_grant_ids.is_empty() {
+            HashMap::new()
+        } else {
+            self.resolve_all_plugin_grants(environment, install_grant_ids, auth)
+                .await?
+        };
+
+        apply_plugin_installation_actions(previous, updates, &resolved_grants)
     }
 
     async fn apply_provision_config_update(
@@ -819,19 +731,112 @@ fn resolve_plugins_for_creation(
                 plugin_installation.environment_plugin_grant_id,
             ))?;
 
-        result.push(InstalledPlugin {
-            environment_plugin_grant_id: grant.id,
-            parameters: plugin_installation.parameters.clone(),
-            priority: plugin_installation.priority,
-            plugin_registration_id: grant.plugin.id,
-            oplog_processor_component_id: grant.plugin.oplog_processor_component_id(),
-            oplog_processor_component_revision: grant.plugin.oplog_processor_component_revision(),
-            plugin_name: grant.plugin.name.clone(),
-            plugin_version: grant.plugin.version.clone(),
-        });
+        result.push(installed_plugin_from_grant(
+            grant,
+            plugin_installation.priority,
+            plugin_installation.parameters.clone(),
+        ));
     }
 
     Ok(result)
+}
+
+/// Builds the stored installation record for `grant` with the given priority and parameters.
+fn installed_plugin_from_grant(
+    grant: &EnvironmentPluginGrantWithDetails,
+    priority: PluginPriority,
+    parameters: BTreeMap<String, String>,
+) -> InstalledPlugin {
+    InstalledPlugin {
+        environment_plugin_grant_id: grant.id,
+        parameters,
+        priority,
+        plugin_registration_id: grant.plugin.id,
+        oplog_processor_component_id: grant.plugin.oplog_processor_component_id(),
+        oplog_processor_component_revision: grant.plugin.oplog_processor_component_revision(),
+        plugin_name: grant.plugin.name.clone(),
+        plugin_version: grant.plugin.version.clone(),
+    }
+}
+
+/// Applies plugin installation actions to a component revision's previous installations.
+///
+/// Installations are keyed by environment plugin grant id. Priority uniqueness is an invariant
+/// of the resulting set, so it is checked once on the final state rather than per action —
+/// checking per action compared an installation against itself (a re-install or a no-op
+/// priority update collided with its own priority, #217) and rejected valid batches such as
+/// priority swaps.
+///
+/// `Install` of a grant that is already installed replaces that installation (idempotent
+/// re-install): deploy clients re-send the full plugin list when they cannot compute a plugin
+/// delta, e.g. on a config-only redeploy. Installing the same grant twice within one batch is
+/// still rejected as a client error.
+fn apply_plugin_installation_actions(
+    previous: Vec<InstalledPlugin>,
+    updates: Vec<PluginInstallationAction>,
+    resolved_grants: &HashMap<EnvironmentPluginGrantId, EnvironmentPluginGrantWithDetails>,
+) -> Result<Vec<InstalledPlugin>, ComponentError> {
+    let mut updated = previous;
+    let mut installed_in_batch: HashSet<EnvironmentPluginGrantId> = HashSet::new();
+
+    let position_of = |plugins: &[InstalledPlugin], grant_id: EnvironmentPluginGrantId| {
+        plugins
+            .iter()
+            .position(|p| p.environment_plugin_grant_id == grant_id)
+    };
+
+    for update in updates {
+        match update {
+            PluginInstallationAction::Uninstall(inner) => {
+                let grant_id = inner.environment_plugin_grant_id;
+                let plugin_index = position_of(&updated, grant_id)
+                    .ok_or(ComponentError::PluginInstallationNotFound(grant_id))?;
+                updated.swap_remove(plugin_index);
+            }
+            PluginInstallationAction::Update(inner) => {
+                // Currently it's ok to update a plugin even if it was removed from the environment / deleted.
+                let grant_id = inner.environment_plugin_grant_id;
+                let plugin_index = position_of(&updated, grant_id)
+                    .ok_or(ComponentError::PluginInstallationNotFound(grant_id))?;
+                let plugin = &mut updated[plugin_index];
+                if let Some(new_priority) = inner.new_priority {
+                    plugin.priority = new_priority;
+                };
+                if let Some(new_parameters) = inner.new_parameters {
+                    plugin.parameters = new_parameters;
+                };
+            }
+            PluginInstallationAction::Install(inner) => {
+                let grant_id = inner.environment_plugin_grant_id;
+                if !installed_in_batch.insert(grant_id) {
+                    return Err(ComponentError::ConflictingEnvironmentPluginGrantId(
+                        grant_id,
+                    ));
+                }
+                // ensure the plugin is (still) granted to the environment
+                let grant = resolved_grants
+                    .get(&grant_id)
+                    .ok_or(ComponentError::EnvironmentPluginNotFound(grant_id))?;
+                let plugin = installed_plugin_from_grant(grant, inner.priority, inner.parameters);
+                match position_of(&updated, grant_id) {
+                    Some(existing_index) => updated[existing_index] = plugin,
+                    None => updated.push(plugin),
+                }
+            }
+        }
+    }
+
+    let non_unique_priorities = updated
+        .iter()
+        .into_group_map_by(|p| p.priority)
+        .into_iter()
+        .filter(|(_, plugins)| plugins.len() > 1)
+        .collect::<HashMap<_, _>>();
+    if let Some((priority, _)) = non_unique_priorities.iter().next() {
+        return Err(ComponentError::ConflictingPluginPriority(*priority));
+    }
+
+    Ok(updated)
 }
 
 fn validate_and_transform_config_entries(
@@ -997,4 +1002,218 @@ fn validate_agent_config_path(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ComponentError, apply_plugin_installation_actions};
+    use golem_common::base_model::account::AccountSummary;
+    use golem_common::base_model::base64::Base64;
+    use golem_common::base_model::environment_plugin_grant::EnvironmentPluginGrantWithDetails;
+    use golem_common::base_model::plugin_registration::{
+        OplogProcessorPluginSpec, PluginRegistrationDto, PluginSpecDto,
+    };
+    use golem_common::model::account::AccountId;
+    use golem_common::model::component::{
+        ComponentId, ComponentRevision, InstalledPlugin, PluginInstallation,
+        PluginInstallationAction, PluginInstallationUpdate, PluginPriority,
+    };
+    use golem_common::model::environment::EnvironmentId;
+    use golem_common::model::environment_plugin_grant::EnvironmentPluginGrantId;
+    use golem_common::model::plugin_registration::PluginRegistrationId;
+    use std::collections::{BTreeMap, HashMap};
+    use test_r::test;
+
+    type Grants = HashMap<EnvironmentPluginGrantId, EnvironmentPluginGrantWithDetails>;
+
+    fn grant(name: &str) -> EnvironmentPluginGrantWithDetails {
+        let account_id = AccountId::new();
+        EnvironmentPluginGrantWithDetails {
+            id: EnvironmentPluginGrantId::new(),
+            environment_id: EnvironmentId::new(),
+            plugin: PluginRegistrationDto {
+                id: PluginRegistrationId::new(),
+                account_id,
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                description: String::new(),
+                icon: Base64(Vec::new()),
+                homepage: String::new(),
+                spec: PluginSpecDto::OplogProcessor(OplogProcessorPluginSpec {
+                    component_id: ComponentId::new(),
+                    component_revision: ComponentRevision::INITIAL,
+                }),
+            },
+            plugin_account: AccountSummary {
+                id: account_id,
+                name: "owner".to_string(),
+                email: "owner@example.com".into(),
+            },
+        }
+    }
+
+    fn grants(all: &[&EnvironmentPluginGrantWithDetails]) -> Grants {
+        all.iter().map(|g| (g.id, (*g).clone())).collect()
+    }
+
+    fn installation(
+        grant: &EnvironmentPluginGrantWithDetails,
+        priority: i32,
+    ) -> PluginInstallation {
+        PluginInstallation {
+            environment_plugin_grant_id: grant.id,
+            priority: PluginPriority(priority),
+            parameters: BTreeMap::new(),
+        }
+    }
+
+    fn install(
+        grant: &EnvironmentPluginGrantWithDetails,
+        priority: i32,
+    ) -> PluginInstallationAction {
+        PluginInstallationAction::Install(installation(grant, priority))
+    }
+
+    fn set_priority(
+        grant: &EnvironmentPluginGrantWithDetails,
+        priority: i32,
+    ) -> PluginInstallationAction {
+        PluginInstallationAction::Update(PluginInstallationUpdate {
+            environment_plugin_grant_id: grant.id,
+            new_priority: Some(PluginPriority(priority)),
+            new_parameters: None,
+        })
+    }
+
+    /// Installs `installs` onto an empty component, i.e. the state after the first deploy.
+    fn installed(grants: &Grants, installs: Vec<PluginInstallationAction>) -> Vec<InstalledPlugin> {
+        apply_plugin_installation_actions(Vec::new(), installs, grants).unwrap()
+    }
+
+    fn priorities_by_name(plugins: &[InstalledPlugin]) -> BTreeMap<String, i32> {
+        plugins
+            .iter()
+            .map(|p| (p.plugin_name.clone(), p.priority.0))
+            .collect()
+    }
+
+    // Regression (#217): a config-only redeploy re-sends `Install` for every plugin that is
+    // already installed (the CLI falls back to install-all when the plugin diff is empty); the
+    // existing installation must not collide with itself on its own priority.
+    #[test]
+    fn reinstalling_already_installed_plugin_on_redeploy_succeeds() {
+        let otlp = grant("golem-otlp-exporter");
+        let grants = grants(&[&otlp]);
+        let previous = installed(&grants, vec![install(&otlp, 0)]);
+
+        let updated =
+            apply_plugin_installation_actions(previous, vec![install(&otlp, 0)], &grants).unwrap();
+
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].environment_plugin_grant_id, otlp.id);
+        assert_eq!(updated[0].priority, PluginPriority(0));
+    }
+
+    #[test]
+    fn reinstalling_already_installed_plugin_replaces_priority_and_parameters() {
+        let otlp = grant("golem-otlp-exporter");
+        let grants = grants(&[&otlp]);
+        let previous = installed(&grants, vec![install(&otlp, 0)]);
+        let mut reinstall = installation(&otlp, 5);
+        reinstall.parameters = BTreeMap::from([("k".to_string(), "v".to_string())]);
+
+        let updated = apply_plugin_installation_actions(
+            previous,
+            vec![PluginInstallationAction::Install(reinstall.clone())],
+            &grants,
+        )
+        .unwrap();
+
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].priority, PluginPriority(5));
+        assert_eq!(updated[0].parameters, reinstall.parameters);
+    }
+
+    // Regression (#217): updating a plugin to the priority it already has must not collide
+    // with itself.
+    #[test]
+    fn updating_plugin_to_its_own_priority_succeeds() {
+        let otlp = grant("golem-otlp-exporter");
+        let grants = grants(&[&otlp]);
+        let previous = installed(&grants, vec![install(&otlp, 0)]);
+
+        let updated =
+            apply_plugin_installation_actions(previous, vec![set_priority(&otlp, 0)], &grants)
+                .unwrap();
+
+        assert_eq!(updated[0].priority, PluginPriority(0));
+    }
+
+    #[test]
+    fn swapping_priorities_within_one_update_succeeds() {
+        let a = grant("a");
+        let b = grant("b");
+        let grants = grants(&[&a, &b]);
+        let previous = installed(&grants, vec![install(&a, 0), install(&b, 1)]);
+
+        let updated = apply_plugin_installation_actions(
+            previous,
+            vec![set_priority(&a, 1), set_priority(&b, 0)],
+            &grants,
+        )
+        .unwrap();
+
+        assert_eq!(
+            priorities_by_name(&updated),
+            BTreeMap::from([("a".to_string(), 1), ("b".to_string(), 0)])
+        );
+    }
+
+    #[test]
+    fn installing_different_plugin_with_taken_priority_is_rejected() {
+        let a = grant("a");
+        let b = grant("b");
+        let grants = grants(&[&a, &b]);
+        let previous = installed(&grants, vec![install(&a, 0)]);
+
+        let result = apply_plugin_installation_actions(previous, vec![install(&b, 0)], &grants);
+
+        assert!(matches!(
+            result,
+            Err(ComponentError::ConflictingPluginPriority(PluginPriority(0)))
+        ));
+    }
+
+    #[test]
+    fn updating_plugin_to_another_plugins_priority_is_rejected() {
+        let a = grant("a");
+        let b = grant("b");
+        let grants = grants(&[&a, &b]);
+        let previous = installed(&grants, vec![install(&a, 0), install(&b, 1)]);
+
+        let result =
+            apply_plugin_installation_actions(previous, vec![set_priority(&b, 0)], &grants);
+
+        assert!(matches!(
+            result,
+            Err(ComponentError::ConflictingPluginPriority(PluginPriority(0)))
+        ));
+    }
+
+    #[test]
+    fn installing_same_plugin_twice_in_one_update_is_rejected() {
+        let a = grant("a");
+        let grants = grants(&[&a]);
+
+        let result = apply_plugin_installation_actions(
+            Vec::new(),
+            vec![install(&a, 0), install(&a, 1)],
+            &grants,
+        );
+
+        assert!(matches!(
+            result,
+            Err(ComponentError::ConflictingEnvironmentPluginGrantId(id)) if id == a.id
+        ));
+    }
 }

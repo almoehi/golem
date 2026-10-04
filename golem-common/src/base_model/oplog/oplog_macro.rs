@@ -202,10 +202,17 @@ macro_rules! oplog_entry {
     }
 }
 
+/// Generates a payload enum (`HostRequest`/`HostResponse`) and one inner struct per case.
+///
+/// A case may carry an optional `[attr, ...]` list right after its name; those attributes are
+/// applied to the generated inner STRUCT (not to the enum variant, which `#[...]` before the
+/// case name targets). This is how a payload struct gets a desert evolution history, e.g.
+/// `PollResult [desert(evolution(FieldAdded("targets", None)))] { ... }`, so a field can be
+/// added without breaking the decoding of payloads already persisted in existing oplogs.
 #[macro_export]
 macro_rules! oplog_payload {
         ( $typename:ident => {
-                $($(#[$casemeta:meta])* $case:ident {
+                $($(#[$casemeta:meta])* $case:ident $([$($structmeta:meta),* $(,)?])? {
                     $($(#[$meta:meta])* $field:ident: $typ:ty),* $(,)?
                 }),* $(,)?
         }) => {
@@ -251,6 +258,7 @@ macro_rules! oplog_payload {
             inner_name = $typename + $case =>
 
             #[derive(Clone, Debug, PartialEq, desert_rust::BinaryCodec, IntoValue, FromValue)]
+            $($(#[$structmeta])*)?
             pub struct $inner_name {
                 $( $(#[$meta])* pub $field: $typ ),*
             }

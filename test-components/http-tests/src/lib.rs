@@ -2,4 +2,5 @@ pub mod http_client;
 pub mod http_client_2;
 pub mod http_client_3;
 pub mod http_client_4;
+pub mod poll_order_client;
 pub mod streaming_client;

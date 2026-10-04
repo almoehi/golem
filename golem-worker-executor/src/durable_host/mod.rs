@@ -4696,6 +4696,7 @@ mod stray_entry_tests {
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
                 HostResponsePollResult {
                     result: Ok(vec![0]),
+                    targets: None,
                 },
             ))),
             durable_function_type: DurableFunctionType::ReadLocal,
@@ -5640,6 +5641,18 @@ impl PrivateDurableWorkerState {
             self.next_pollable_seq += 1;
             seq
         })
+    }
+
+    /// The logical sequence number already assigned to `rep` by `pollable_seq`, WITHOUT
+    /// assigning one. Used by `poll()` to describe its input pollables
+    /// (`HostResponsePollResult::targets`): `poll()` must not mint identities itself, because a
+    /// pollable that only ever appears in `poll()` lists — e.g. wstd's process-wide
+    /// `READY_POLLABLE`, created once per instance and therefore at a different point after a
+    /// snapshot restore than in the original live run — would shift `next_pollable_seq` for
+    /// every pollable observed after it, breaking the `ReadLocalPollable(seq)` matching that
+    /// `ready()` relies on. Such pollables are reported as `None` (untracked) instead.
+    pub fn peek_pollable_seq(&self, rep: u32) -> Option<u32> {
+        self.pollable_seq.get(&rep).copied()
     }
 
     /// Clears a pollable's sequence-number assignment when it is dropped, so a wasmtime

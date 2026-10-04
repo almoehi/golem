@@ -429,3 +429,178 @@ async fn outgoing_http_contains_idempotency_key(
     );
     Ok(())
 }
+
+/// Regression test for the `io::poll::poll` replay-order bug (`durable_host/io/poll.rs`,
+/// `map_recorded_poll_ready`; GOLEM_IO_POLL_BUG.md "Fifth Bug").
+///
+/// Golem used to replay a recorded `poll()` answer POSITIONALLY: the recorded ready index was
+/// handed back as-is. But a guest's target-list order need not be replay-stable — wstd's reactor
+/// (and the `PollOrderClient` test agent, which mirrors it) builds the list by iterating a
+/// `HashMap` keyed on a process-wide counter, so a fresh instance (here: one resumed from a
+/// snapshot) presents the same pollables in a different order than the live run did. The
+/// replayed index then names a different pollable — e.g. the never-firing timeout instead of the
+/// HTTP response — and a guest that trusts `poll()` diverges from what it did live.
+///
+/// Setup: `warm_up` advances the agent's process-wide wait counter in the live instance and a
+/// snapshot lands right after it; `racing_fetches` then runs GETs (response + timeout:
+/// 2-pollable polls) and large POSTs (body-write backpressure + response + timeout: 3-pollable
+/// polls) AFTER the snapshot. A cold restart resumes from the snapshot — with the counter back at
+/// 0 — and must replay `racing_fetches` to rebuild the agent state: every result must come back
+/// exactly as recorded, and no request may be re-sent.
+#[test]
+#[tracing::instrument]
+async fn poll_replay_after_snapshot_restore_maps_ready_set_by_pollable_identity(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    _tracing: &Tracing,
+    #[tagged_as("http_tests")] http_tests: &PrecompiledComponent,
+) -> anyhow::Result<()> {
+    use axum::body::Body;
+    use axum::extract::Path;
+    use axum::routing::get;
+    use futures::StreamExt;
+    use golem_common::model::oplog::PublicOplogEntry;
+    use golem_common::model::{AgentStatus, OplogIndex};
+    use golem_wasm::Value;
+    use golem_worker_executor::services::golem_config::SnapshotPolicy;
+    use golem_worker_executor_test_utils::start_with_snapshot_policy;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    const ROUNDS: u32 = 6;
+    const UPLOAD_SIZE: usize = 2 * 1024 * 1024; // keep in sync with poll_order_client.rs
+
+    let context = TestContext::new(last_unique_id);
+    // Every 2nd invocation (the constructor counts as one): the constructor + three `warm_up`
+    // calls end on a snapshot, the single `racing_fetches` call after them does not — so it is
+    // exactly the region replayed after the restart.
+    let snapshot_policy = SnapshotPolicy::EveryNInvocation { count: 2 };
+    let executor = start_with_snapshot_policy(deps, &context, snapshot_policy.clone()).await?;
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let host_http_port = listener.local_addr().unwrap().port();
+    let requests_served = Arc::new(AtomicUsize::new(0));
+    let served = requests_served.clone();
+    let served_upload = requests_served.clone();
+    let http_server = spawn(
+        async move {
+            let route = Router::new()
+                .route(
+                    "/delayed/{round}",
+                    get(move |Path(round): Path<u32>| {
+                        let served = served.clone();
+                        async move {
+                            // Long enough that the guest has to poll (response + timeout).
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                            served.fetch_add(1, Ordering::SeqCst);
+                            format!("get-{round}")
+                        }
+                    }),
+                )
+                .route(
+                    "/upload/{round}",
+                    post(move |Path(round): Path<u32>, body: Body| {
+                        let served = served_upload.clone();
+                        async move {
+                            // Read slowly so the guest's body writes hit backpressure.
+                            let mut stream = body.into_data_stream();
+                            let mut len = 0usize;
+                            while let Some(chunk) = stream.next().await {
+                                len += chunk.unwrap().len();
+                                tokio::time::sleep(Duration::from_millis(2)).await;
+                            }
+                            served.fetch_add(1, Ordering::SeqCst);
+                            format!("post-{round}-{len}")
+                        }
+                    }),
+                );
+            axum::serve(listener, route).await.unwrap();
+        }
+        .in_current_span(),
+    );
+
+    let component = executor
+        .component_dep(&context.default_environment_id, http_tests)
+        .store()
+        .await?;
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), host_http_port.to_string());
+    let agent_id = agent_id!("PollOrderClient", "snapshot-restore");
+    let worker_id = executor
+        .start_agent_with(&component.id, agent_id.clone(), env, Vec::new())
+        .await?;
+
+    for _ in 0..3 {
+        executor
+            .invoke_and_await_agent(&component, &agent_id, "warm_up", data_value!(1013u64))
+            .await?;
+    }
+    let snapshots = |oplog: &[golem_common::model::oplog::PublicOplogEntryWithIndex]| {
+        oplog
+            .iter()
+            .filter(|entry| matches!(&entry.entry, PublicOplogEntry::Snapshot(_)))
+            .count()
+    };
+    let snapshots_before = snapshots(&executor.get_oplog(&worker_id, OplogIndex::INITIAL).await?);
+    assert!(
+        snapshots_before >= 1,
+        "test setup invalid: expected a snapshot after the warm-up invocations"
+    );
+
+    let expected: Vec<Value> = (0..ROUNDS)
+        .flat_map(|round| {
+            [
+                Value::String(format!("200:get-{round}")),
+                Value::String(format!("200:post-{round}-{UPLOAD_SIZE}")),
+            ]
+        })
+        .collect();
+
+    let live = executor
+        .invoke_and_await_agent(&component, &agent_id, "racing_fetches", data_value!(ROUNDS))
+        .await?
+        .into_return_value();
+    assert_eq!(live, Some(Value::List(expected.clone())), "live run");
+    assert_eq!(
+        snapshots(&executor.get_oplog(&worker_id, OplogIndex::INITIAL).await?),
+        snapshots_before,
+        "test setup invalid: racing_fetches must not be covered by a snapshot, or the restart \
+         would not replay it"
+    );
+    let served_live = requests_served.load(Ordering::SeqCst);
+    assert_eq!(served_live, 2 * ROUNDS as usize);
+
+    // Cold restart: the next invocation resumes from the snapshot in a fresh instance (wait
+    // counter back at 0, so different target-list orders) and replays racing_fetches.
+    drop(executor);
+    let executor = start_with_snapshot_policy(deps, &context, snapshot_policy).await?;
+
+    let recovered = executor
+        .invoke_and_await_agent(&component, &agent_id, "results", data_value!())
+        .await?
+        .into_return_value();
+    let metadata = executor
+        .wait_for_statuses(
+            &worker_id,
+            &[AgentStatus::Idle, AgentStatus::Failed],
+            Duration::from_secs(30),
+        )
+        .await?;
+
+    drop(executor);
+    http_server.abort();
+
+    assert_eq!(
+        recovered,
+        Some(Value::List(expected)),
+        "replay after the snapshot restore must hand every poll() answer to the same pollable \
+         as live — a `timeout` here is the replayed ready index waking the timer"
+    );
+    assert_eq!(metadata.status, AgentStatus::Idle);
+    assert_eq!(
+        requests_served.load(Ordering::SeqCst),
+        served_live,
+        "replay must not re-send any request"
+    );
+    Ok(())
+}

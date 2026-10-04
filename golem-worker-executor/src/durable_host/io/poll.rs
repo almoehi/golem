@@ -33,7 +33,7 @@ use golem_common::model::oplog::{
     HostResponsePollResult, OplogEntry,
 };
 use golem_service_base::error::worker_executor::{InterruptKind, WorkerExecutorError};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use wasmtime::component::Resource;
 use wasmtime_wasi::IoView as _;
 use wasmtime_wasi::p2::bindings::io::poll::{Host, HostPollable, Pollable};
@@ -300,6 +300,19 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
             }
         };
 
+        // The logical identity of every input pollable, in the guest's list order. Recorded
+        // live and compared on replay so the recorded ready set is mapped onto the CURRENT list
+        // by identity rather than by position: wstd's reactor builds this list by iterating a
+        // `HashMap` keyed on a per-instance counter, so after a snapshot restore (or any other
+        // fresh instance) the same pollables can arrive in a different order, and a positional
+        // replay then wakes the wrong future — e.g. a fetch's 1e19-ns timeout timer instead of
+        // its response (see `map_recorded_poll_ready`). Peeked, never assigned: see
+        // `peek_pollable_seq` for why `poll()` must not mint identities.
+        let targets: Vec<Option<u32>> = in_
+            .iter()
+            .map(|pollable| self.state.peek_pollable_seq(pollable.rep()))
+            .collect();
+
         let durability =
             Durability::<IoPollPoll>::new(self, DurableFunctionType::ReadLocal).await?;
         let replaying = !durability.is_live();
@@ -390,6 +403,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                         HostRequestPollCount { count },
                         HostResponsePollResult {
                             result: result.map_err(|err| err.to_string()),
+                            targets: Some(targets),
                         },
                     )
                     .await?),
@@ -467,7 +481,7 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                     let payload: HostResponsePollResult = host_response
                         .try_into()
                         .map_err(|e: String| wasmtime::Error::msg(e))?;
-                    Ok(payload)
+                    Ok(self.ready_set_for_current_targets(payload, &targets))
                 }
                 // The give-up fallback, but ONLY while the cursor holds a host-call entry.
                 //
@@ -509,7 +523,10 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                         ?ready,
                         "POLLCALL_TRACE poll() REPLAY no own entry at cursor, synthesizing"
                     );
-                    Ok(HostResponsePollResult { result: Ok(ready) })
+                    Ok(HostResponsePollResult {
+                        result: Ok(ready),
+                        targets: None,
+                    })
                 }
             }
         };
@@ -546,6 +563,35 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
 }
 
 impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
+    /// Replay only: `replayed_poll_answer`, plus a trace of any translation it made.
+    fn ready_set_for_current_targets(
+        &self,
+        payload: HostResponsePollResult,
+        current_targets: &[Option<u32>],
+    ) -> HostResponsePollResult {
+        let recorded = payload.clone();
+        let (answer, mapping) = replayed_poll_answer(payload, current_targets);
+        match mapping {
+            PollReplayMapping::Legacy | PollReplayMapping::SameOrder => {}
+            PollReplayMapping::Remapped => debug!(
+                agent_id = %self.owned_agent_id,
+                recorded_targets = ?recorded.targets,
+                recorded_ready = ?recorded.result,
+                ?current_targets,
+                mapped = ?answer.result,
+                "POLLCALL_TRACE poll() REPLAY target list order differs from live, ready set remapped by identity"
+            ),
+            PollReplayMapping::TargetSetMismatch => warn!(
+                agent_id = %self.owned_agent_id,
+                recorded_targets = ?recorded.targets,
+                recorded_ready = ?recorded.result,
+                ?current_targets,
+                "POLLCALL_TRACE poll() REPLAY target set differs from live, falling back to positional ready indexes"
+            ),
+        }
+        answer
+    }
+
     /// Replay only: actually wait for every filesystem-stream pollable among `ready_reps` — the
     /// pollables the replayed `poll()`/`ready()` answer just reported as ready.
     ///
@@ -631,5 +677,242 @@ fn is_suspend_for_sleep<T>(result: &Result<T, wasmtime::Error>) -> Option<Durati
         None
     } else {
         None
+    }
+}
+
+/// Maps a recorded `poll()` ready set onto the guest's CURRENT target list, by pollable
+/// identity instead of by position.
+///
+/// `recorded_targets` / `current_targets` describe each input pollable, in list order, by its
+/// call-order-derived logical identity (`pollable_seq`; `None` = untracked, see
+/// `peek_pollable_seq`). `recorded_ready` is the live answer, as indexes into
+/// `recorded_targets`. Returns the same answer as indexes into `current_targets`.
+///
+/// Why positions are not enough: the order of the list is the GUEST's choice, and it need not be
+/// replay-stable. wstd's reactor (wasm-rquickjs's, too) builds it by iterating a `HashMap` whose
+/// keys carry a process-wide counter, so a fresh instance — after a snapshot restore, an update
+/// or a revert — presents the same pollables in a different order than the live run did, and
+/// the recorded index then names a different pollable (2026-10-04: a fetch's 1e19-ns timeout
+/// woken instead of its response, failing the fetch in replay only).
+///
+/// Matching rule: the k-th recorded occurrence of an identity maps to the k-th current
+/// occurrence of the same identity. That covers a pollable listed twice (two waiters on one
+/// pollable), and matches untracked pollables by their ordinal among the untracked ones — so a
+/// list with no tracked pollable at all maps exactly positionally, as before.
+///
+/// The answer keeps the RECORDED order (the order the live guest saw, and woke its waiters in),
+/// rather than being re-sorted by current position.
+///
+/// `None` when the two lists do not name the same pollables (as a multiset) or an index is out
+/// of range: replay has then diverged for some other reason, and no identity mapping exists.
+pub(crate) fn map_recorded_poll_ready(
+    recorded_targets: &[Option<u32>],
+    recorded_ready: &[u32],
+    current_targets: &[Option<u32>],
+) -> Option<Vec<u32>> {
+    let mut recorded_sorted = recorded_targets.to_vec();
+    let mut current_sorted = current_targets.to_vec();
+    recorded_sorted.sort_unstable();
+    current_sorted.sort_unstable();
+    if recorded_sorted != current_sorted {
+        return None;
+    }
+
+    recorded_ready
+        .iter()
+        .map(|&recorded_index| {
+            let recorded_index = recorded_index as usize;
+            let identity = recorded_targets.get(recorded_index)?;
+            let occurrence = recorded_targets[..recorded_index]
+                .iter()
+                .filter(|target| *target == identity)
+                .count();
+            current_targets
+                .iter()
+                .enumerate()
+                .filter(|(_, target)| *target == identity)
+                .nth(occurrence)
+                .map(|(current_index, _)| current_index as u32)
+        })
+        .collect()
+}
+
+/// How a replayed `poll()` answer was translated (see `replayed_poll_answer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PollReplayMapping {
+    /// Entry written before `targets` existed, or a recorded error: returned unchanged.
+    Legacy,
+    /// Same pollables in the same order as live: unchanged.
+    SameOrder,
+    /// Same pollables in a different order: ready indexes translated by identity.
+    Remapped,
+    /// Not the same pollables as live: returned unchanged (positional — the pre-`targets`
+    /// behavior, and the best remaining guess).
+    TargetSetMismatch,
+}
+
+/// Translates a recorded `poll()` answer into indexes of the guest's CURRENT input list
+/// (`current_targets`), via `map_recorded_poll_ready`. Falls back to the recorded indexes
+/// unchanged — the positional behavior every entry had before `targets` existed — for an entry
+/// that predates the field, a recorded error, or a target set that differs from live.
+pub(crate) fn replayed_poll_answer(
+    payload: HostResponsePollResult,
+    current_targets: &[Option<u32>],
+) -> (HostResponsePollResult, PollReplayMapping) {
+    let (Ok(recorded_ready), Some(recorded_targets)) = (&payload.result, &payload.targets) else {
+        return (payload, PollReplayMapping::Legacy);
+    };
+    match map_recorded_poll_ready(recorded_targets, recorded_ready, current_targets) {
+        Some(mapped) if &mapped == recorded_ready => (payload, PollReplayMapping::SameOrder),
+        Some(mapped) => (
+            HostResponsePollResult {
+                result: Ok(mapped),
+                targets: payload.targets,
+            },
+            PollReplayMapping::Remapped,
+        ),
+        None => (payload, PollReplayMapping::TargetSetMismatch),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PollReplayMapping, map_recorded_poll_ready, replayed_poll_answer};
+    use golem_common::model::oplog::HostResponsePollResult;
+    use test_r::test;
+
+    /// Backward compatibility: an entry written before `targets` existed (decoded with
+    /// `targets: None`) replays exactly as before — positionally — even if the guest's list is
+    /// permuted (nothing to map it by).
+    #[test]
+    fn legacy_entry_without_targets_replays_positionally() {
+        let recorded = HostResponsePollResult {
+            result: Ok(vec![1]),
+            targets: None,
+        };
+        let (answer, mapping) = replayed_poll_answer(recorded.clone(), &[Some(3), Some(7)]);
+        assert_eq!(mapping, PollReplayMapping::Legacy);
+        assert_eq!(answer, recorded);
+    }
+
+    #[test]
+    fn recorded_error_is_replayed_unchanged() {
+        let recorded = HostResponsePollResult {
+            result: Err("boom".to_string()),
+            targets: Some(vec![Some(7), Some(3)]),
+        };
+        let (answer, mapping) = replayed_poll_answer(recorded.clone(), &[Some(3), Some(7)]);
+        assert_eq!(mapping, PollReplayMapping::Legacy);
+        assert_eq!(answer, recorded);
+    }
+
+    #[test]
+    fn permuted_entry_is_remapped_and_keeps_its_targets() {
+        let recorded = HostResponsePollResult {
+            result: Ok(vec![1]),
+            targets: Some(vec![Some(7), Some(3)]),
+        };
+        let (answer, mapping) = replayed_poll_answer(recorded, &[Some(3), Some(7)]);
+        assert_eq!(mapping, PollReplayMapping::Remapped);
+        assert_eq!(answer.result, Ok(vec![0]));
+        assert_eq!(answer.targets, Some(vec![Some(7), Some(3)]));
+    }
+
+    #[test]
+    fn same_order_entry_is_unchanged() {
+        let recorded = HostResponsePollResult {
+            result: Ok(vec![1]),
+            targets: Some(vec![Some(7), Some(3)]),
+        };
+        let (answer, mapping) = replayed_poll_answer(recorded.clone(), &[Some(7), Some(3)]);
+        assert_eq!(mapping, PollReplayMapping::SameOrder);
+        assert_eq!(answer, recorded);
+    }
+
+    #[test]
+    fn mismatched_target_set_falls_back_to_positional() {
+        let recorded = HostResponsePollResult {
+            result: Ok(vec![1]),
+            targets: Some(vec![Some(7), Some(3)]),
+        };
+        let (answer, mapping) = replayed_poll_answer(recorded.clone(), &[Some(3), Some(8)]);
+        assert_eq!(mapping, PollReplayMapping::TargetSetMismatch);
+        assert_eq!(answer, recorded);
+    }
+
+    /// The 2026-10-04 live failure, distilled: live recorded `poll([timer#7, response#3]) ->
+    /// [1]` (the response future); after a snapshot restore the guest's reactor builds the same
+    /// list in the opposite order. Positional replay would wake the 1e19-ns timer instead.
+    #[test]
+    fn permuted_target_list_maps_ready_set_by_identity() {
+        let recorded_targets = [Some(7), Some(3)];
+        let current_targets = [Some(3), Some(7)];
+        assert_eq!(
+            map_recorded_poll_ready(&recorded_targets, &[1], &current_targets),
+            Some(vec![0]),
+            "the response future (seq 3) must be woken, not whatever sits at live position 1"
+        );
+    }
+
+    /// Three pollables (body-write backpressure + response future + timer), rotated, with two
+    /// of them ready: each must land on its own pollable, and the answer must keep the RECORDED
+    /// order (the live wake order), not be re-sorted into current positions.
+    #[test]
+    fn three_way_permutation_keeps_live_wake_order() {
+        let recorded_targets = [Some(10), Some(11), Some(12)];
+        let current_targets = [Some(12), Some(10), Some(11)];
+        assert_eq!(
+            map_recorded_poll_ready(&recorded_targets, &[0, 2], &current_targets),
+            Some(vec![1, 0])
+        );
+    }
+
+    /// Untracked pollables (no `ready()` ever called on them, e.g. wstd's `READY_POLLABLE`) are
+    /// matched by their ordinal among the untracked ones — positional within that class.
+    #[test]
+    fn untracked_pollables_match_by_ordinal_among_untracked() {
+        let recorded_targets = [Some(4), Some(5), None];
+        let current_targets = [Some(5), Some(4), None];
+        assert_eq!(
+            map_recorded_poll_ready(&recorded_targets, &[0, 2], &current_targets),
+            Some(vec![1, 2])
+        );
+    }
+
+    /// The same pollable can appear twice in one list (two `WaitFor`s on one `AsyncPollable`):
+    /// the k-th recorded occurrence maps to the k-th current occurrence.
+    #[test]
+    fn duplicate_pollable_occurrences_map_in_order() {
+        let recorded_targets = [Some(2), Some(9), Some(2)];
+        let current_targets = [Some(9), Some(2), Some(2)];
+        assert_eq!(
+            map_recorded_poll_ready(&recorded_targets, &[0, 2], &current_targets),
+            Some(vec![1, 2])
+        );
+    }
+
+    /// A different set of pollables than recorded means replay has diverged in some other way;
+    /// no identity mapping is attempted (the caller falls back to positional).
+    #[test]
+    fn different_target_set_is_not_mapped() {
+        assert_eq!(
+            map_recorded_poll_ready(&[Some(1), Some(2)], &[1], &[Some(1), Some(8)]),
+            None
+        );
+        assert_eq!(
+            map_recorded_poll_ready(&[Some(1), Some(2)], &[1], &[Some(1)]),
+            None
+        );
+        assert_eq!(map_recorded_poll_ready(&[Some(1)], &[3], &[Some(1)]), None);
+    }
+
+    /// Unchanged order is the identity mapping.
+    #[test]
+    fn same_order_is_identity() {
+        let targets = [Some(1), None, Some(2)];
+        assert_eq!(
+            map_recorded_poll_ready(&targets, &[0, 1, 2], &targets),
+            Some(vec![0, 1, 2])
+        );
     }
 }

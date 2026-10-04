@@ -346,8 +346,19 @@ oplog_payload! {
         PollReady {
             result: Result<bool, String>
         },
-        PollResult {
-            result: Result<Vec<u32>, String>
+        // `targets` was added after oplogs had already been written with `result` alone, hence
+        // the desert evolution step: an entry persisted before it decodes with `targets: None`.
+        PollResult [desert(evolution(FieldAdded("targets", None)))] {
+            result: Result<Vec<u32>, String>,
+            /// One entry per `poll()` input pollable, in the order the guest passed them (the
+            /// order `result`'s indexes refer to): that pollable's call-order-derived logical
+            /// identity (`pollable_seq`, golem-worker-executor `durable_host/mod.rs`), or `None`
+            /// for a pollable that never went through `pollable::ready` and so has no identity.
+            /// Lets replay map the recorded ready set onto the guest's CURRENT target list by
+            /// identity instead of by position — the guest's list order is not replay-stable
+            /// (golem-worker-executor `durable_host/io/poll.rs`, `map_recorded_poll_ready`).
+            /// `None` for entries written before this field existed: replayed positionally.
+            targets: Option<Vec<Option<u32>>>
         },
         RandomBytes {
             bytes: Vec<u8>

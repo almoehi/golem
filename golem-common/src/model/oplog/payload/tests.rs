@@ -322,3 +322,59 @@ proptest! {
     }
 
 }
+
+/// `HostResponsePollResult` exactly as it was before `targets` was added — the shape every
+/// `io::poll::poll` entry in an existing oplog was serialized with.
+#[derive(Debug, Clone, PartialEq, desert_rust::BinaryCodec)]
+struct HostResponsePollResultBeforeTargets {
+    result: Result<Vec<u32>, String>,
+}
+
+#[test]
+fn poll_result_written_before_targets_existed_decodes_with_no_targets() {
+    let old = HostResponsePollResultBeforeTargets {
+        result: Ok(vec![1, 0]),
+    };
+    let bytes = desert_rust::serialize_to_byte_vec(&old).unwrap();
+    let decoded: crate::model::oplog::HostResponsePollResult =
+        desert_rust::deserialize(&bytes).unwrap();
+    assert_eq!(
+        decoded,
+        crate::model::oplog::HostResponsePollResult {
+            result: Ok(vec![1, 0]),
+            targets: None,
+        }
+    );
+}
+
+#[test]
+fn poll_result_with_targets_round_trips_through_the_host_response_enum() {
+    let response = crate::model::oplog::HostResponse::PollResult(
+        crate::model::oplog::HostResponsePollResult {
+            result: Ok(vec![1]),
+            targets: Some(vec![Some(7), None, Some(3)]),
+        },
+    );
+    let bytes = crate::serialization::serialize(&response).unwrap();
+    let decoded: crate::model::oplog::HostResponse =
+        crate::serialization::deserialize(&bytes).unwrap();
+    assert_eq!(decoded, response);
+}
+
+/// Rollback safety: a binary that predates `targets` can still decode a payload written with it
+/// (the unknown chunk is skipped), so it just replays positionally as it always did.
+#[test]
+fn poll_result_with_targets_decodes_with_the_struct_before_targets_existed() {
+    let new = crate::model::oplog::HostResponsePollResult {
+        result: Ok(vec![2]),
+        targets: Some(vec![Some(4), None, Some(9)]),
+    };
+    let bytes = desert_rust::serialize_to_byte_vec(&new).unwrap();
+    let decoded: HostResponsePollResultBeforeTargets = desert_rust::deserialize(&bytes).unwrap();
+    assert_eq!(
+        decoded,
+        HostResponsePollResultBeforeTargets {
+            result: Ok(vec![2])
+        }
+    );
+}

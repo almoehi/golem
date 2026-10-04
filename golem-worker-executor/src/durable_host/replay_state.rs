@@ -1028,6 +1028,7 @@ mod tests {
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
                 HostResponsePollResult {
                     result: Ok(vec![0]),
+                    targets: None,
                 },
             ))),
             durable_function_type: DurableFunctionType::ReadLocal,
@@ -1215,6 +1216,7 @@ mod tests {
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
                 HostResponsePollResult {
                     result: Ok(vec![0]),
+                    targets: None,
                 },
             ))),
             durable_function_type: DurableFunctionType::ReadLocal,
@@ -1666,6 +1668,7 @@ mod tests {
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
                 HostResponsePollResult {
                     result: Ok(vec![0]),
+                    targets: None,
                 },
             ))),
             durable_function_type: DurableFunctionType::ReadLocal,
@@ -1769,6 +1772,7 @@ mod tests {
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
                 HostResponsePollResult {
                     result: Ok(vec![0]),
+                    targets: None,
                 },
             ))),
             durable_function_type: DurableFunctionType::ReadLocal,
@@ -1865,6 +1869,7 @@ mod tests {
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
                 HostResponsePollResult {
                     result: Ok(vec![0]),
+                    targets: None,
                 },
             ))),
             durable_function_type: DurableFunctionType::ReadLocal,
@@ -2079,6 +2084,7 @@ mod tests {
             response: OplogPayload::Inline(Box::new(HostResponse::PollResult(
                 HostResponsePollResult {
                     result: Ok(vec![0]),
+                    targets: None,
                 },
             ))),
             durable_function_type: DurableFunctionType::ReadLocal,

@@ -431,7 +431,7 @@ async fn outgoing_http_contains_idempotency_key(
 }
 
 /// Regression test for the `io::poll::poll` replay-order bug (`durable_host/io/poll.rs`,
-/// `map_recorded_poll_ready`; GOLEM_IO_POLL_BUG.md "Fifth Bug").
+/// `map_recorded_poll_ready`).
 ///
 /// Golem used to replay a recorded `poll()` answer POSITIONALLY: the recorded ready index was
 /// handed back as-is. But a guest's target-list order need not be replay-stable — wstd's reactor

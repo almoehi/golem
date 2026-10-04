@@ -569,22 +569,22 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
         payload: HostResponsePollResult,
         current_targets: &[Option<u32>],
     ) -> HostResponsePollResult {
-        let recorded = payload.clone();
+        let recorded_ready = payload.result.clone();
         let (answer, mapping) = replayed_poll_answer(payload, current_targets);
         match mapping {
-            PollReplayMapping::Legacy | PollReplayMapping::SameOrder => {}
+            PollReplayMapping::Legacy | PollReplayMapping::Unchanged => {}
             PollReplayMapping::Remapped => debug!(
                 agent_id = %self.owned_agent_id,
-                recorded_targets = ?recorded.targets,
-                recorded_ready = ?recorded.result,
+                recorded_targets = ?answer.targets,
+                ?recorded_ready,
                 ?current_targets,
                 mapped = ?answer.result,
                 "POLLCALL_TRACE poll() REPLAY target list order differs from live, ready set remapped by identity"
             ),
             PollReplayMapping::TargetSetMismatch => warn!(
                 agent_id = %self.owned_agent_id,
-                recorded_targets = ?recorded.targets,
-                recorded_ready = ?recorded.result,
+                recorded_targets = ?answer.targets,
+                ?recorded_ready,
                 ?current_targets,
                 "POLLCALL_TRACE poll() REPLAY target set differs from live, falling back to positional ready indexes"
             ),
@@ -698,7 +698,10 @@ fn is_suspend_for_sleep<T>(result: &Result<T, wasmtime::Error>) -> Option<Durati
 /// Matching rule: the k-th recorded occurrence of an identity maps to the k-th current
 /// occurrence of the same identity. That covers a pollable listed twice (two waiters on one
 /// pollable), and matches untracked pollables by their ordinal among the untracked ones — so a
-/// list with no tracked pollable at all maps exactly positionally, as before.
+/// list with no tracked pollable at all maps exactly positionally, as before. Consequently only
+/// TRACKED pollables are protected against reordering: if a guest permutes two untracked ones,
+/// they are still matched positionally (and the multiset check cannot notice). In wstd the only
+/// untracked pollable is the reactor's single `READY_POLLABLE`, so this does not arise there.
 ///
 /// The answer keeps the RECORDED order (the order the live guest saw, and woke its waiters in),
 /// rather than being re-sorted by current position.
@@ -742,8 +745,8 @@ pub(crate) fn map_recorded_poll_ready(
 pub(crate) enum PollReplayMapping {
     /// Entry written before `targets` existed, or a recorded error: returned unchanged.
     Legacy,
-    /// Same pollables in the same order as live: unchanged.
-    SameOrder,
+    /// Identity mapping yields the recorded indexes: unchanged.
+    Unchanged,
     /// Same pollables in a different order: ready indexes translated by identity.
     Remapped,
     /// Not the same pollables as live: returned unchanged (positional — the pre-`targets`
@@ -763,7 +766,7 @@ pub(crate) fn replayed_poll_answer(
         return (payload, PollReplayMapping::Legacy);
     };
     match map_recorded_poll_ready(recorded_targets, recorded_ready, current_targets) {
-        Some(mapped) if &mapped == recorded_ready => (payload, PollReplayMapping::SameOrder),
+        Some(mapped) if &mapped == recorded_ready => (payload, PollReplayMapping::Unchanged),
         Some(mapped) => (
             HostResponsePollResult {
                 result: Ok(mapped),
@@ -825,7 +828,7 @@ mod tests {
             targets: Some(vec![Some(7), Some(3)]),
         };
         let (answer, mapping) = replayed_poll_answer(recorded.clone(), &[Some(7), Some(3)]);
-        assert_eq!(mapping, PollReplayMapping::SameOrder);
+        assert_eq!(mapping, PollReplayMapping::Unchanged);
         assert_eq!(answer, recorded);
     }
 

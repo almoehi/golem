@@ -238,6 +238,7 @@ sqlx-core = { version = "0.8" }
 strip-ansi-escapes = "0.2.0"
 strum = "0.27.1"
 strum_macros = "0.27.1"
+subtle = "2.6.1"
 syn = "2.0.90"
 synoptic = "2.2.9"
 sysinfo = "0.33.1"

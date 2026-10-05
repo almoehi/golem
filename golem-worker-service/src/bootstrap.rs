@@ -22,6 +22,7 @@ use crate::custom_api::oidc::session_store::{RedisSessionStore, SessionStore, Sq
 use crate::custom_api::oidc::{DefaultIdentityProvider, IdentityProvider};
 use crate::custom_api::request_handler::RequestHandler;
 use crate::custom_api::route_resolver::RouteResolver;
+use crate::custom_api::trusted_identity_proxy::TrustedIdentityProxy;
 use crate::custom_api::webhooks::WebhookCallbackHandler;
 use crate::mcp::{McpCapabilityLookup, RegistryServiceMcpCapabilityLookup};
 use crate::service::agent_resolution_cache::AgentResolutionCache;
@@ -29,6 +30,7 @@ use crate::service::auth::{AuthService, RemoteAuthService};
 use crate::service::component::{ComponentService, RemoteComponentService};
 use crate::service::limit::{LimitService, RemoteLimitService};
 use crate::service::worker::{WorkerClient, WorkerExecutorWorkerClient, WorkerService};
+use anyhow::Context;
 use golem_api_grpc::proto::golem::workerexecutor::v1::worker_executor_client::WorkerExecutorClient;
 use golem_common::redis::RedisPool;
 use golem_service_base::clients::registry::{GrpcRegistryService, RegistryService};
@@ -38,6 +40,7 @@ use golem_service_base::grpc::client::MultiTargetGrpcClient;
 use golem_service_base::service::routing_table::RoutingTableService;
 use std::sync::Arc;
 use tonic::codec::CompressionEncoding;
+use tracing::warn;
 
 #[derive(Clone)]
 pub struct Services {
@@ -56,6 +59,16 @@ pub struct Services {
 
 impl Services {
     pub async fn new(config: &WorkerServiceConfig) -> anyhow::Result<Self> {
+        let trusted_identity_proxy = Arc::new(
+            TrustedIdentityProxy::from_config(&config.trusted_identity_proxy)
+                .context("Invalid trusted identity proxy configuration")?,
+        );
+        if !trusted_identity_proxy.is_enabled() && config.trusted_identity_proxy.secret.is_some() {
+            warn!(
+                "A trusted identity proxy secret is configured, but the trusted identity proxy is not enabled"
+            );
+        }
+
         let registry_service_client: Arc<dyn RegistryService> =
             Arc::new(GrpcRegistryService::new(&config.registry_service));
 
@@ -173,6 +186,7 @@ impl Services {
             call_agent_handler.clone(),
             oidc_handler.clone(),
             webhook_callback_handler.clone(),
+            trusted_identity_proxy,
         ));
 
         Ok(Self {

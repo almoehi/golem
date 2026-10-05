@@ -14,6 +14,7 @@
 
 mod handler;
 mod session_store;
+mod trusted_identity_proxy;
 
 use golem_common::config::{DbSqliteConfig, RedisConfig};
 use golem_common::redis::RedisPool;

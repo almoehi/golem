@@ -54,17 +54,18 @@ pub fn apply_session_from_header_security_middleware(
         }
     })?;
 
-    request.set_authenticated_session(session.into());
+    request.set_authenticated_session(session.into_session_with_test_defaults());
 
     Ok(None)
 }
 
+/// Identity asserted in a request header, as JSON.
 #[derive(Debug, Clone, Deserialize)]
-struct EasyOidcSession {
-    #[serde(default = "EasyOidcSession::default_subject")]
-    pub subject: String,
-    #[serde(default = "EasyOidcSession::default_issuer")]
-    pub issuer: IssuerUrl,
+pub(crate) struct EasyOidcSession {
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub subject: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    pub issuer: Option<IssuerUrl>,
 
     pub email: Option<String>,
     pub name: Option<String>,
@@ -81,6 +82,15 @@ struct EasyOidcSession {
     pub issued_at: DateTime<Utc>,
     #[serde(default = "EasyOidcSession::default_expires_at")]
     pub expires_at: DateTime<Utc>,
+}
+
+/// Missing fields are `None`, but an explicit `null` stays a parse error.
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 impl EasyOidcSession {
@@ -103,30 +113,44 @@ impl EasyOidcSession {
     fn default_expires_at() -> DateTime<Utc> {
         Utc::now().checked_add_signed(TimeDelta::hours(8)).unwrap()
     }
-}
 
-impl From<EasyOidcSession> for OidcSession {
-    fn from(value: EasyOidcSession) -> Self {
-        Self {
-            subject: value.subject.clone(),
-            issuer: value.issuer.to_string(),
-            email: value.email,
-            name: value.name,
-            email_verified: value.email_verified,
-            given_name: value.given_name,
-            family_name: value.family_name,
-            picture: value.picture,
-            preferred_username: value.preferred_username,
+    /// Session for the test session header: a missing subject or issuer falls back to a
+    /// test identity.
+    pub fn into_session_with_test_defaults(mut self) -> OidcSession {
+        let subject = self.subject.take().unwrap_or_else(Self::default_subject);
+        let issuer = self.issuer.take().unwrap_or_else(Self::default_issuer);
+        self.into_session(subject, issuer)
+    }
+
+    /// Session for an identity that must be stated explicitly: `None` if the subject or
+    /// the issuer is missing or the subject is blank.
+    pub fn into_explicit_session(mut self) -> Option<OidcSession> {
+        let subject = self.subject.take().filter(|s| !s.trim().is_empty())?;
+        let issuer = self.issuer.take()?;
+        Some(self.into_session(subject, issuer))
+    }
+
+    fn into_session(self, subject: String, issuer: IssuerUrl) -> OidcSession {
+        OidcSession {
+            subject: subject.clone(),
+            issuer: issuer.to_string(),
+            email: self.email,
+            name: self.name,
+            email_verified: self.email_verified,
+            given_name: self.given_name,
+            family_name: self.family_name,
+            picture: self.picture,
+            preferred_username: self.preferred_username,
             claims: IdTokenClaims::new(
-                value.issuer,
+                issuer,
                 Vec::new(),
                 Utc::now(),
-                value.issued_at,
-                StandardClaims::new(SubjectIdentifier::new(value.subject)),
+                self.issued_at,
+                StandardClaims::new(SubjectIdentifier::new(subject)),
                 EmptyAdditionalClaims {},
             ),
-            scopes: value.scopes,
-            expires_at: value.expires_at,
+            scopes: self.scopes,
+            expires_at: self.expires_at,
         }
     }
 }

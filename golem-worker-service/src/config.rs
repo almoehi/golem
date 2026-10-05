@@ -50,6 +50,8 @@ pub struct WorkerServiceConfig {
     pub webhook_callback_handler: WebhookCallbackHandlerConfig,
     #[serde(default)]
     pub agent_resolution_cache: AgentResolutionCacheConfig,
+    #[serde(default)]
+    pub trusted_identity_proxy: TrustedIdentityProxyConfig,
 }
 
 impl WorkerServiceConfig {
@@ -141,6 +143,13 @@ impl SafeDisplay for WorkerServiceConfig {
             self.agent_resolution_cache.to_safe_string_indented()
         );
 
+        let _ = writeln!(&mut result, "trusted identity proxy:");
+        let _ = writeln!(
+            &mut result,
+            "{}",
+            self.trusted_identity_proxy.to_safe_string_indented()
+        );
+
         result
     }
 }
@@ -166,6 +175,7 @@ impl Default for WorkerServiceConfig {
             auth_service: AuthServiceConfig::default(),
             webhook_callback_handler: WebhookCallbackHandlerConfig::default(),
             agent_resolution_cache: AgentResolutionCacheConfig::default(),
+            trusted_identity_proxy: TrustedIdentityProxyConfig::default(),
         }
     }
 }
@@ -517,6 +527,82 @@ impl Default for WebhookCallbackHandlerConfig {
                 0xc9, 0x86, 0x1e, 0x41,
             ]),
         }
+    }
+}
+
+/// Lets a trusted reverse proxy assert the caller identity on custom API routes by
+/// presenting a shared secret. Disabled by default.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrustedIdentityProxyConfig {
+    pub enabled: bool,
+    /// Required when enabled, at least `TrustedProxySecret::MIN_LENGTH` bytes
+    pub secret: Option<TrustedProxySecret>,
+    /// Additionally accepted secret, to rotate `secret` without downtime
+    pub previous_secret: Option<TrustedProxySecret>,
+    /// Request header carrying the shared secret
+    pub secret_header: String,
+    /// Request header carrying the asserted identity as JSON
+    pub identity_header: String,
+}
+
+impl TrustedIdentityProxyConfig {
+    pub const DEFAULT_SECRET_HEADER: &'static str = "X-Golem-Trusted-Proxy-Secret";
+    pub const DEFAULT_IDENTITY_HEADER: &'static str = "X-Golem-Trusted-Identity";
+}
+
+impl Default for TrustedIdentityProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            secret: None,
+            previous_secret: None,
+            secret_header: Self::DEFAULT_SECRET_HEADER.to_string(),
+            identity_header: Self::DEFAULT_IDENTITY_HEADER.to_string(),
+        }
+    }
+}
+
+impl SafeDisplay for TrustedIdentityProxyConfig {
+    fn to_safe_string(&self) -> String {
+        let redacted = |secret: &Option<TrustedProxySecret>| match secret {
+            Some(_) => "*******",
+            None => "not set",
+        };
+
+        let mut result = String::new();
+        let _ = writeln!(&mut result, "enabled: {}", self.enabled);
+        let _ = writeln!(&mut result, "secret: {}", redacted(&self.secret));
+        let _ = writeln!(
+            &mut result,
+            "previous_secret: {}",
+            redacted(&self.previous_secret)
+        );
+        let _ = writeln!(&mut result, "secret_header: {}", self.secret_header);
+        let _ = writeln!(&mut result, "identity_header: {}", self.identity_header);
+        result
+    }
+}
+
+/// Shared secret of the trusted identity proxy. Never printed by `Debug`.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TrustedProxySecret(String);
+
+impl TrustedProxySecret {
+    pub const MIN_LENGTH: usize = 32;
+
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl Debug for TrustedProxySecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("*******")
     }
 }
 

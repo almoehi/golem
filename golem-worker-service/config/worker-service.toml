@@ -163,6 +163,11 @@ span_events_active = false
 span_events_full = false
 without_time = false
 
+[trusted_identity_proxy]
+enabled = false
+identity_header = "X-Golem-Trusted-Identity"
+secret_header = "X-Golem-Trusted-Proxy-Secret"
+
 [webhook_callback_handler]
 hmac_key = "K34Co4pRMDl7dB3cYB+1/N0J3tMzJWI4FyPNOsmGHkE="
 

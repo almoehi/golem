@@ -55,7 +55,7 @@ fn oidc_handler(session_store: &Arc<dyn SessionStore>) -> Arc<OidcHandler> {
 }
 
 #[derive(Clone)]
-struct FakeIdentityProvider;
+pub struct FakeIdentityProvider;
 
 #[async_trait::async_trait]
 impl IdentityProvider for FakeIdentityProvider {
@@ -122,7 +122,7 @@ impl IdentityProvider for FakeIdentityProvider {
     }
 }
 
-fn sample_security_scheme() -> Arc<SecuritySchemeDetails> {
+pub fn sample_security_scheme() -> Arc<SecuritySchemeDetails> {
     Arc::new(SecuritySchemeDetails {
         id: SecuritySchemeId::new(),
         name: SecuritySchemeName("my-scheme".to_string()),

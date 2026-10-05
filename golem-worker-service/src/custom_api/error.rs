@@ -69,6 +69,8 @@ pub enum RequestHandlerError {
     AgentInvocationFailed(#[from] WorkerServiceError),
     #[error("OIDC loging state is associated with a different security scheme")]
     OidcSchemeMismatch,
+    #[error("Trusted identity proxy authentication failed: {reason}")]
+    TrustedIdentityRejected { reason: &'static str },
     #[error(transparent)]
     InternalError(#[from] anyhow::Error),
 }
@@ -97,6 +99,7 @@ impl SafeDisplay for RequestHandlerError {
             Self::UnknownOidcState => self.to_string(),
             Self::OidcTokenExchangeFailed => self.to_string(),
             Self::OidcSchemeMismatch => self.to_string(),
+            Self::TrustedIdentityRejected { .. } => self.to_string(),
             Self::OpenApiSpecGenerationFailed { .. } => self.to_string(),
 
             Self::InvariantViolated { .. } => "internal error".to_string(),

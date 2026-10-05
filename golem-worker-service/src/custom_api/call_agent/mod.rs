@@ -61,7 +61,7 @@ impl CallAgentHandler {
             .await?;
 
         let method_params =
-            self.resolve_method_arguments(resolved_route, request, behaviour, parsed_body)?;
+            Self::resolve_method_arguments(resolved_route, request, behaviour, parsed_body)?;
 
         debug!("Invoking agent {agent_id}");
 
@@ -158,8 +158,9 @@ impl CallAgentHandler {
         })
     }
 
-    fn resolve_method_arguments(
-        &self,
+    /// Binds the request to the parameters of the agent method. Everything returned here is
+    /// passed to the agent and recorded in its oplog.
+    pub fn resolve_method_arguments(
         resolved_route: &ResolvedRouteEntry,
         request: &RichRequest,
         behaviour: &CallAgentBehaviour,
@@ -280,7 +281,9 @@ impl CallAgentHandler {
     }
 }
 
-fn principal_from_request(request: &RichRequest) -> Result<Principal, RequestHandlerError> {
+/// The principal an agent sees for the request: the authenticated session as an OIDC
+/// principal, whichever security middleware established it.
+pub fn principal_from_request(request: &RichRequest) -> Result<Principal, RequestHandlerError> {
     match request.authenticated_session() {
         Some(session) => Ok(Principal::Oidc(OidcPrincipal {
             sub: session.subject.clone(),

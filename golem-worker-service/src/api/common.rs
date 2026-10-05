@@ -454,6 +454,10 @@ impl From<RequestHandlerError> for ApiEndpointError {
                 Self::not_found(api::error_code::ROUTE_NOT_FOUND, value)
             }
 
+            RequestHandlerError::TrustedIdentityRejected { .. } => {
+                Self::unauthorized(api::error_code::AUTH_UNAUTHORIZED, value)
+            }
+
             RequestHandlerError::OidcTokenExchangeFailed => {
                 Self::forbidden(api::error_code::OIDC_TOKEN_EXCHANGE_FAILED, value)
             }

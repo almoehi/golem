@@ -24,6 +24,7 @@ pub mod request_handler;
 mod rich_request;
 pub mod route_resolver;
 mod session_from_header_security;
+pub mod trusted_identity_proxy;
 pub mod webhooks;
 
 use self::poem_endpoint::CustomApiPoemEndpoint;

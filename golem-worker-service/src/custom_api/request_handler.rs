@@ -19,6 +19,10 @@ use super::model::RichRouteBehaviour;
 use super::oidc::handler::OidcHandler;
 use super::route_resolver::{ResolvedRouteEntry, RouteResolver};
 use super::session_from_header_security::apply_session_from_header_security_middleware;
+use super::trusted_identity_proxy::{
+    TrustedIdentityProxy, TrustedProxyAuthentication, TrustedProxyCredentials,
+    apply_trusted_identity_proxy_middleware,
+};
 use super::webhooks::WebhookCallbackHandler;
 use super::{OidcCallbackBehaviour, ResponseBody, RouteExecutionResult};
 use crate::custom_api::RichRequest;
@@ -37,6 +41,7 @@ pub struct RequestHandler {
     call_agent_handler: Arc<CallAgentHandler>,
     oidc_handler: Arc<OidcHandler>,
     webhook_callback_handler: Arc<WebhookCallbackHandler>,
+    trusted_identity_proxy: Arc<TrustedIdentityProxy>,
 }
 
 #[allow(irrefutable_let_patterns)]
@@ -46,23 +51,34 @@ impl RequestHandler {
         call_agent_handler: Arc<CallAgentHandler>,
         oidc_handler: Arc<OidcHandler>,
         webhook_callback_handler: Arc<WebhookCallbackHandler>,
+        trusted_identity_proxy: Arc<TrustedIdentityProxy>,
     ) -> Self {
         Self {
             route_resolver,
             call_agent_handler,
             oidc_handler,
             webhook_callback_handler,
+            trusted_identity_proxy,
         }
     }
 
-    pub async fn handle_request(&self, request: Request) -> Result<Response, RequestHandlerError> {
+    pub async fn handle_request(
+        &self,
+        mut request: Request,
+    ) -> Result<Response, RequestHandlerError> {
+        // Must stay the first step: the trusted identity proxy headers are removed before the
+        // request is logged, routed, traced or bound to agent parameters.
+        let trusted_proxy_credentials = self
+            .trusted_identity_proxy
+            .take_credentials(request.headers_mut());
+
         debug!("Begin http request handling for request {request:?}");
 
         let matching_route = self.route_resolver.resolve_matching_route(&request).await?;
         let mut request = RichRequest::new(request);
 
         let execution_result = self
-            .execute_route_and_middlewares(&mut request, &matching_route)
+            .execute_route_and_middlewares(&mut request, &matching_route, trusted_proxy_credentials)
             .instrument(tracing::span!(
                 tracing::Level::INFO,
                 "handle_route",
@@ -81,17 +97,15 @@ impl RequestHandler {
         &self,
         request: &mut RichRequest,
         resolved_route: &ResolvedRouteEntry,
+        trusted_proxy_credentials: TrustedProxyCredentials,
     ) -> Result<RouteExecutionResult, RequestHandlerError> {
-        if let Some(short_circuit) = self
-            .oidc_handler
-            .apply_oidc_incoming_middleware(request, resolved_route)
-            .await?
-        {
-            return Ok(short_circuit);
-        }
-
-        if let Some(short_circuit) =
-            apply_session_from_header_security_middleware(request, resolved_route)?
+        if let Some(short_circuit) = apply_incoming_security_middlewares(
+            &self.oidc_handler,
+            request,
+            resolved_route,
+            trusted_proxy_credentials,
+        )
+        .await?
         {
             return Ok(short_circuit);
         }
@@ -148,6 +162,37 @@ impl RequestHandler {
             }
         }
     }
+}
+
+/// Authenticates the request as required by the security of the route. Returns a response
+/// to short circuit with, or `None` once the route may be executed.
+///
+/// An identity asserted by the trusted identity proxy takes precedence over the session
+/// cookie of security scheme routes: such a request never starts or consults an OIDC session.
+pub async fn apply_incoming_security_middlewares(
+    oidc_handler: &OidcHandler,
+    request: &mut RichRequest,
+    resolved_route: &ResolvedRouteEntry,
+    trusted_proxy_credentials: TrustedProxyCredentials,
+) -> Result<Option<RouteExecutionResult>, RequestHandlerError> {
+    let trusted_proxy_authentication = apply_trusted_identity_proxy_middleware(
+        request,
+        resolved_route,
+        trusted_proxy_credentials,
+    )?;
+
+    if trusted_proxy_authentication == TrustedProxyAuthentication::Authenticated {
+        return Ok(None);
+    }
+
+    if let Some(short_circuit) = oidc_handler
+        .apply_oidc_incoming_middleware(request, resolved_route)
+        .await?
+    {
+        return Ok(Some(short_circuit));
+    }
+
+    apply_session_from_header_security_middleware(request, resolved_route)
 }
 
 fn route_execution_result_to_response(

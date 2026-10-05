@@ -164,6 +164,7 @@ span_events_full = false
 without_time = false
 
 [trusted_identity_proxy]
+allowed_issuers = []
 enabled = false
 identity_header = "X-Golem-Trusted-Identity"
 secret_header = "X-Golem-Trusted-Proxy-Secret"

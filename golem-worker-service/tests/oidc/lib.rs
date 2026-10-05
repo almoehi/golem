@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod handler;
+mod request_handler;
 mod session_store;
 mod trusted_identity_proxy;
 

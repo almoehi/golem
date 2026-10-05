@@ -15,6 +15,8 @@
 use crate::handler::{FakeIdentityProvider, sample_security_scheme};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
+use figment::Figment;
+use figment::providers::Serialized;
 use golem_common::SafeDisplay;
 use golem_common::model::agent::{
     AgentTypeName, DataSchema, NamedElementSchemas, Principal, UntypedElementValue,
@@ -52,16 +54,17 @@ use std::sync::{Arc, Mutex};
 use test_r::test;
 use uuid::Uuid;
 
-const SECRET: &str = "trusted-proxy-secret-0123456789abcdef";
-const WRONG_SECRET: &str = "trusted-proxy-secret-0123456789abcdeX";
-const SECRET_HEADER: &str = TrustedIdentityProxyConfig::DEFAULT_SECRET_HEADER;
-const IDENTITY_HEADER: &str = TrustedIdentityProxyConfig::DEFAULT_IDENTITY_HEADER;
+pub const SECRET: &str = "trusted-proxy-secret-0123456789abcdef";
+pub const WRONG_SECRET: &str = "trusted-proxy-secret-0123456789abcdeX";
+pub const SECRET_HEADER: &str = TrustedIdentityProxyConfig::DEFAULT_SECRET_HEADER;
+pub const IDENTITY_HEADER: &str = TrustedIdentityProxyConfig::DEFAULT_IDENTITY_HEADER;
 const ROUTE_SESSION_HEADER: &str = "X-Test-Session";
-const IDENTITY: &str = r#"{"subject":"api-key-user","issuer":"https://keys.example.com","email":"robot@example.com","email_verified":true,"name":"Robot"}"#;
+pub const ISSUER: &str = "https://keys.example.com";
+pub const IDENTITY: &str = r#"{"subject":"api-key-user","issuer":"https://keys.example.com","email":"robot@example.com","email_verified":true,"name":"Robot"}"#;
 
 /// Session store that counts every access, so tests can prove the store was not touched.
 #[derive(Default)]
-struct RecordingSessionStore {
+pub struct RecordingSessionStore {
     pending_logins: Mutex<HashMap<String, PendingOidcLogin>>,
     sessions: Mutex<HashMap<Uuid, OidcSession>>,
     accesses: Mutex<usize>,
@@ -72,7 +75,7 @@ impl RecordingSessionStore {
         *self.accesses.lock().unwrap() += 1;
     }
 
-    fn accesses(&self) -> usize {
+    pub fn accesses(&self) -> usize {
         *self.accesses.lock().unwrap()
     }
 
@@ -159,7 +162,7 @@ impl SessionStore for RecordingSessionStore {
 
 /// The gateway as far as authentication is concerned: the trusted identity proxy, the OIDC
 /// handler and the session store behind it.
-struct Gateway {
+pub struct Gateway {
     proxy: TrustedIdentityProxy,
     store: Arc<RecordingSessionStore>,
     oidc_handler: OidcHandler,
@@ -189,8 +192,8 @@ impl Gateway {
         Self::new(&enabled_config())
     }
 
-    /// Mirrors `RequestHandler::handle_request`: the credentials are taken off the raw
-    /// request first, then the security middlewares run.
+    /// The two steps `RequestHandler::handle_request` takes before executing a route: its
+    /// own first step, then its security middlewares.
     async fn authenticate(
         &self,
         route: &ResolvedRouteEntry,
@@ -200,12 +203,11 @@ impl Gateway {
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
-        let mut request = request.finish();
 
-        let credentials = self.proxy.take_credentials(request.headers_mut());
-        let mut request = RichRequest::new(request);
+        let (mut request, credentials) = self.proxy.strip_and_wrap(request.finish());
 
         let result = apply_incoming_security_middlewares(
+            &self.proxy,
             &self.oidc_handler,
             &mut request,
             route,
@@ -278,10 +280,11 @@ impl Authenticated {
     }
 }
 
-fn enabled_config() -> TrustedIdentityProxyConfig {
+pub fn enabled_config() -> TrustedIdentityProxyConfig {
     TrustedIdentityProxyConfig {
         enabled: true,
         secret: Some(TrustedProxySecret::new(SECRET)),
+        allowed_issuers: vec![ISSUER.to_string()],
         ..Default::default()
     }
 }
@@ -713,29 +716,39 @@ async fn wrong_secret_does_not_fall_back_to_cookie_session() {
 
 // --- enabled, session-from-header route ---
 
+const ROUTE_SESSION: &str = r#"{"subject":"client-chosen","issuer":"https://keys.example.com"}"#;
+
 #[test]
-async fn session_header_without_secret_is_unauthorized() {
+async fn session_route_without_secret_is_unauthorized() {
     let gateway = Gateway::enabled();
 
-    gateway
-        .authenticate(
-            &session_from_header_route(),
-            &[(ROUTE_SESSION_HEADER, r#"{"subject":"dev-user"}"#)],
-        )
-        .await
-        .assert_unauthorized()
-        .await;
+    for headers in [
+        vec![],
+        vec![(ROUTE_SESSION_HEADER, ROUTE_SESSION)],
+        vec![(IDENTITY_HEADER, IDENTITY)],
+        vec![
+            (ROUTE_SESSION_HEADER, ROUTE_SESSION),
+            (IDENTITY_HEADER, IDENTITY),
+        ],
+    ] {
+        gateway
+            .authenticate(&session_from_header_route(), &headers)
+            .await
+            .assert_unauthorized()
+            .await;
+    }
 }
 
 #[test]
-async fn session_header_with_wrong_secret_is_unauthorized() {
+async fn session_route_with_wrong_secret_is_unauthorized() {
     let gateway = Gateway::enabled();
 
     gateway
         .authenticate(
             &session_from_header_route(),
             &[
-                (ROUTE_SESSION_HEADER, r#"{"subject":"dev-user"}"#),
+                (ROUTE_SESSION_HEADER, ROUTE_SESSION),
+                (IDENTITY_HEADER, IDENTITY),
                 (SECRET_HEADER, WRONG_SECRET),
             ],
         )
@@ -745,21 +758,173 @@ async fn session_header_with_wrong_secret_is_unauthorized() {
 }
 
 #[test]
-async fn session_header_with_secret_is_accepted() {
+async fn session_route_takes_the_identity_from_the_identity_header_only() {
     let gateway = Gateway::enabled();
+    let route = session_from_header_route();
 
     let authenticated = gateway
         .authenticate(
-            &session_from_header_route(),
+            &route,
             &[
-                (ROUTE_SESSION_HEADER, r#"{"subject":"dev-user"}"#),
+                (ROUTE_SESSION_HEADER, ROUTE_SESSION),
                 (SECRET_HEADER, SECRET),
+                (IDENTITY_HEADER, IDENTITY),
             ],
         )
         .await;
 
-    authenticated.assert_passed_as("dev-user");
-    assert!(!authenticated.request.headers().contains_key(SECRET_HEADER));
+    authenticated.assert_passed_as("api-key-user");
+
+    // the route's own header is gone: it cannot be bound to an agent parameter either
+    for header in [ROUTE_SESSION_HEADER, SECRET_HEADER, IDENTITY_HEADER] {
+        assert!(!authenticated.request.headers().contains_key(header));
+        assert_eq!(
+            CallAgentHandler::resolve_method_arguments(
+                &route,
+                &authenticated.request,
+                &call_agent_behaviour(header, optional_string()),
+                ParsedRequestBody::Unused,
+            )
+            .unwrap(),
+            vec![UntypedElementValue::ComponentModel(
+                golem_wasm::Value::Option(None)
+            )]
+        );
+    }
+}
+
+#[test]
+async fn session_route_with_secret_but_only_its_own_header_is_unauthorized() {
+    let gateway = Gateway::enabled();
+
+    for route_session in [ROUTE_SESSION, "{}", r#"{"subject":"dev-user"}"#] {
+        let authenticated = gateway
+            .authenticate(
+                &session_from_header_route(),
+                &[
+                    (ROUTE_SESSION_HEADER, route_session),
+                    (SECRET_HEADER, SECRET),
+                ],
+            )
+            .await;
+
+        assert!(
+            !authenticated
+                .request
+                .headers()
+                .contains_key(ROUTE_SESSION_HEADER)
+        );
+        authenticated.assert_unauthorized().await;
+    }
+}
+
+#[test]
+async fn session_route_never_defaults_the_identity() {
+    let gateway = Gateway::enabled();
+
+    for identity in [
+        "{}",
+        r#"{"subject":"dev-user"}"#,
+        r#"{"issuer":"https://keys.example.com"}"#,
+    ] {
+        gateway
+            .authenticate(
+                &session_from_header_route(),
+                &[(SECRET_HEADER, SECRET), (IDENTITY_HEADER, identity)],
+            )
+            .await
+            .assert_unauthorized()
+            .await;
+    }
+}
+
+#[test]
+async fn session_route_with_repeated_headers_is_unauthorized() {
+    let gateway = Gateway::enabled();
+
+    for headers in [
+        vec![
+            (SECRET_HEADER, SECRET),
+            (SECRET_HEADER, SECRET),
+            (IDENTITY_HEADER, IDENTITY),
+        ],
+        vec![
+            (SECRET_HEADER, SECRET),
+            (IDENTITY_HEADER, IDENTITY),
+            (IDENTITY_HEADER, IDENTITY),
+        ],
+    ] {
+        gateway
+            .authenticate(&session_from_header_route(), &headers)
+            .await
+            .assert_unauthorized()
+            .await;
+    }
+}
+
+// --- enabled, identity rules ---
+
+#[test]
+async fn issuer_outside_the_allowed_list_is_unauthorized() {
+    let gateway = Gateway::enabled();
+
+    for route in [oidc_route(), session_from_header_route()] {
+        for issuer in [
+            "https://issuer.example",
+            "https://keys.example.com/",
+            "https://keys.example.com/other",
+            "http://keys.example.com",
+        ] {
+            let identity = format!(r#"{{"subject":"api-key-user","issuer":"{issuer}"}}"#);
+            gateway
+                .authenticate(
+                    &route,
+                    &[(SECRET_HEADER, SECRET), (IDENTITY_HEADER, &identity)],
+                )
+                .await
+                .assert_unauthorized()
+                .await;
+        }
+    }
+}
+
+#[test]
+async fn identities_that_could_collide_or_never_expire_are_unauthorized() {
+    let gateway = Gateway::enabled();
+    let far_future = (Utc::now() + TimeDelta::hours(25)).to_rfc3339();
+    let with = |extra: &str| {
+        format!(r#"{{"subject":"api-key-user","issuer":"https://keys.example.com",{extra}}}"#)
+    };
+
+    let rejected = [
+        // separators inside subject or issuer
+        r#"{"subject":"api-key\nuser","issuer":"https://keys.example.com"}"#.to_string(),
+        r#"{"subject":"api-key-user\t","issuer":"https://keys.example.com"}"#.to_string(),
+        r#"{"subject":"api-key-user","issuer":"https://keys.example.com\n"}"#.to_string(),
+        r#"{"subject":"api-key-user","issuer":"https://keys.exa\nmple.com"}"#.to_string(),
+        // not an http(s) URL
+        r#"{"subject":"api-key-user","issuer":"foo:bar"}"#.to_string(),
+        // unknown fields
+        with(r#""exp":1"#),
+        with(r#""expiresAt":"2020-01-01T00:00:00Z""#),
+        // numeric and far-future time stamps
+        with(r#""expires_at":1893456000"#),
+        with(&format!(r#""expires_at":"{far_future}""#)),
+        with(&format!(r#""issued_at":"{far_future}""#)),
+    ];
+
+    for identity in rejected {
+        gateway
+            .authenticate(
+                &oidc_route(),
+                &[(SECRET_HEADER, SECRET), (IDENTITY_HEADER, &identity)],
+            )
+            .await
+            .assert_unauthorized()
+            .await;
+    }
+
+    assert_eq!(gateway.store.accesses(), 0);
 }
 
 // --- enabled, route without security ---
@@ -887,21 +1052,124 @@ fn secret_is_not_printed() {
     }
 }
 
+/// The section as the service reads it from `GOLEM__TRUSTED_IDENTITY_PROXY__<KEY>` variables:
+/// figment infers a type from the text of every environment variable, which is reproduced
+/// here by parsing each raw value the same way instead of touching the process environment.
+fn config_from_env(vars: &[(&str, &str)]) -> Result<TrustedIdentityProxyConfig, figment::Error> {
+    let mut figment = Figment::from(Serialized::defaults(WorkerServiceConfig::default()));
+    for (key, raw) in vars {
+        let value: figment::value::Value = raw.parse().expect("infallible");
+        figment = figment.merge((
+            format!("trusted_identity_proxy.{}", key.to_lowercase()),
+            value,
+        ));
+    }
+    figment
+        .extract::<WorkerServiceConfig>()
+        .map(|config| config.trusted_identity_proxy)
+}
+
 #[test]
-fn config_is_read_from_environment_shaped_values() {
-    let config: TrustedIdentityProxyConfig = serde_json::from_value(serde_json::json!({
-        "enabled": true,
-        "secret": SECRET,
-        "secret_header": "X-Proxy-Secret",
-        "identity_header": "X-Proxy-Identity",
-    }))
+fn whole_section_round_trips_through_environment_values() {
+    let config = config_from_env(&[
+        ("ENABLED", "true"),
+        ("SECRET", SECRET),
+        ("PREVIOUS_SECRET", WRONG_SECRET),
+        ("SECRET_HEADER", "X-Proxy-Secret"),
+        ("IDENTITY_HEADER", "X-Proxy-Identity"),
+        (
+            "ALLOWED_ISSUERS",
+            r#"["https://keys.example.com","https://other.example.com/tenant"]"#,
+        ),
+    ])
     .unwrap();
 
     assert!(config.enabled);
-    assert!(config.previous_secret.is_none());
+    assert_eq!(config.secret.as_ref().unwrap().expose(), SECRET.as_bytes());
+    assert_eq!(
+        config.previous_secret.as_ref().unwrap().expose(),
+        WRONG_SECRET.as_bytes()
+    );
+    assert_eq!(config.secret_header, "X-Proxy-Secret");
+    assert_eq!(config.identity_header, "X-Proxy-Identity");
+    assert_eq!(
+        config.allowed_issuers,
+        vec![
+            "https://keys.example.com",
+            "https://other.example.com/tenant"
+        ]
+    );
     assert!(
         TrustedIdentityProxy::from_config(&config)
             .unwrap()
             .is_enabled()
     );
+}
+
+#[test]
+fn allowed_issuers_environment_forms() {
+    let expected = vec![
+        "https://keys.example.com",
+        "https://other.example.com/tenant",
+    ];
+
+    for raw in [
+        r#"["https://keys.example.com","https://other.example.com/tenant"]"#,
+        r#"["https://keys.example.com", "https://other.example.com/tenant"]"#,
+        "https://keys.example.com,https://other.example.com/tenant",
+        "https://keys.example.com, https://other.example.com/tenant",
+    ] {
+        let config = config_from_env(&[("ALLOWED_ISSUERS", raw)]).unwrap();
+        assert_eq!(config.allowed_issuers, expected, "{raw}");
+    }
+
+    let single = config_from_env(&[("ALLOWED_ISSUERS", "https://keys.example.com")]).unwrap();
+    assert_eq!(single.allowed_issuers, vec!["https://keys.example.com"]);
+}
+
+#[test]
+fn secret_that_reads_as_number_or_boolean_is_refused_without_being_echoed() {
+    // What figment reads as something other than a string: integers that fit a machine
+    // word, anything with a `.` that parses as a float, and the two booleans.
+    for raw in [
+        "1234567890123456789",
+        "-123456789012345678",
+        "123456789012345678901234567890.5",
+        "1234567890123456789012345678901234567890.0",
+        "true",
+        "false",
+    ] {
+        let error = match config_from_env(&[("ENABLED", "true"), ("SECRET", raw)]) {
+            Ok(_) => panic!("{raw} was read as a string"),
+            Err(error) => error,
+        };
+        let message = format!("{error} / {error:?}");
+        assert!(message.contains("must be a string"), "{message}");
+        if raw.len() > 5 {
+            assert!(!message.contains(raw), "{message}");
+            assert!(!message.contains(&raw[..6]), "{message}");
+        }
+    }
+
+    // Longer all-digit values are not inferred as numbers: they stay strings, as do quoted
+    // values and everything containing a letter.
+    for (raw, secret) in [
+        (
+            "12345678901234567890123456789012",
+            "12345678901234567890123456789012",
+        ),
+        (
+            r#""12345678901234567890123456789012""#,
+            "12345678901234567890123456789012",
+        ),
+        (r#""1234567890.5""#, "1234567890.5"),
+        (SECRET, SECRET),
+        (
+            "K34Co4pRMDl7dB3cYB+1/N0J3tMzJWI4FyPNOsmGHkE=",
+            "K34Co4pRMDl7dB3cYB+1/N0J3tMzJWI4FyPNOsmGHkE=",
+        ),
+    ] {
+        let config = config_from_env(&[("SECRET", raw)]).unwrap();
+        assert_eq!(config.secret.unwrap().expose(), secret.as_bytes(), "{raw}");
+    }
 }

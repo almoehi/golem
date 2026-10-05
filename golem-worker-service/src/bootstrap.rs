@@ -40,7 +40,6 @@ use golem_service_base::grpc::client::MultiTargetGrpcClient;
 use golem_service_base::service::routing_table::RoutingTableService;
 use std::sync::Arc;
 use tonic::codec::CompressionEncoding;
-use tracing::warn;
 
 #[derive(Clone)]
 pub struct Services {
@@ -63,11 +62,6 @@ impl Services {
             TrustedIdentityProxy::from_config(&config.trusted_identity_proxy)
                 .context("Invalid trusted identity proxy configuration")?,
         );
-        if !trusted_identity_proxy.is_enabled() && config.trusted_identity_proxy.secret.is_some() {
-            warn!(
-                "A trusted identity proxy secret is configured, but the trusted identity proxy is not enabled"
-            );
-        }
 
         let registry_service_client: Arc<dyn RegistryService> =
             Arc::new(GrpcRegistryService::new(&config.registry_service));

@@ -531,7 +531,7 @@ impl Default for WebhookCallbackHandlerConfig {
 }
 
 /// Lets a trusted reverse proxy assert the caller identity on custom API routes by
-/// presenting a shared secret. Disabled by default.
+/// presenting a shared secret. Disabled by default; every other setting requires `enabled`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrustedIdentityProxyConfig {
     pub enabled: bool,
@@ -543,6 +543,10 @@ pub struct TrustedIdentityProxyConfig {
     pub secret_header: String,
     /// Request header carrying the asserted identity as JSON
     pub identity_header: String,
+    /// The only issuers an asserted identity may name (exact match). Must not be empty when
+    /// enabled, and must not contain the issuer of an identity provider used for logins.
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    pub allowed_issuers: Vec<String>,
 }
 
 impl TrustedIdentityProxyConfig {
@@ -558,6 +562,7 @@ impl Default for TrustedIdentityProxyConfig {
             previous_secret: None,
             secret_header: Self::DEFAULT_SECRET_HEADER.to_string(),
             identity_header: Self::DEFAULT_IDENTITY_HEADER.to_string(),
+            allowed_issuers: Vec::new(),
         }
     }
 }
@@ -579,14 +584,103 @@ impl SafeDisplay for TrustedIdentityProxyConfig {
         );
         let _ = writeln!(&mut result, "secret_header: {}", self.secret_header);
         let _ = writeln!(&mut result, "identity_header: {}", self.identity_header);
+        let _ = writeln!(
+            &mut result,
+            "allowed_issuers: {}",
+            self.allowed_issuers.join(", ")
+        );
         result
     }
 }
 
-/// Shared secret of the trusted identity proxy. Never printed by `Debug`.
-#[derive(Clone, Serialize, Deserialize)]
+/// Accepts a list of strings or one comma separated string, which is what an environment
+/// variable holding plain URLs is read as.
+fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringList {
+        Separated(String),
+        List(Vec<String>),
+    }
+
+    Ok(match StringList::deserialize(deserializer)? {
+        StringList::List(items) => items,
+        StringList::Separated(items) => items
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(String::from)
+            .collect(),
+    })
+}
+
+/// Shared secret of the trusted identity proxy. Never printed by `Debug`, and a value of
+/// the wrong type is rejected without being echoed in the error.
+#[derive(Clone, Serialize)]
 #[serde(transparent)]
 pub struct TrustedProxySecret(String);
+
+impl<'de> Deserialize<'de> for TrustedProxySecret {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SecretVisitor;
+
+        // An environment variable holding only digits, or `true`/`false`, is read as a number
+        // or a boolean. The default serde error for that would print the value.
+        fn not_a_string<T, E: serde::de::Error>() -> Result<T, E> {
+            Err(E::custom(
+                "the secret must be a string: quote it or use a value containing letters",
+            ))
+        }
+
+        impl serde::de::Visitor<'_> for SecretVisitor {
+            type Value = TrustedProxySecret;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(TrustedProxySecret(value.to_string()))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                not_a_string()
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                not_a_string()
+            }
+
+            fn visit_i128<E: serde::de::Error>(self, _: i128) -> Result<Self::Value, E> {
+                not_a_string()
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                not_a_string()
+            }
+
+            fn visit_u128<E: serde::de::Error>(self, _: u128) -> Result<Self::Value, E> {
+                not_a_string()
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                not_a_string()
+            }
+
+            fn visit_char<E: serde::de::Error>(self, _: char) -> Result<Self::Value, E> {
+                not_a_string()
+            }
+        }
+
+        deserializer.deserialize_any(SecretVisitor)
+    }
+}
 
 impl TrustedProxySecret {
     pub const MIN_LENGTH: usize = 32;

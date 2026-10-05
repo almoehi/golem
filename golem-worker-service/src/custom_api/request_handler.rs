@@ -21,7 +21,6 @@ use super::route_resolver::{ResolvedRouteEntry, RouteResolver};
 use super::session_from_header_security::apply_session_from_header_security_middleware;
 use super::trusted_identity_proxy::{
     TrustedIdentityProxy, TrustedProxyAuthentication, TrustedProxyCredentials,
-    apply_trusted_identity_proxy_middleware,
 };
 use super::webhooks::WebhookCallbackHandler;
 use super::{OidcCallbackBehaviour, ResponseBody, RouteExecutionResult};
@@ -62,20 +61,21 @@ impl RequestHandler {
         }
     }
 
-    pub async fn handle_request(
-        &self,
-        mut request: Request,
-    ) -> Result<Response, RequestHandlerError> {
+    pub async fn handle_request(&self, request: Request) -> Result<Response, RequestHandlerError> {
         // Must stay the first step: the trusted identity proxy headers are removed before the
         // request is logged, routed, traced or bound to agent parameters.
-        let trusted_proxy_credentials = self
-            .trusted_identity_proxy
-            .take_credentials(request.headers_mut());
+        let (mut request, trusted_proxy_credentials) =
+            self.trusted_identity_proxy.strip_and_wrap(request);
 
-        debug!("Begin http request handling for request {request:?}");
+        debug!(
+            "Begin http request handling for request {:?}",
+            request.underlying
+        );
 
-        let matching_route = self.route_resolver.resolve_matching_route(&request).await?;
-        let mut request = RichRequest::new(request);
+        let matching_route = self
+            .route_resolver
+            .resolve_matching_route(&request.underlying)
+            .await?;
 
         let execution_result = self
             .execute_route_and_middlewares(&mut request, &matching_route, trusted_proxy_credentials)
@@ -100,6 +100,7 @@ impl RequestHandler {
         trusted_proxy_credentials: TrustedProxyCredentials,
     ) -> Result<RouteExecutionResult, RequestHandlerError> {
         if let Some(short_circuit) = apply_incoming_security_middlewares(
+            &self.trusted_identity_proxy,
             &self.oidc_handler,
             request,
             resolved_route,
@@ -167,15 +168,17 @@ impl RequestHandler {
 /// Authenticates the request as required by the security of the route. Returns a response
 /// to short circuit with, or `None` once the route may be executed.
 ///
-/// An identity asserted by the trusted identity proxy takes precedence over the session
-/// cookie of security scheme routes: such a request never starts or consults an OIDC session.
+/// An identity asserted by the trusted identity proxy replaces the regular authentication of
+/// the route: such a request never starts or consults an OIDC session, and never reads the
+/// session header of the route.
 pub async fn apply_incoming_security_middlewares(
+    trusted_identity_proxy: &TrustedIdentityProxy,
     oidc_handler: &OidcHandler,
     request: &mut RichRequest,
     resolved_route: &ResolvedRouteEntry,
     trusted_proxy_credentials: TrustedProxyCredentials,
 ) -> Result<Option<RouteExecutionResult>, RequestHandlerError> {
-    let trusted_proxy_authentication = apply_trusted_identity_proxy_middleware(
+    let trusted_proxy_authentication = trusted_identity_proxy.apply_incoming_middleware(
         request,
         resolved_route,
         trusted_proxy_credentials,

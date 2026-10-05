@@ -470,20 +470,25 @@ fn worker_service_config(
     })
 }
 
+const TRUSTED_IDENTITY_PROXY_ENABLED_ENV: &str = "GOLEM_TRUSTED_IDENTITY_PROXY_ENABLED";
 const TRUSTED_IDENTITY_PROXY_SECRET_ENV: &str = "GOLEM_TRUSTED_IDENTITY_PROXY_SECRET";
 const TRUSTED_IDENTITY_PROXY_PREVIOUS_SECRET_ENV: &str =
     "GOLEM_TRUSTED_IDENTITY_PROXY_PREVIOUS_SECRET";
 const TRUSTED_IDENTITY_PROXY_SECRET_HEADER_ENV: &str = "GOLEM_TRUSTED_IDENTITY_PROXY_SECRET_HEADER";
 const TRUSTED_IDENTITY_PROXY_IDENTITY_HEADER_ENV: &str =
     "GOLEM_TRUSTED_IDENTITY_PROXY_IDENTITY_HEADER";
+const TRUSTED_IDENTITY_PROXY_ALLOWED_ISSUERS_ENV: &str =
+    "GOLEM_TRUSTED_IDENTITY_PROXY_ALLOWED_ISSUERS";
 
-/// The trusted identity proxy of the custom request gateway is enabled by setting
-/// `GOLEM_TRUSTED_IDENTITY_PROXY_SECRET`; unset or empty variables keep the defaults.
+/// Maps the `GOLEM_TRUSTED_IDENTITY_PROXY_*` variables one to one onto the worker service's
+/// trusted identity proxy settings. Nothing is interpreted here: a variable that is present,
+/// even if empty, is a setting, and the worker service applies the same rule as for its own
+/// configuration (the feature is on exactly when `ENABLED` is `true`, any other setting
+/// without it is refused at startup).
 fn trusted_identity_proxy_config(
     env_var: impl Fn(&str) -> Result<String, std::env::VarError>,
 ) -> anyhow::Result<TrustedIdentityProxyConfig> {
-    let non_empty = |name: &str| match env_var(name) {
-        Ok(value) if value.is_empty() => Ok(None),
+    let var = |name: &str| match env_var(name) {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => {
@@ -491,18 +496,33 @@ fn trusted_identity_proxy_config(
         }
     };
 
+    let enabled = match var(TRUSTED_IDENTITY_PROXY_ENABLED_ENV)?.as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => anyhow::bail!("{TRUSTED_IDENTITY_PROXY_ENABLED_ENV} must be true or false"),
+    };
+
     let defaults = TrustedIdentityProxyConfig::default();
-    let secret = non_empty(TRUSTED_IDENTITY_PROXY_SECRET_ENV)?.map(TrustedProxySecret::new);
 
     Ok(TrustedIdentityProxyConfig {
-        enabled: secret.is_some(),
-        secret,
-        previous_secret: non_empty(TRUSTED_IDENTITY_PROXY_PREVIOUS_SECRET_ENV)?
+        enabled,
+        secret: var(TRUSTED_IDENTITY_PROXY_SECRET_ENV)?.map(TrustedProxySecret::new),
+        previous_secret: var(TRUSTED_IDENTITY_PROXY_PREVIOUS_SECRET_ENV)?
             .map(TrustedProxySecret::new),
-        secret_header: non_empty(TRUSTED_IDENTITY_PROXY_SECRET_HEADER_ENV)?
+        secret_header: var(TRUSTED_IDENTITY_PROXY_SECRET_HEADER_ENV)?
             .unwrap_or(defaults.secret_header),
-        identity_header: non_empty(TRUSTED_IDENTITY_PROXY_IDENTITY_HEADER_ENV)?
+        identity_header: var(TRUSTED_IDENTITY_PROXY_IDENTITY_HEADER_ENV)?
             .unwrap_or(defaults.identity_header),
+        allowed_issuers: var(TRUSTED_IDENTITY_PROXY_ALLOWED_ISSUERS_ENV)?
+            .map(|issuers| {
+                issuers
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|issuer| !issuer.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -569,6 +589,9 @@ async fn run_worker_service(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use golem_worker_service::custom_api::trusted_identity_proxy::{
+        TrustedIdentityProxy, TrustedIdentityProxyConfigError,
+    };
     use std::env::VarError;
     use test_r::test;
 
@@ -584,25 +607,36 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn trusted_identity_proxy_is_disabled_without_secret() {
-        for vars in [
-            vec![],
-            vec![(TRUSTED_IDENTITY_PROXY_SECRET_ENV, "")],
-            vec![(TRUSTED_IDENTITY_PROXY_SECRET_HEADER_ENV, "X-Secret")],
-        ] {
-            let config = config_from(&vars);
-            assert!(!config.enabled);
-            assert!(config.secret.is_none());
-        }
+    /// What the worker service makes of the variables at startup
+    fn startup(vars: &[(&str, &str)]) -> Result<bool, TrustedIdentityProxyConfigError> {
+        TrustedIdentityProxy::from_config(&config_from(vars)).map(|proxy| proxy.is_enabled())
     }
 
     #[test]
-    fn trusted_identity_proxy_is_enabled_by_secret() {
-        let config = config_from(&[(TRUSTED_IDENTITY_PROXY_SECRET_ENV, SECRET)]);
+    fn trusted_identity_proxy_is_disabled_without_variables() {
+        let config = config_from(&[]);
+        assert!(!config.enabled);
+        assert!(config.secret.is_none());
+        assert_eq!(startup(&[]), Ok(false));
+        assert_eq!(
+            startup(&[(TRUSTED_IDENTITY_PROXY_ENABLED_ENV, "false")]),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn trusted_identity_proxy_is_enabled_only_by_the_enabled_variable() {
+        let config = config_from(&[
+            (TRUSTED_IDENTITY_PROXY_ENABLED_ENV, "true"),
+            (TRUSTED_IDENTITY_PROXY_SECRET_ENV, SECRET),
+            (
+                TRUSTED_IDENTITY_PROXY_ALLOWED_ISSUERS_ENV,
+                "https://keys.example.com, https://other.example.com/tenant",
+            ),
+        ]);
 
         assert!(config.enabled);
-        assert_eq!(config.secret.unwrap().expose(), SECRET.as_bytes());
+        assert_eq!(config.secret.as_ref().unwrap().expose(), SECRET.as_bytes());
         assert!(config.previous_secret.is_none());
         assert_eq!(
             config.secret_header,
@@ -612,11 +646,94 @@ mod tests {
             config.identity_header,
             TrustedIdentityProxyConfig::DEFAULT_IDENTITY_HEADER
         );
+        assert_eq!(
+            config.allowed_issuers,
+            vec![
+                "https://keys.example.com",
+                "https://other.example.com/tenant"
+            ]
+        );
+        assert!(
+            TrustedIdentityProxy::from_config(&config)
+                .unwrap()
+                .is_enabled()
+        );
+    }
+
+    #[test]
+    fn trusted_identity_proxy_settings_without_enabled_refuse_startup() {
+        for (name, value, field) in [
+            (TRUSTED_IDENTITY_PROXY_SECRET_ENV, SECRET, "secret"),
+            (TRUSTED_IDENTITY_PROXY_SECRET_ENV, "", "secret"),
+            (
+                TRUSTED_IDENTITY_PROXY_PREVIOUS_SECRET_ENV,
+                SECRET,
+                "previous_secret",
+            ),
+            (
+                TRUSTED_IDENTITY_PROXY_SECRET_HEADER_ENV,
+                "X-Secret",
+                "secret_header",
+            ),
+            (
+                TRUSTED_IDENTITY_PROXY_IDENTITY_HEADER_ENV,
+                "X-Identity",
+                "identity_header",
+            ),
+            (
+                TRUSTED_IDENTITY_PROXY_ALLOWED_ISSUERS_ENV,
+                "https://keys.example.com",
+                "allowed_issuers",
+            ),
+        ] {
+            let expected = Err(TrustedIdentityProxyConfigError::SettingWithoutEnabled { field });
+            assert_eq!(startup(&[(name, value)]), expected);
+            assert_eq!(
+                startup(&[(TRUSTED_IDENTITY_PROXY_ENABLED_ENV, "false"), (name, value)]),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_identity_proxy_enabled_needs_secret_and_allowed_issuers() {
+        let enabled = (TRUSTED_IDENTITY_PROXY_ENABLED_ENV, "true");
+
+        assert_eq!(
+            startup(&[enabled]),
+            Err(TrustedIdentityProxyConfigError::MissingSecret)
+        );
+        assert_eq!(
+            startup(&[
+                enabled,
+                (TRUSTED_IDENTITY_PROXY_PREVIOUS_SECRET_ENV, SECRET)
+            ]),
+            Err(TrustedIdentityProxyConfigError::MissingSecret)
+        );
+        assert_eq!(
+            startup(&[enabled, (TRUSTED_IDENTITY_PROXY_SECRET_ENV, SECRET)]),
+            Err(TrustedIdentityProxyConfigError::NoAllowedIssuers)
+        );
+    }
+
+    #[test]
+    fn trusted_identity_proxy_enabled_variable_must_be_a_boolean() {
+        for value in ["", "1", "yes", "TRUE"] {
+            let result = trusted_identity_proxy_config(|name| {
+                if name == TRUSTED_IDENTITY_PROXY_ENABLED_ENV {
+                    Ok(value.to_string())
+                } else {
+                    Err(VarError::NotPresent)
+                }
+            });
+            assert!(result.is_err(), "{value:?}");
+        }
     }
 
     #[test]
     fn trusted_identity_proxy_overrides_are_applied() {
         let config = config_from(&[
+            (TRUSTED_IDENTITY_PROXY_ENABLED_ENV, "true"),
             (TRUSTED_IDENTITY_PROXY_SECRET_ENV, SECRET),
             (TRUSTED_IDENTITY_PROXY_PREVIOUS_SECRET_ENV, "previous"),
             (TRUSTED_IDENTITY_PROXY_SECRET_HEADER_ENV, "X-Secret"),

@@ -485,16 +485,19 @@ async fn golem_rust_idempotence_on(
     Ok(())
 }
 
-/// A retried batched remote write leaves a `Jump` over its abandoned attempt (the shape of the
-/// live incident of 2026-10-20: an outgoing HTTP request interrupted by a transient error, then
-/// retried). The agent must (1) replay through that region after a cold executor restart and
-/// (2) be revertable to the `BeginRemoteWrite` right before the jumped-over region — which was
-/// refused as "a deleted region" because the check looked at the first DROPPED index (the
-/// region's start) instead of the revert target itself.
+/// A `Jump` (here the guest's own `set_oplog_index`, the same oplog shape as the executor's
+/// retry jumps of the live incident of 2026-10-20) must (1) replay after a cold executor restart
+/// — a `Jump` is a hint entry now — and (2) leave the agent revertable to the entry right before
+/// the jumped-over region, which was refused as "a deleted region" because the check looked at
+/// the first DROPPED index (the region's start) instead of the revert target itself.
+///
+/// (Not a retried atomic region / remote write: replaying an HTTP request recorded after a retry
+/// jump traps on this golem base independently of this fix — `golem_rust_atomic_region` fails
+/// the same way before and after it.)
 #[test]
 #[tracing::instrument]
 #[timeout("4m")]
-async fn golem_rust_retried_remote_write_jump_survives_restart_and_revert(
+async fn golem_rust_jump_survives_restart_and_revert_to_region_start(
     last_unique_id: &LastUniqueId,
     deps: &WorkerExecutorTestDependencies,
     #[tagged_as("host_api_tests")] host_api_tests: &PrecompiledComponent,
@@ -513,15 +516,17 @@ async fn golem_rust_retried_remote_write_jump_survives_restart_and_revert(
     let mut env = HashMap::new();
     env.insert("PORT".to_string(), http_server.port().to_string());
 
-    let agent_id = agent_id!("GolemHostApi", "retried-remote-write-jump");
+    let agent_id = agent_id!("GolemHostApi", "jump-restart-revert");
     let worker_id = executor
         .start_agent_with(&component.id, agent_id.clone(), env, Vec::new())
         .await?;
 
-    // The first attempt crashes after starting the side-effect request; the retry jumps over it.
-    executor
-        .invoke_and_await_agent(&component, &agent_id, "idempotence_flag", data_value!(true))
-        .await?;
+    let first = executor
+        .invoke_and_await_agent(&component, &agent_id, "jump", data_value!())
+        .await?
+        .into_return_value()
+        .ok_or_else(|| anyhow!("expected return value"))?;
+    assert_eq!(first, Value::U64(5));
 
     let jump = executor
         .get_oplog(&worker_id, OplogIndex::INITIAL)
@@ -531,17 +536,17 @@ async fn golem_rust_retried_remote_write_jump_survives_restart_and_revert(
             PublicOplogEntry::Jump(params) => Some(params.jump),
             _ => None,
         })
-        .expect("the retried remote write must have written a Jump");
+        .expect("the jump invocation must have written a Jump");
 
     // Cold restart: the next invocation replays the whole oplog, through the jumped-over region.
     drop(executor);
     let executor = start(deps, &context).await?;
     executor
-        .invoke_and_await_agent(&component, &agent_id, "idempotence_flag", data_value!(true))
+        .invoke_and_await_agent(&component, &agent_id, "jump", data_value!())
         .await?;
 
-    // Revert to the BeginRemoteWrite right before the abandoned attempt. Everything after it,
-    // the Jump included, is dropped, so the target is not inside any remaining skipped region.
+    // Revert to the entry right before the jumped-over region. Everything after it, the Jump
+    // included, is dropped, so the target is not inside any remaining skipped region.
     executor
         .revert(
             &worker_id,
@@ -551,10 +556,9 @@ async fn golem_rust_retried_remote_write_jump_survives_restart_and_revert(
         )
         .await?;
 
-    // The reverted agent resumes the first invocation (its side effect is retried) and still
-    // serves new ones.
+    // The reverted agent resumes the first invocation and still serves new ones.
     executor
-        .invoke_and_await_agent(&component, &agent_id, "idempotence_flag", data_value!(true))
+        .invoke_and_await_agent(&component, &agent_id, "jump", data_value!())
         .await?;
 
     executor.check_oplog_is_queryable(&worker_id).await?;

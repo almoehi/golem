@@ -1106,8 +1106,8 @@ mod tests {
     /// got http::types::outgoing_body_stream::check_write"
     ///
     /// Pathology: a periodic snapshot is taken mid-HTTP-batch (between BeginRemoteWrite and
-    /// EndRemoteWrite). On restore, `open_http_requests` and `replaying_http_batch` are both
-    /// gone (runtime state not persisted). The next oplog entry is `CheckWrite` (from the
+    /// EndRemoteWrite). On restore, `open_http_requests` is gone
+    /// (runtime state not persisted). The next oplog entry is `CheckWrite` (from the
     /// original HTTP call). Without the fix, `check_write()` falls through to the plain-WASI
     /// branch (no oplog access), stalling the cursor. The subsequent `poll()` then reads the
     /// `CheckWrite` entry expecting `IoPollPoll` → permanent WASM trap.
@@ -3147,9 +3147,9 @@ mod tests {
     }
 
     /// The §14.6 counterexample as a regression: with no batch registered as open, a batched
-    /// entry must survive the scan untouched. `check_write`'s `replaying_http_batch` and
-    /// post-snapshot-restore branches read the oplog directly without consulting the cache, and
-    /// are reached exactly in that state — deferring an entry there would strand them.
+    /// entry must survive the scan untouched. `check_write`'s post-snapshot-restore branch
+    /// reads the oplog directly without consulting the cache, and is reached exactly in that
+    /// state — deferring an entry there would strand it.
     #[test]
     async fn untracked_batch_entries_survive_a_scan() {
         let begin_idx = OplogIndex::from_u64(42);

@@ -363,6 +363,11 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
     async fn check_write(&mut self, self_: Resource<OutputStream>) -> Result<u64, StreamError> {
         let rep = self_.rep();
         let is_http = is_outgoing_http_body_stream(self, rep);
+        let route = output_stream_route(
+            is_http,
+            is_never_an_http_body_stream(self, &self_)?,
+            self.state.is_live(),
+        );
         let open_reps: Vec<_> = self
             .state
             .open_http_requests
@@ -376,7 +381,7 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
             is_live = self.state.is_live(),
             "check_write: is_outgoing_http_body_stream={is_http}, open_http_requests={open_reps:?}"
         );
-        if is_http {
+        if route == OutputStreamRoute::HttpBody {
             let state = get_http_output_stream_state(self, rep)?;
             let durability = Durability::<HttpTypesOutgoingBodyStreamCheckWrite>::new(
                 self,
@@ -429,33 +434,14 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
             .map_err(StreamError::from)?;
 
             result.result.map_err(StreamError::from)
-        } else if let Some(batch_begin) = self.state.replaying_http_batch {
-            // Replay inside a completed WriteRemoteBatched(None) HTTP batch.
-            // open_http_requests is empty during replay so is_http was false above, but the
-            // oplog contains a CheckWrite entry tagged WriteRemoteBatched(Some(N)) that must
-            // be consumed to keep the replay cursor in sync with the live execution path.
-            let durability = Durability::<HttpTypesOutgoingBodyStreamCheckWrite>::new(
-                self,
-                DurableFunctionType::WriteRemoteBatched(Some(batch_begin)),
-            )
-            .await
-            .map_err(StreamError::from)?;
-            let result = durability
-                .replay_or(
-                    self,
-                    HostResponseStreamCheckWrite {
-                        result: Err(SerializableStreamError::Closed),
-                    },
-                )
-                .await
-                .map_err(StreamError::from)?;
-            result.result.map_err(StreamError::from)
         } else {
-            // Post-snapshot-restore: open_http_requests is empty (not persisted in snapshots) and
-            // replaying_http_batch is None (runtime state lost on restore). The oplog may contain
-            // a CheckWrite entry from the original HTTP call. Consume it to keep the replay cursor
-            // in sync; without this the cursor stalls and the next poll() reads the wrong entry.
-            if !self.state.is_live() {
+            // Post-snapshot-restore: open_http_requests is empty (not persisted in snapshots), so
+            // the body stream of a request whose handle() predates the snapshot is not
+            // registered. The oplog may contain a CheckWrite entry from the original HTTP call.
+            // Consume it to keep the replay cursor in sync; without this the cursor stalls and
+            // the next poll() reads the wrong entry. Never for a stream that cannot be an HTTP
+            // body stream (stdout, stderr, files): see `output_stream_route`.
+            if route == OutputStreamRoute::UnregisteredInReplay {
                 let snapshot_restore_entry = self
                     .state
                     .replay_state
@@ -566,27 +552,6 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
             }
             .map_err(StreamError::from)?;
 
-            result.result.map(|_bytes| ()).map_err(StreamError::from)
-        } else if let Some(batch_begin) = self.state.replaying_http_batch {
-            // Replay inside a completed WriteRemoteBatched(None) HTTP batch.
-            // open_http_requests is empty during replay so is_outgoing_http_body_stream was
-            // false above, but the oplog contains a Write entry tagged WriteRemoteBatched(Some(N))
-            // that must be consumed to keep the replay cursor in sync with the live path.
-            let durability = Durability::<HttpTypesOutgoingBodyStreamWrite>::new(
-                self,
-                DurableFunctionType::WriteRemoteBatched(Some(batch_begin)),
-            )
-            .await
-            .map_err(StreamError::from)?;
-            let result = durability
-                .replay_or(
-                    self,
-                    HostResponseStreamWriteWithBytes {
-                        result: Err(SerializableStreamError::Closed),
-                    },
-                )
-                .await
-                .map_err(StreamError::from)?;
             result.result.map(|_bytes| ()).map_err(StreamError::from)
         } else {
             self.observe_function_call("io::streams::output_stream", "write");
@@ -1230,6 +1195,59 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
     }
 }
 
+/// How a guest output-stream operation is replayed / recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputStreamRoute {
+    /// The body stream of a registered outgoing HTTP request: durable, tagged with its batch.
+    HttpBody,
+    /// Replaying a stream that is not registered but could be the body stream of a request
+    /// whose `handle()` predates a snapshot restore: may consume a recorded `CheckWrite`.
+    UnregisteredInReplay,
+    /// Any other stream (stdout, stderr, files, pre-`handle()` bodies, live unregistered
+    /// streams): executed directly, never recorded as, nor replayed from, an HTTP entry.
+    Plain,
+}
+
+/// The one decision of which oplog entries a guest output stream may own. It depends only on
+/// the STREAM's own identity, never on ambient replay state such as "an HTTP batch is being
+/// replayed": the live run recorded HTTP entries for a stream exactly when it was a registered
+/// HTTP body stream, so replay must use the same predicate. (The fork's former
+/// `replaying_http_batch` routed every unregistered stream — stdout included — into the batch
+/// being replayed, so a `println!` between a replayed response and the batch's end got
+/// `StreamError::Closed` and the guest panicked.)
+fn output_stream_route(
+    is_registered_http_body: bool,
+    is_never_an_http_body: bool,
+    is_live: bool,
+) -> OutputStreamRoute {
+    if is_registered_http_body {
+        OutputStreamRoute::HttpBody
+    } else if !is_live && !is_never_an_http_body {
+        OutputStreamRoute::UnregisteredInReplay
+    } else {
+        OutputStreamRoute::Plain
+    }
+}
+
+/// Streams that are provably not HTTP body streams: the managed stdout / stderr and open
+/// filesystem output streams.
+fn is_never_an_http_body_stream<Ctx: WorkerCtx>(
+    ctx: &mut DurableWorkerCtx<Ctx>,
+    stream: &Resource<OutputStream>,
+) -> Result<bool, StreamError> {
+    if ctx
+        .state
+        .open_filesystem_output_streams
+        .contains_key(&stream.rep())
+    {
+        return Ok(true);
+    }
+    let output = ctx.table().get(stream)?;
+    let any = output.as_any();
+    Ok(any.downcast_ref::<ManagedStdOut>().is_some()
+        || any.downcast_ref::<ManagedStdErr>().is_some())
+}
+
 fn is_outgoing_http_body_stream<Ctx: WorkerCtx>(
     ctx: &DurableWorkerCtx<Ctx>,
     stream_rep: u32,
@@ -1644,5 +1662,49 @@ async fn reconcile_pending_filesystem_stream_reservation<Ctx: WorkerCtx>(
     let over_reserved = pending.reserved_growth.saturating_sub(actual_growth);
     if over_reserved > 0 {
         ctx.release_filesystem_storage_space(over_reserved).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OutputStreamRoute, output_stream_route};
+    use test_r::test;
+
+    /// Regression (cold replay of an HTTP request with a `println!` inside its batch): a stream
+    /// that is provably not an HTTP body stream is executed directly in replay, whatever HTTP
+    /// batch is being replayed at that moment — it never owns, consumes or parks on a batch's
+    /// entries. The route has no "batch being replayed" input on purpose.
+    #[test]
+    fn stdout_and_files_are_never_routed_into_an_http_batch() {
+        for is_live in [false, true] {
+            assert_eq!(
+                output_stream_route(false, true, is_live),
+                OutputStreamRoute::Plain
+            );
+        }
+    }
+
+    #[test]
+    fn a_registered_http_body_stream_is_durable_live_and_in_replay() {
+        for is_live in [false, true] {
+            assert_eq!(
+                output_stream_route(true, false, is_live),
+                OutputStreamRoute::HttpBody
+            );
+        }
+    }
+
+    /// Only replay probes an unregistered, possibly-HTTP stream (post-snapshot-restore); live,
+    /// such a stream is a plain stream, exactly as the run that recorded the oplog treated it.
+    #[test]
+    fn only_replay_probes_an_unregistered_stream() {
+        assert_eq!(
+            output_stream_route(false, false, false),
+            OutputStreamRoute::UnregisteredInReplay
+        );
+        assert_eq!(
+            output_stream_route(false, false, true),
+            OutputStreamRoute::Plain
+        );
     }
 }

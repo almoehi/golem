@@ -553,9 +553,9 @@ async fn golem_rust_idempotence_on(
 /// the jumped-over region, which was refused as "a deleted region" because the check looked at
 /// the first DROPPED index (the region's start) instead of the revert target itself.
 ///
-/// (Not a retried atomic region / remote write: replaying an HTTP request recorded after a retry
-/// jump traps on this golem base independently of this fix — `golem_rust_atomic_region` fails
-/// the same way before and after it.)
+/// (The retried atomic regions themselves are covered by `golem_rust_atomic_region*`; their
+/// replay trap was not jump-related, see
+/// `golem_rust_http_request_replays_with_stdout_inside_the_batch`.)
 #[test]
 #[tracing::instrument]
 #[timeout("4m")]

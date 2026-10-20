@@ -1301,7 +1301,6 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
                             debug!(
                                 "Remote write operation {begin_index} already completed at {index}, continue replaying"
                             );
-                            self.state.replaying_http_batch = Some(begin_index);
                             Ok(begin_index)
                         }
                         OplogEntryLookupResult::NotFound {
@@ -1420,7 +1419,6 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
                     .add(OplogEntry::end_remote_write(begin_index))
                     .await;
             } else {
-                self.state.replaying_http_batch = None;
                 let (_, _) =
                     crate::get_oplog_entry!(self.state.replay_state, OplogEntry::EndRemoteWrite)?;
             }
@@ -4174,12 +4172,6 @@ struct PrivateDurableWorkerState {
 
     snapshotting_mode: Option<PersistenceLevel>,
 
-    /// Set during replay when replaying through a completed WriteRemoteBatched(None) HTTP
-    /// request cycle. The value is the BeginRemoteWrite oplog index for the batch.
-    /// Used by check_write/write in streams.rs to take the durable replay path even when
-    /// open_http_requests is empty (it is never populated during replay).
-    replaying_http_batch: Option<OplogIndex>,
-
     component_metadata: Component,
 
     total_linear_memory_size: u64,
@@ -4385,10 +4377,10 @@ struct PrivateDurableWorkerState {
 ///
 /// Keeping this guard (rather than treating ANY entry carrying a tracked-shape
 /// `DurableFunctionType` as deferrable) is load-bearing, not conservatism:
-/// `HostOutputStream::check_write`'s `replaying_http_batch` and post-snapshot-restore branches
-/// (`io/streams.rs`) do their own bare oplog reads without consulting the stray cache, and are
-/// reached exactly when no batch is open — i.e. exactly when this set is empty and nothing can
-/// defer their entries out from under them. See FINDING_B_FIX_DESIGN.md §14.6.
+/// `HostOutputStream::check_write`'s post-snapshot-restore branch (`io/streams.rs`) does its own
+/// bare oplog read without consulting the stray cache, and is reached for a batch that is not
+/// registered as open (its `handle()` predates the restore) — so nothing can defer that batch's
+/// entries out from under it. See FINDING_B_FIX_DESIGN.md §14.6.
 pub struct TrackedConcurrentOpSeqs {
     namespaces: HashSet<IdentityNamespace>,
 }
@@ -5298,9 +5290,9 @@ mod stray_entry_tests {
     }
 
     /// The tracked-identity guard must be KEPT, not dropped (§14.6): `check_write`'s
-    /// `replaying_http_batch` and post-snapshot-restore branches do their own bare oplog reads
-    /// without consulting the cache, and are reached exactly when no batch is open. An entry
-    /// whose batch is not registered must therefore never be deferred out from under them.
+    /// post-snapshot-restore branch does its own bare oplog read without consulting the cache,
+    /// for a batch that is not registered as open. An entry whose batch is not registered must
+    /// therefore never be deferred out from under it.
     #[test]
     fn untracked_batch_entries_are_never_deferred() {
         let idx = OplogIndex::from_u64(7);
@@ -5536,7 +5528,6 @@ impl PrivateDurableWorkerState {
             open_filesystem_input_streams: HashSet::new(),
             filesystem_stream_pollables: HashSet::new(),
             snapshotting_mode: None,
-            replaying_http_batch: None,
             component_metadata,
             total_linear_memory_size,
             current_filesystem_storage_usage,

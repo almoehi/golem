@@ -3188,4 +3188,173 @@ mod tests {
             "the check_write entry must still be at the cursor for its own bare read"
         );
     }
+
+    fn start_span_entry(span_id: u64) -> OplogEntry {
+        use golem_common::model::invocation_context::SpanId;
+        use golem_common::model::oplog::AttributeMap;
+        OplogEntry::StartSpan {
+            timestamp: Timestamp::now_utc(),
+            span_id: SpanId(std::num::NonZeroU64::new(span_id).unwrap()),
+            parent: None,
+            linked_context_id: None,
+            attributes: AttributeMap(std::collections::HashMap::new()),
+        }
+    }
+
+    fn hint_entry(message: &str) -> OplogEntry {
+        OplogEntry::Log {
+            timestamp: Timestamp::now_utc(),
+            level: LogLevel::Stdout,
+            context: String::new(),
+            message: message.to_string(),
+        }
+    }
+
+    /// The oplog of `WorkflowAgent(flux2_reference_compose_nsfw@main, …)` (live incident
+    /// 2026-10-20, entries #20135..#20166), compressed to its shape:
+    ///
+    /// ```text
+    ///  2 BeginRemoteWrite                      (#20135)
+    ///  3 StartSpan        attempt 1            (#20136)
+    ///  4 Error            retry from 2  [hint] (#20140, DnsError)
+    ///  5 PendingAgentInvocation         [hint] (#20141, appended while the retry replayed)
+    ///  6 OplogProcessorCheckpoint       [hint] (#20142..#20143, same)
+    ///  7 Jump             <3 => 5>             (#20144, end = stale `replay_target().next()`)
+    ///  8 StartSpan        attempt 2            (#20145)
+    ///  9 EndRemoteWrite                        (#20172 or so, the retry completed)
+    /// ```
+    ///
+    /// The executor writes a retry `Jump` to skip the failed attempt, and computed its region
+    /// end as `replay_target().next()` assuming that is where the `Jump` itself lands. Entries
+    /// appended concurrently while the retry replayed (an enqueued invocation, oplog-processor
+    /// checkpoints) pushed the `Jump` past that index, so the `Jump` sat OUTSIDE the region it
+    /// declares. On the next replay the cursor skips `<3 => 5>`, skips the two hints, reads the
+    /// `Jump` (a non-hint entry) where the retried request's `StartSpan` is expected, and traps
+    /// permanently: "expected OplogEntry :: StartSpan |, got Jump { .. <20136 => 20161> }".
+    #[test]
+    async fn replay_skips_retry_jump_landing_outside_its_own_region() {
+        let entries = vec![
+            OplogEntry::BeginRemoteWrite {
+                timestamp: Timestamp::now_utc(),
+            },
+            start_span_entry(1),
+            OplogEntry::Error {
+                timestamp: Timestamp::now_utc(),
+                error: golem_common::model::oplog::AgentError::TransientError(
+                    "ErrorCode::DnsError".to_string(),
+                ),
+                retry_from: OplogIndex::from_u64(2),
+                inside_atomic_region: false,
+                retry_policy_state: None,
+            },
+            hint_entry("enqueued invocation (concurrent append)"),
+            hint_entry("oplog processor checkpoint (concurrent append)"),
+            OplogEntry::Jump {
+                timestamp: Timestamp::now_utc(),
+                jump: OplogRegion {
+                    start: OplogIndex::from_u64(3),
+                    end: OplogIndex::from_u64(5),
+                },
+            },
+            start_span_entry(2),
+            OplogEntry::EndRemoteWrite {
+                timestamp: Timestamp::now_utc(),
+                begin_index: OplogIndex::from_u64(2),
+            },
+        ];
+        let mut map = BTreeMap::from([(OplogIndex::INITIAL, noop_entry())]);
+        let mut idx = OplogIndex::INITIAL;
+        for entry in entries {
+            idx = idx.next();
+            map.insert(idx, entry);
+        }
+        // The status reducer folds every `Jump` region into the skipped regions.
+        let skipped = DeletedRegions::from_regions(vec![OplogRegion {
+            start: OplogIndex::from_u64(3),
+            end: OplogIndex::from_u64(5),
+        }]);
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            Arc::new(MutableBatchOplog::new(map)),
+            skipped,
+        )
+        .await
+        .unwrap();
+
+        let (idx, entry) = state.get_oplog_entry().await.unwrap();
+        assert_eq!(idx, OplogIndex::from_u64(2));
+        assert!(matches!(entry, OplogEntry::BeginRemoteWrite { .. }));
+
+        let (idx, entry) = state.get_oplog_entry().await.unwrap();
+        assert!(
+            matches!(&entry, OplogEntry::StartSpan { span_id, .. } if span_id.0.get() == 2),
+            "the retried request's StartSpan must follow BeginRemoteWrite, got #{idx}: {entry:?}"
+        );
+        assert_eq!(idx, OplogIndex::from_u64(8));
+    }
+
+    /// `lookup_oplog_entry` (how `begin_function` decides whether a remote write / atomic region
+    /// was completed) must skip EVERY skipped region ahead of the cursor, not only the first: an
+    /// `EndRemoteWrite` inside a later deleted region (a reverted or jumped-over attempt) does not
+    /// complete the operation.
+    #[test]
+    async fn lookup_skips_every_skipped_region_ahead_of_the_cursor() {
+        let entries = vec![
+            OplogEntry::BeginRemoteWrite {
+                timestamp: Timestamp::now_utc(),
+            },
+            start_span_entry(1),
+            start_span_entry(2),
+            hint_entry("first deleted region"),
+            start_span_entry(3),
+            hint_entry("second deleted region"),
+            OplogEntry::EndRemoteWrite {
+                timestamp: Timestamp::now_utc(),
+                begin_index: OplogIndex::from_u64(2),
+            },
+            noop_entry(),
+        ];
+        let mut map = BTreeMap::from([(OplogIndex::INITIAL, noop_entry())]);
+        let mut idx = OplogIndex::INITIAL;
+        for entry in entries {
+            idx = idx.next();
+            map.insert(idx, entry);
+        }
+        let skipped = DeletedRegions::from_regions(vec![
+            OplogRegion {
+                start: OplogIndex::from_u64(4),
+                end: OplogIndex::from_u64(5),
+            },
+            OplogRegion {
+                start: OplogIndex::from_u64(7),
+                end: OplogIndex::from_u64(8),
+            },
+        ]);
+        let agent_id = AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "test".to_string(),
+        };
+        let mut state = ReplayState::new(
+            OwnedAgentId::new(EnvironmentId::new(), &agent_id),
+            Arc::new(MutableBatchOplog::new(map)),
+            skipped,
+        )
+        .await
+        .unwrap();
+
+        let (begin_index, entry) = state.get_oplog_entry().await.unwrap();
+        assert!(matches!(entry, OplogEntry::BeginRemoteWrite { .. }));
+
+        let end = state
+            .lookup_oplog_entry(begin_index, OplogEntry::is_end_remote_write)
+            .await;
+        assert_eq!(
+            end, None,
+            "the EndRemoteWrite at #8 lies in a deleted region and must not complete the write"
+        );
+    }
 }

@@ -19,6 +19,9 @@ use axum::extract::Path;
 use axum::routing::{delete, get, post};
 use bytes::Bytes;
 use golem_common::model::IdempotencyKey;
+use golem_common::model::OplogIndex;
+use golem_common::model::oplog::PublicOplogEntry;
+use golem_common::model::worker::{RevertToOplogIndex, RevertWorkerTarget};
 use golem_common::{agent_id, data_value};
 use golem_test_framework::dsl::{
     TestDsl, drain_connection, stdout_event_starting_with, stdout_events,
@@ -478,6 +481,86 @@ async fn golem_rust_idempotence_on(
     info!("events:\n - {}", events.join("\n - "));
 
     assert_eq!(events, vec!["1", "1"]);
+
+    Ok(())
+}
+
+/// A retried batched remote write leaves a `Jump` over its abandoned attempt (the shape of the
+/// live incident of 2026-10-20: an outgoing HTTP request interrupted by a transient error, then
+/// retried). The agent must (1) replay through that region after a cold executor restart and
+/// (2) be revertable to the `BeginRemoteWrite` right before the jumped-over region — which was
+/// refused as "a deleted region" because the check looked at the first DROPPED index (the
+/// region's start) instead of the revert target itself.
+#[test]
+#[tracing::instrument]
+#[timeout("4m")]
+async fn golem_rust_retried_remote_write_jump_survives_restart_and_revert(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("host_api_tests")] host_api_tests: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    let http_server = TestHttpServer::start(1).await;
+
+    let component = executor
+        .component_dep(&context.default_environment_id, host_api_tests)
+        .store()
+        .await?;
+
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), http_server.port().to_string());
+
+    let agent_id = agent_id!("GolemHostApi", "retried-remote-write-jump");
+    let worker_id = executor
+        .start_agent_with(&component.id, agent_id.clone(), env, Vec::new())
+        .await?;
+
+    // The first attempt crashes after starting the side-effect request; the retry jumps over it.
+    executor
+        .invoke_and_await_agent(&component, &agent_id, "idempotence_flag", data_value!(true))
+        .await?;
+
+    let jump = executor
+        .get_oplog(&worker_id, OplogIndex::INITIAL)
+        .await?
+        .into_iter()
+        .find_map(|entry| match entry.entry {
+            PublicOplogEntry::Jump(params) => Some(params.jump),
+            _ => None,
+        })
+        .expect("the retried remote write must have written a Jump");
+
+    // Cold restart: the next invocation replays the whole oplog, through the jumped-over region.
+    drop(executor);
+    let executor = start(deps, &context).await?;
+    executor
+        .invoke_and_await_agent(&component, &agent_id, "idempotence_flag", data_value!(true))
+        .await?;
+
+    // Revert to the BeginRemoteWrite right before the abandoned attempt. Everything after it,
+    // the Jump included, is dropped, so the target is not inside any remaining skipped region.
+    executor
+        .revert(
+            &worker_id,
+            RevertWorkerTarget::RevertToOplogIndex(RevertToOplogIndex {
+                last_oplog_index: jump.start.previous(),
+            }),
+        )
+        .await?;
+
+    // The reverted agent resumes the first invocation (its side effect is retried) and still
+    // serves new ones.
+    executor
+        .invoke_and_await_agent(&component, &agent_id, "idempotence_flag", data_value!(true))
+        .await?;
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    drop(executor);
+    http_server.abort();
 
     Ok(())
 }

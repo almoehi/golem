@@ -363,11 +363,10 @@ impl<Ctx: WorkerCtx> HostOutputStream for DurableWorkerCtx<Ctx> {
     async fn check_write(&mut self, self_: Resource<OutputStream>) -> Result<u64, StreamError> {
         let rep = self_.rep();
         let is_http = is_outgoing_http_body_stream(self, rep);
-        let route = output_stream_route(
-            is_http,
-            is_never_an_http_body_stream(self, &self_)?,
-            self.state.is_live(),
-        );
+        // Only a replayed, unregistered stream needs the identity check (and its table lookup).
+        let never_owns_http_entries =
+            !is_http && !self.state.is_live() && never_owns_http_entries(self, &self_)?;
+        let route = output_stream_route(is_http, never_owns_http_entries, self.state.is_live());
         let open_reps: Vec<_> = self
             .state
             .open_http_requests
@@ -1203,8 +1202,9 @@ enum OutputStreamRoute {
     /// Replaying a stream that is not registered but could be the body stream of a request
     /// whose `handle()` predates a snapshot restore: may consume a recorded `CheckWrite`.
     UnregisteredInReplay,
-    /// Any other stream (stdout, stderr, files, pre-`handle()` bodies, live unregistered
-    /// streams): executed directly, never recorded as, nor replayed from, an HTTP entry.
+    /// Any other stream (stdout, stderr, files, outgoing bodies not yet passed to `handle()`,
+    /// live unregistered streams): executed directly, never recorded as, nor replayed from, an
+    /// HTTP entry.
     Plain,
 }
 
@@ -1217,28 +1217,35 @@ enum OutputStreamRoute {
 /// `StreamError::Closed` and the guest panicked.)
 fn output_stream_route(
     is_registered_http_body: bool,
-    is_never_an_http_body: bool,
+    never_owns_http_entries: bool,
     is_live: bool,
 ) -> OutputStreamRoute {
     if is_registered_http_body {
         OutputStreamRoute::HttpBody
-    } else if !is_live && !is_never_an_http_body {
+    } else if !is_live && !never_owns_http_entries {
         OutputStreamRoute::UnregisteredInReplay
     } else {
         OutputStreamRoute::Plain
     }
 }
 
-/// Streams that are provably not HTTP body streams: the managed stdout / stderr and open
-/// filesystem output streams.
-fn is_never_an_http_body_stream<Ctx: WorkerCtx>(
+/// Streams whose operations the live run provably never recorded as HTTP entries, so in replay
+/// they must never consume one: the managed stdout / stderr, open filesystem output streams, and
+/// outgoing-body streams still waiting for `handle()` (pre-`handle()` request bodies, and bodies
+/// no request owns, e.g. an outgoing response's). A pre-`handle()` body is executed directly live
+/// too (`is_outgoing_http_body_stream`); probing for it in replay could steal the `CheckWrite`
+/// recorded for a concurrently registered request whose own `check_write` follows it.
+fn never_owns_http_entries<Ctx: WorkerCtx>(
     ctx: &mut DurableWorkerCtx<Ctx>,
     stream: &Resource<OutputStream>,
 ) -> Result<bool, StreamError> {
-    if ctx
-        .state
-        .open_filesystem_output_streams
-        .contains_key(&stream.rep())
+    let rep = stream.rep();
+    if ctx.state.open_filesystem_output_streams.contains_key(&rep)
+        || ctx
+            .state
+            .pending_http_outgoing_body_stream
+            .values()
+            .any(|stream_rep| *stream_rep == rep)
     {
         return Ok(true);
     }
@@ -1671,7 +1678,8 @@ mod tests {
     use test_r::test;
 
     /// Regression (cold replay of an HTTP request with a `println!` inside its batch): a stream
-    /// that is provably not an HTTP body stream is executed directly in replay, whatever HTTP
+    /// that provably never owns HTTP entries (stdout, stderr, files, pre-`handle()` bodies) is
+    /// executed directly in replay, whatever HTTP
     /// batch is being replayed at that moment — it never owns, consumes or parks on a batch's
     /// entries. The route has no "batch being replayed" input on purpose.
     #[test]

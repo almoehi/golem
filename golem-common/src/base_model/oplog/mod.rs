@@ -199,8 +199,15 @@ oplog_entry! {
     /// the source oplog index from there.
     /// `jump` is an oplog region representing that from the end of that region we want to go back to the start and
     /// ignore all recorded operations in between.
+    ///
+    /// A hint: replay never consumes a `Jump` — its region is folded into the skipped regions by
+    /// the status reducer, like a `Revert`'s. The region is meant to end at the `Jump` itself, but
+    /// entries appended concurrently (enqueued invocations, oplog-processor checkpoints) can push
+    /// the `Jump` past its region's end; as a non-hint it was then read where the guest expected
+    /// its next host call, trapping the agent permanently (live incident 2026-10-20). Upstream
+    /// golem made the same change in #3914.
     Jump {
-        hint: false
+        hint: true
         wit_raw_type: "jump-parameters"
         wit_public_type: "jump-parameters"
         raw {

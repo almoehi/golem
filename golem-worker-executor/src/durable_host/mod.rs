@@ -1206,6 +1206,35 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
         }
     }
 
+    /// Writes the `Jump` that makes every later replay skip the abandoned attempt of a retried
+    /// region (an atomic region, a batched remote write, a remote transaction or an unclosed
+    /// persist-nothing zone) whose recorded entries start at `start`. Must be called right after
+    /// switching to live mode, before the retried attempt writes anything.
+    ///
+    /// The region ends at the `Jump` entry itself, derived from the oplog's CURRENT tail — not
+    /// from `replay_target()`, which is the tail when this replay STARTED: entries appended
+    /// concurrently while the retry replayed (enqueued invocations, oplog-processor checkpoints,
+    /// pending updates) sit between the two, and a region ending at `replay_target().next()`
+    /// then stopped short of its own `Jump` (live incident 2026-10-20, `Jump <20136 => 20161>`
+    /// at #20163). A `Jump` is a hint entry, so replay skips it even if another append races in
+    /// between reading the tail and adding it; the region bound only keeps the deleted range
+    /// exact for the status reducer and for revert validation.
+    async fn add_jump_over_abandoned_attempt(&mut self, start: OplogIndex) {
+        let jump_index = self.state.oplog.current_oplog_index().await.next();
+        let deleted_region = OplogRegion {
+            start,
+            end: jump_index,
+        };
+
+        self.public_state
+            .worker()
+            .add_and_commit_oplog(OplogEntry::jump(deleted_region))
+            .await;
+
+        // TODO: this recomputation should not be necessary.
+        self.public_state.worker().reattach_worker_status().await;
+    }
+
     pub async fn begin_function(
         &mut self,
         function_type: &DurableFunctionType,
@@ -1292,19 +1321,9 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
 
                             // But this is not enough, because if the retried batched write operation succeeds,
                             // and later we replay it, we need to skip the first attempt and only replay the second.
-                            // Se we add a Jump entry to the oplog that registers a deleted region.
-                            let deleted_region = OplogRegion {
-                                start: begin_index.next(), // need to keep the BeginAtomicRegion entry
-                                end: self.state.replay_state.replay_target().next(), // skipping the Jump entry too
-                            };
-
-                            self.public_state
-                                .worker()
-                                .add_and_commit_oplog(OplogEntry::jump(deleted_region))
+                            // Keeping the BeginRemoteWrite entry.
+                            self.add_jump_over_abandoned_attempt(begin_index.next())
                                 .await;
-
-                            // TODO: this recomputation should not be necessary.
-                            self.public_state.worker().reattach_worker_status().await;
                             Ok(begin_index)
                         }
                         OplogEntryLookupResult::NotFound { .. } => {
@@ -1564,19 +1583,8 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
                 } else {
                     // But this is not enough, because if the retried batched write operation succeeds,
                     // and later we replay it, we need to skip the first attempt and only replay the second.
-                    // Se we add a Jump entry to the oplog that registers a deleted region.
-                    let deleted_region = OplogRegion {
-                        start: begin_index, // need to delete the previous BeginRemoteTransaction entry, because we'll get a new TX id
-                        end: self.state.replay_state.replay_target().next(), // skipping the Jump entry too
-                    };
-
-                    self.public_state
-                        .worker()
-                        .add_and_commit_oplog(OplogEntry::jump(deleted_region))
-                        .await;
-
-                    // TODO: this recomputation should not be necessary.
-                    self.public_state.worker().reattach_worker_status().await;
+                    // Deleting the previous BeginRemoteTransaction entry too, because we'll get a new TX id.
+                    self.add_jump_over_abandoned_attempt(begin_index).await;
 
                     let (tx_id, tx) = handler.create_new().await?;
                     let _ = self

@@ -1830,9 +1830,15 @@ impl<Ctx: WorkerCtx> Worker<Ctx> {
         let region_start = last_oplog_index.next();
         let last_known_status = self.get_latest_worker_metadata().await.last_known_status;
 
+        // The revert keeps `..=last_oplog_index` and drops `region_start..`, so it is the target
+        // that must not lie in a skipped region. A skipped region that STARTS at `region_start`
+        // is fine: the entry that declared it (a Jump, Revert or snapshot-based PendingUpdate)
+        // always comes after the region's start, so it is dropped with it. Checking
+        // `region_start` refused exactly that case, e.g. reverting to the `BeginRemoteWrite` of
+        // a retried HTTP request whose abandoned attempts a Jump skips.
         if last_known_status
             .skipped_regions
-            .is_in_deleted_region(region_start)
+            .is_in_deleted_region(last_oplog_index)
         {
             Err(WorkerExecutorError::invalid_request(format!(
                 "Attempted to revert to a deleted region in oplog to index {last_oplog_index}"

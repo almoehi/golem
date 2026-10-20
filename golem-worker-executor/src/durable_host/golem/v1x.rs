@@ -397,19 +397,9 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
 
                     // But this is not enough, because if the retried transactional block succeeds,
                     // and later we replay it, we need to skip the first attempt and only replay the second.
-                    // Se we add a Jump entry to the oplog that registers a deleted region.
-                    let deleted_region = OplogRegion {
-                        start: begin_index.next(), // need to keep the BeginAtomicRegion entry
-                        end: self.state.replay_state.replay_target().next(), // skipping the Jump entry too
-                    };
-
-                    self.public_state
-                        .worker()
-                        .add_and_commit_oplog(OplogEntry::jump(deleted_region))
+                    // Keeping the BeginAtomicRegion entry.
+                    self.add_jump_over_abandoned_attempt(begin_index.next())
                         .await;
-
-                    // TODO: this recomputation should not be necessary.
-                    self.public_state.worker().reattach_worker_status().await;
                 }
             }
 
@@ -487,19 +477,9 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                     // get_oplog_entry jumped to live mode because the persist-nothing zone was not closed.
                     // If the retried transactional block succeeds, and later we replay it, we need to skip the first
                     // attempt and only replay the second.
-                    // Se we add a Jump entry to the oplog that registers a deleted region.
-                    let deleted_region = OplogRegion {
-                        start: oplog_index_before.next(), // need to keep the BeginAtomicRegion entry
-                        end: self.state.replay_state.replay_target().next(), // skipping the Jump entry too
-                    };
-
-                    self.public_state
-                        .worker()
-                        .add_and_commit_oplog(OplogEntry::jump(deleted_region))
+                    // Keeping the ChangePersistenceLevel entry.
+                    self.add_jump_over_abandoned_attempt(oplog_index_before.next())
                         .await;
-
-                    // TODO: this recomputation should not be necessary.
-                    self.public_state.worker().reattach_worker_status().await;
                 }
             }
 

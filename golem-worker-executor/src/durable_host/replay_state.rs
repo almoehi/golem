@@ -573,26 +573,22 @@ impl ReplayState {
         while start < replay_target {
             let entries = self.read_oplog(start, REPLAY_READ_CHUNK_SIZE).await;
             for (idx, entry) in &entries {
-                if current_next_skip_region
-                    .as_ref()
-                    .map(|r| r.contains(*idx))
-                    .unwrap_or(false)
+                if let Some(region) = &current_next_skip_region
+                    && region.contains(*idx)
                 {
-                    // If we are in the current skip region, ignore the entry
+                    // If we are in the current skip region, ignore the entry, and once at its
+                    // end, move on to the next one (checked before the `continue`: the end is
+                    // inside the region, so a check after it was never reached and every later
+                    // skipped region was searched as if it were live)
+                    if region.end == *idx {
+                        current_next_skip_region = self
+                            .internal
+                            .read()
+                            .await
+                            .skipped_regions
+                            .find_next_deleted_region(idx.next());
+                    }
                     continue;
-                }
-                if current_next_skip_region
-                    .as_ref()
-                    .map(|r| &r.end == idx)
-                    .unwrap_or(false)
-                {
-                    // if we are at the end of the current skip region, find the next one
-                    current_next_skip_region = self
-                        .internal
-                        .read()
-                        .await
-                        .skipped_regions
-                        .find_next_deleted_region(idx.next());
                 }
 
                 update_state(entry, *idx, &mut state);

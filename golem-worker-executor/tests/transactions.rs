@@ -441,6 +441,68 @@ async fn golem_rust_atomic_region(
     Ok(())
 }
 
+/// A cold replay of a completed outgoing HTTP request must not route the guest's OTHER output
+/// streams into that request's recorded batch. `remote_side_effect` prints "Received {status}"
+/// to stdout while the response (and so the `BeginRemoteWrite` batch) is still open; replaying
+/// that `check_write` as the batch's `outgoing_body_stream::check_write` parked on the batch's
+/// `EndRemoteWrite`, answered `Closed`, and `println!` panicked ("failed printing to stdout").
+/// No retry and no `Jump` is involved: the first replay of ANY such request trapped (this is
+/// why `golem_rust_atomic_region*` failed — their only replays follow retry jumps).
+#[test]
+#[tracing::instrument]
+#[timeout("4m")]
+async fn golem_rust_http_request_replays_with_stdout_inside_the_batch(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("host_api_tests")] host_api_tests: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let executor = start(deps, &context).await?;
+
+    // No step fails: no panic, no retry, no jump.
+    let http_server = TestHttpServer::start(0).await;
+    let component = executor
+        .component_dep(&context.default_environment_id, host_api_tests)
+        .store()
+        .await?;
+
+    let mut env = HashMap::new();
+    env.insert("PORT".to_string(), http_server.port().to_string());
+
+    let agent_id = agent_id!("GolemHostApi", "http-replay-stdout");
+    let worker_id = executor
+        .start_agent_with(&component.id, agent_id.clone(), env, Vec::new())
+        .await?;
+
+    executor
+        .invoke_and_await_agent(&component, &agent_id, "atomic_region", data_value!())
+        .await?;
+
+    // Cold restart: the next invocation first replays the recorded HTTP requests.
+    drop(executor);
+    let executor = start(deps, &context).await?;
+    executor
+        .invoke_and_await_agent(&component, &agent_id, "atomic_region", data_value!())
+        .await?;
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+
+    drop(executor);
+    http_server.abort();
+
+    let events = http_server.get_events();
+    info!("events:\n - {}", events.join("\n - "));
+
+    // The replay sends nothing; only the two live invocations reach the server.
+    assert_eq!(
+        events,
+        vec!["1", "2", "3", "4", "5", "6", "1", "2", "3", "4", "5", "6"]
+    );
+
+    Ok(())
+}
+
 #[test]
 #[tracing::instrument]
 #[timeout("4m")]

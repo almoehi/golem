@@ -477,7 +477,8 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                     // get_oplog_entry jumped to live mode because the persist-nothing zone was not closed.
                     // If the retried transactional block succeeds, and later we replay it, we need to skip the first
                     // attempt and only replay the second.
-                    // Keeping the ChangePersistenceLevel entry.
+                    // `oplog_index_before.next()` is the replayed ChangePersistenceLevel entry
+                    // itself, so the region skips it too (unchanged bound).
                     self.add_jump_over_abandoned_attempt(oplog_index_before.next())
                         .await;
                 }

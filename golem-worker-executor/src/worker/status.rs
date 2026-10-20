@@ -1854,6 +1854,43 @@ mod test {
         run_test_case(test_case).await;
     }
 
+    /// A retry `Jump` ends at the oplog tail, so an invocation enqueued concurrently while the
+    /// retry replayed lies inside the jumped-over region. Skipped regions must not drop it: it
+    /// stays pending (`calculate_pending_invocations` ignores skipped regions by design).
+    #[test]
+    async fn pending_invocation_inside_retry_jump_region_stays_pending() {
+        let k1 = IdempotencyKey::fresh();
+        let k2 = IdempotencyKey::fresh();
+
+        let test_case = TestCase::builder(0)
+            .agent_invocation_started("a", vec![], k1.clone()) // idx 2
+            .host_call(
+                "b",
+                HostRequest::NoInput(HostRequestNoInput {}),
+                HostResponse::Custom(1.into_value_and_type()),
+                DurableFunctionType::WriteRemoteBatched(None),
+            ) // idx 3, the abandoned attempt
+            .pending_invocation(AgentInvocation::AgentMethod {
+                idempotency_key: k2,
+                method_name: "c".to_string(),
+                input: UntypedDataValue::Tuple(vec![]),
+                invocation_context: InvocationContextStack::fresh(),
+                principal: Principal::anonymous(),
+            }) // idx 4, appended concurrently
+            .jump(OplogIndex::from_u64(3)) // idx 5, skips [3, 5]
+            .agent_invocation_finished(
+                AgentInvocationResult::AgentInitialization,
+                k1,
+                ComponentRevision::INITIAL,
+            )
+            .build();
+
+        let final_status = test_case.entries.last().unwrap().expected_status.clone();
+        assert_eq!(final_status.pending_invocations.len(), 1);
+
+        run_test_case(test_case).await;
+    }
+
     // Regression test for a busy-loop bug in `Invocation::external_invocation`
     // (invocation_loop.rs): a `PendingAgentInvocation` whose idempotency key already has a
     // recorded result (e.g. a duplicate/re-sent request using the same deterministic key —

@@ -257,6 +257,7 @@ impl Services {
             component_object_store.clone(),
             environment_service.clone(),
             deployment_service.clone(),
+            repos.plugin_repo.clone(),
         ));
 
         let plugin_registration_service = Arc::new(PluginRegistrationService::new(

@@ -100,9 +100,15 @@ pub trait OplogProcessorPlugin: Send + Sync {
         entries: Vec<OplogEntry>,
     ) -> Result<(), WorkerExecutorError>;
 
-    /// Evicts the cached plugin worker for the given plugin, forcing a fresh
-    /// instance to be created on the next `resolve_target` call.
-    async fn invalidate_target(&self, environment_id: EnvironmentId, plugin: &InstalledPlugin);
+    /// Evicts the cached plugin worker for the given plugin if it is still `failed_target`,
+    /// forcing a fresh instance to be created on the next `resolve_target` call. A failure
+    /// reported against an older target never evicts a newer one.
+    async fn invalidate_target(
+        &self,
+        environment_id: EnvironmentId,
+        plugin: &InstalledPlugin,
+        failed_target: &AgentId,
+    );
 
     async fn on_shard_assignment_changed(&self) -> Result<(), WorkerExecutorError>;
 
@@ -122,6 +128,11 @@ pub trait OplogProcessorPlugin: Send + Sync {
 /// used plugin on each worker executor node.
 pub struct PerExecutorOplogProcessorPlugin<Ctx: WorkerCtx> {
     workers: Arc<RwLock<HashMap<WorkerKey, RunningPlugin>>>,
+    /// Bumped by `invalidate_target` so the next `resolve_target` derives a different
+    /// (fresh) plugin worker name for that key. In-memory only: after a restart every key
+    /// starts at generation 0 again, so the plugin worker of a healthy plugin keeps the
+    /// same identity across restarts.
+    generations: Arc<std::sync::Mutex<HashMap<WorkerKey, u64>>>,
     component_service: Arc<dyn ComponentService>,
     shard_service: Arc<dyn ShardService>,
     worker_activator: Arc<dyn WorkerActivator<Ctx>>,
@@ -150,6 +161,7 @@ impl<Ctx: WorkerCtx> PerExecutorOplogProcessorPlugin<Ctx> {
     ) -> Self {
         Self {
             workers: Arc::new(RwLock::new(HashMap::new())),
+            generations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             component_service,
             shard_service,
             worker_activator,
@@ -179,7 +191,16 @@ impl<Ctx: WorkerCtx> PerExecutorOplogProcessorPlugin<Ctx> {
                                 "missing oplog processor plugin component revision"
                             ))?;
 
-                        let agent_id = self.generate_agent_id_for(plugin_component_id).await?;
+                        let generation = self.generation_of(&key);
+                        let agent_id = self.generate_agent_id_for(
+                            plugin_component_id,
+                            &PluginWorkerIdentity {
+                                environment_id,
+                                plugin_registration_id: plugin.plugin_registration_id,
+                                component_revision: plugin_component_revision,
+                                generation,
+                            },
+                        )?;
                         // Resolve the component's authoritative environment_id.
                         let plugin_component = self
                             .component_service
@@ -202,53 +223,78 @@ impl<Ctx: WorkerCtx> PerExecutorOplogProcessorPlugin<Ctx> {
         }
     }
 
-    async fn generate_agent_id_for(
+    fn generation_of(&self, key: &WorkerKey) -> u64 {
+        let generations = self.generations.lock().unwrap();
+        generations.get(key).copied().unwrap_or(0)
+    }
+
+    fn generate_agent_id_for(
         &self,
         plugin_component_id: ComponentId,
+        identity: &PluginWorkerIdentity,
     ) -> Result<AgentId, WorkerExecutorError> {
         let current_assignment = self.shard_service.current_assignment()?;
-        let agent_id = Self::generate_local_agent_id(
+        Ok(generate_local_plugin_agent_id(
             plugin_component_id,
+            identity,
             &current_assignment.shard_ids,
             current_assignment.number_of_shards,
-        );
-
-        Ok(agent_id)
+        ))
     }
+}
 
-    /// Converts a `TargetAgentId` to an `AgentId`. If the worker name was not specified,
-    /// it generates a new unique one, and if the `force_in_shard` set is not empty, it guarantees
-    /// that the generated worker ID will belong to one of the provided shards.
-    ///
-    /// If the worker name was specified, `force_in_shard` is ignored.
-    fn generate_local_agent_id(
-        component_id: ComponentId,
-        force_in_shard: &HashSet<ShardId>,
-        number_of_shards: usize,
-    ) -> AgentId {
-        if force_in_shard.is_empty() || number_of_shards == 0 {
-            let agent_name = Uuid::new_v4().to_string();
-            AgentId {
-                component_id,
-                agent_id: agent_name,
-            }
-        } else {
-            let mut current = Uuid::new_v4().to_u128_le();
-            loop {
-                let uuid = Uuid::from_u128_le(current);
-                let agent_name = uuid.to_string();
-                let agent_id = AgentId {
-                    component_id,
-                    agent_id: agent_name,
-                };
-                let shard_id = ShardId::from_agent_id(&agent_id, number_of_shards);
-                if force_in_shard.contains(&shard_id) {
-                    return agent_id;
-                }
-                current += 1;
-            }
-        }
+/// Everything that identifies the one plugin worker an executor runs for a plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PluginWorkerIdentity {
+    /// Environment of the source agents served (the `WorkerKey`'s environment).
+    environment_id: EnvironmentId,
+    plugin_registration_id: PluginRegistrationId,
+    /// The plugin component revision the worker runs: a new revision gets a new worker,
+    /// never an old worker silently running an outdated revision.
+    component_revision: ComponentRevision,
+    /// See `PerExecutorOplogProcessorPlugin::generations`.
+    generation: u64,
+}
+
+/// Derives the name of the plugin worker this executor runs for `identity`.
+///
+/// The name is deterministic: the first candidate (`n = 0, 1, ...`) whose shard is
+/// owned by this executor. With an unchanged shard assignment every restart derives the
+/// SAME worker, so a restart neither orphans the previous plugin worker (and its oplog)
+/// nor leaves source agents retrying batches against a worker nobody uses any more.
+/// Executors owning disjoint shard sets derive different workers. If `force_in_shard`
+/// holds no shard below `number_of_shards`, the first candidate is used.
+fn generate_local_plugin_agent_id(
+    component_id: ComponentId,
+    identity: &PluginWorkerIdentity,
+    force_in_shard: &HashSet<ShardId>,
+    number_of_shards: usize,
+) -> AgentId {
+    let candidate = |n: u64| AgentId {
+        component_id,
+        agent_id: plugin_worker_name(identity, n),
+    };
+    let in_range = |shard: &ShardId| (0..number_of_shards as i64).contains(&shard.value());
+    if number_of_shards == 0 || !force_in_shard.iter().any(in_range) {
+        return candidate(0);
     }
+    (0u64..)
+        .map(candidate)
+        .find(|agent_id| {
+            force_in_shard.contains(&ShardId::from_agent_id(agent_id, number_of_shards))
+        })
+        .expect("an owned shard is hit by some candidate")
+}
+
+fn plugin_worker_name(identity: &PluginWorkerIdentity, candidate: u64) -> String {
+    let mut buf = Vec::with_capacity(96);
+    buf.extend_from_slice(b"oplog-proc-worker-v1\0");
+    buf.extend_from_slice(identity.environment_id.0.as_bytes());
+    buf.extend_from_slice(identity.plugin_registration_id.0.as_bytes());
+    buf.extend_from_slice(&identity.component_revision.get().to_be_bytes());
+    buf.extend_from_slice(&identity.generation.to_be_bytes());
+    buf.extend_from_slice(&candidate.to_be_bytes());
+    Uuid::new_v5(&OPLOG_PROC_NS, &buf).to_string()
 }
 
 #[async_trait]
@@ -430,9 +476,21 @@ impl<Ctx: WorkerCtx> OplogProcessorPlugin for PerExecutorOplogProcessorPlugin<Ct
         Ok(())
     }
 
-    async fn invalidate_target(&self, environment_id: EnvironmentId, plugin: &InstalledPlugin) {
+    async fn invalidate_target(
+        &self,
+        environment_id: EnvironmentId,
+        plugin: &InstalledPlugin,
+        failed_target: &AgentId,
+    ) {
+        let key = (environment_id, plugin.plugin_registration_id);
         let mut workers = self.workers.write().await;
-        workers.remove(&(environment_id, plugin.plugin_registration_id));
+        if workers
+            .get(&key)
+            .is_some_and(|running| running.owned_agent_id.agent_id == *failed_target)
+        {
+            workers.remove(&key);
+            *self.generations.lock().unwrap().entry(key).or_insert(0) += 1;
+        }
     }
 
     async fn is_local(&self, agent_id: &AgentId) -> Result<bool, WorkerExecutorError> {
@@ -496,6 +554,7 @@ impl<Ctx: WorkerCtx> Clone for PerExecutorOplogProcessorPlugin<Ctx> {
     fn clone(&self) -> Self {
         Self {
             workers: self.workers.clone(),
+            generations: self.generations.clone(),
             component_service: self.component_service.clone(),
             shard_service: self.shard_service.clone(),
             worker_activator: self.worker_activator.clone(),
@@ -1260,8 +1319,18 @@ impl ForwardingOplogState {
             "Oplog processor: flushing batch to plugin"
         );
 
-        let target_agent_id = if let Some(id) = &live.target_agent_id {
-            id.clone()
+        let recorded_target = match &live.target_agent_id {
+            Some(recorded)
+                if !self
+                    .is_stale_local_target(metadata, &plugin, recorded)
+                    .await =>
+            {
+                Some(recorded.clone())
+            }
+            _ => None,
+        };
+        let target_agent_id = if let Some(id) = recorded_target {
+            id
         } else {
             match self
                 .oplog_plugins
@@ -1272,13 +1341,16 @@ impl ForwardingOplogState {
                     tracing::info!(
                         plugin_name = plugin.plugin_name,
                         target_agent = %id,
+                        previous_target = ?live.target_agent_id,
                         "Oplog processor: resolved target plugin worker"
                     );
+                    // Cursors are kept as they are: an unconfirmed range stays
+                    // unconfirmed and is (re)sent to the new target below.
                     self.write_checkpoint(
                         grant_id,
                         &id,
                         live.confirmed_up_to,
-                        live.confirmed_up_to,
+                        live.sending_up_to,
                         live.last_batch_start,
                     )
                     .await;
@@ -1397,7 +1469,7 @@ impl ForwardingOplogState {
                 if target_is_local {
                     // Local failure: invalidate target so next flush creates a fresh instance
                     self.oplog_plugins
-                        .invalidate_target(metadata.environment_id, &plugin)
+                        .invalidate_target(metadata.environment_id, &plugin, &target_agent_id)
                         .await;
                     if let Some(s) = self.plugin_state.get_mut(&grant_id) {
                         s.target_agent_id = None;
@@ -1412,6 +1484,46 @@ impl ForwardingOplogState {
                     }
                 }
             }
+        }
+    }
+
+    /// A recorded target is stale when this executor owns it but it is not the plugin
+    /// worker this executor currently runs for the plugin: nothing sends to such a worker
+    /// any more (it belongs to an earlier generation, e.g. one invalidated after a failed
+    /// send, or to a plugin component revision no longer installed), so batches recorded
+    /// against it would be retried against it forever, waking it (and replaying its
+    /// whole oplog) on every attempt. A target on another executor is never stale here:
+    /// delivery keeps going to it and `try_locality_recovery` migrates away from it.
+    ///
+    /// Re-targeting is at-least-once: an unconfirmed batch is re-sent to the current
+    /// worker (after the status check on the stale one, which only reads its status and
+    /// does not run it), and plugin state derived by the stale worker for this source
+    /// agent (e.g. spans opened in earlier batches) is not carried over.
+    async fn is_stale_local_target(
+        &self,
+        metadata: &AgentMetadata,
+        plugin: &InstalledPlugin,
+        recorded: &AgentId,
+    ) -> bool {
+        if !matches!(self.oplog_plugins.is_local(recorded).await, Ok(true)) {
+            return false;
+        }
+        match self
+            .oplog_plugins
+            .resolve_target(metadata.environment_id, plugin)
+            .await
+        {
+            Ok(current) if current != *recorded => {
+                tracing::warn!(
+                    plugin_name = plugin.plugin_name,
+                    source_agent = %self.initial_worker_metadata.agent_id,
+                    stale_target = %recorded,
+                    current_target = %current,
+                    "Oplog processor: recorded target plugin worker is stale, re-targeting"
+                );
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1839,11 +1951,16 @@ mod tests {
         /// Status returned by `lookup_invocation_status`. Defaults to `Unknown` (matches
         /// the previous hardcoded behavior); override via `set_status` per test.
         status: async_lock::Mutex<InvocationStatus>,
+        /// What `resolve_target` returns: the plugin worker this executor currently runs.
+        current_target: AgentId,
+        /// Targets `is_local` reports as owned by another executor.
+        remote_targets: HashSet<AgentId>,
     }
 
     #[derive(Debug, Clone)]
     #[allow(dead_code)]
     struct RecordedSend {
+        target_agent_id: AgentId,
         initial_oplog_index: OplogIndex,
         entry_count: usize,
     }
@@ -1859,7 +1976,17 @@ mod tests {
                 sends: async_lock::Mutex::new(Vec::new()),
                 lookups: async_lock::Mutex::new(Vec::new()),
                 status: async_lock::Mutex::new(InvocationStatus::Unknown),
+                current_target: AgentId {
+                    component_id: ComponentId::new(),
+                    agent_id: "mock-target".to_string(),
+                },
+                remote_targets: HashSet::new(),
             }
+        }
+
+        fn with_remote_target(mut self, target: AgentId) -> Self {
+            self.remote_targets.insert(target);
+            self
         }
 
         async fn send_count(&self) -> usize {
@@ -1886,21 +2013,19 @@ mod tests {
             _environment_id: EnvironmentId,
             _plugin: &InstalledPlugin,
         ) -> Result<AgentId, WorkerExecutorError> {
-            Ok(AgentId {
-                component_id: ComponentId::new(),
-                agent_id: "mock-target".to_string(),
-            })
+            Ok(self.current_target.clone())
         }
 
         async fn send(
             &self,
             _worker_metadata: AgentMetadata,
             _plugin: &InstalledPlugin,
-            _target_agent_id: &AgentId,
+            target_agent_id: &AgentId,
             initial_oplog_index: OplogIndex,
             entries: Vec<OplogEntry>,
         ) -> Result<(), WorkerExecutorError> {
             self.sends.lock().await.push(RecordedSend {
+                target_agent_id: target_agent_id.clone(),
                 initial_oplog_index,
                 entry_count: entries.len(),
             });
@@ -1911,12 +2036,13 @@ mod tests {
             &self,
             _environment_id: EnvironmentId,
             _plugin: &InstalledPlugin,
+            _failed_target: &AgentId,
         ) {
             // no-op in tests
         }
 
-        async fn is_local(&self, _agent_id: &AgentId) -> Result<bool, WorkerExecutorError> {
-            Ok(true)
+        async fn is_local(&self, agent_id: &AgentId) -> Result<bool, WorkerExecutorError> {
+            Ok(!self.remote_targets.contains(agent_id))
         }
 
         async fn on_shard_assignment_changed(&self) -> Result<(), WorkerExecutorError> {
@@ -2370,8 +2496,7 @@ mod tests {
     async fn unconfirmed_batch_status_checked_as_original_worker_owner() {
         let grant_id = EnvironmentPluginGrantId::new();
         let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
-        let mut state =
-            unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
+        let mut state = unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
         let worker_owner = state.initial_worker_metadata.created_by;
 
         // First tick: nothing sent yet, so this just enqueues — no status check.
@@ -2403,8 +2528,7 @@ mod tests {
         let grant_id = EnvironmentPluginGrantId::new();
         let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
         recording_plugin.set_status(InvocationStatus::Unknown).await;
-        let mut state =
-            unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
+        let mut state = unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
 
         state.try_flush().await; // original send
         state.try_flush().await; // status check (Unknown) -> immediate retry
@@ -2429,8 +2553,7 @@ mod tests {
     async fn unconfirmed_batch_is_confirmed_and_not_resent_when_complete() {
         let grant_id = EnvironmentPluginGrantId::new();
         let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
-        let mut state =
-            unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
+        let mut state = unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
 
         state.try_flush().await; // original send
         recording_plugin
@@ -2456,13 +2579,10 @@ mod tests {
     async fn unconfirmed_batch_not_resent_while_genuinely_pending() {
         let grant_id = EnvironmentPluginGrantId::new();
         let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
-        let mut state =
-            unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
+        let mut state = unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
 
         state.try_flush().await; // original send
-        recording_plugin
-            .set_status(InvocationStatus::Pending)
-            .await;
+        recording_plugin.set_status(InvocationStatus::Pending).await;
         state.try_flush().await; // status check (Pending, fresh) -> wait, no resend
 
         assert_eq!(
@@ -2472,5 +2592,217 @@ mod tests {
         );
         let live = state.plugin_state.get(&grant_id).unwrap();
         assert_eq!(live.confirmed_up_to, OplogIndex::NONE);
+    }
+
+    // --------------------------------------------------------------------------
+    // Plugin worker identity: stable across restarts, distinct per identity
+    // --------------------------------------------------------------------------
+
+    fn plugin_identity() -> PluginWorkerIdentity {
+        PluginWorkerIdentity {
+            environment_id: EnvironmentId::new(),
+            plugin_registration_id: PluginRegistrationId::new(),
+            component_revision: ComponentRevision::INITIAL,
+            generation: 0,
+        }
+    }
+
+    /// Regression test for the orphaned-exporter bug: the plugin worker name used to be a
+    /// random UUID per process, so every restart created a new plugin worker while the
+    /// previous one (and its oplog) stayed behind, still targeted by source agents.
+    #[test]
+    fn plugin_worker_id_is_stable_for_the_same_identity_and_shards() {
+        let component_id = ComponentId::new();
+        let identity = plugin_identity();
+        let shards = HashSet::from([ShardId::new(3), ShardId::new(7)]);
+
+        let first = generate_local_plugin_agent_id(component_id, &identity, &shards, 16);
+        let after_restart =
+            generate_local_plugin_agent_id(component_id, &identity.clone(), &shards, 16);
+
+        assert_eq!(first, after_restart);
+        assert!(shards.contains(&ShardId::from_agent_id(&first, 16)));
+    }
+
+    #[test]
+    fn plugin_worker_id_differs_per_identity_field() {
+        let component_id = ComponentId::new();
+        let base = plugin_identity();
+        let shards = HashSet::new();
+        let id_of = |identity: &PluginWorkerIdentity| {
+            generate_local_plugin_agent_id(component_id, identity, &shards, 0)
+        };
+
+        let variants = [
+            PluginWorkerIdentity {
+                environment_id: EnvironmentId::new(),
+                ..base.clone()
+            },
+            PluginWorkerIdentity {
+                plugin_registration_id: PluginRegistrationId::new(),
+                ..base.clone()
+            },
+            PluginWorkerIdentity {
+                component_revision: ComponentRevision::INITIAL.next().unwrap(),
+                ..base.clone()
+            },
+            PluginWorkerIdentity {
+                generation: 1,
+                ..base.clone()
+            },
+        ];
+        for variant in &variants {
+            assert_ne!(id_of(&base), id_of(variant), "{variant:?}");
+        }
+    }
+
+    #[test]
+    fn plugin_worker_id_lands_in_an_owned_shard() {
+        let component_id = ComponentId::new();
+        let identity = plugin_identity();
+        for owned in 0..8 {
+            let shards = HashSet::from([ShardId::new(owned)]);
+            let agent_id = generate_local_plugin_agent_id(component_id, &identity, &shards, 8);
+            assert_eq!(ShardId::from_agent_id(&agent_id, 8), ShardId::new(owned));
+        }
+    }
+
+    #[test]
+    fn plugin_worker_id_without_an_owned_shard_in_range_uses_first_candidate() {
+        let component_id = ComponentId::new();
+        let identity = plugin_identity();
+        let out_of_range = HashSet::from([ShardId::new(42)]);
+
+        assert_eq!(
+            generate_local_plugin_agent_id(component_id, &identity, &out_of_range, 8),
+            generate_local_plugin_agent_id(component_id, &identity, &HashSet::new(), 8)
+        );
+    }
+
+    // --------------------------------------------------------------------------
+    // Stale recorded targets
+    // --------------------------------------------------------------------------
+
+    fn stale_target() -> AgentId {
+        AgentId {
+            component_id: ComponentId::new(),
+            agent_id: "previous-plugin-worker".to_string(),
+        }
+    }
+
+    /// Regression test: after a restart, a source agent's checkpoint still names the plugin
+    /// worker of the previous process with an unconfirmed batch. That worker is local but
+    /// no longer the current one; the batch must be re-sent to the current plugin worker
+    /// instead of being retried against the stale one forever.
+    #[test]
+    async fn unconfirmed_batch_to_stale_local_target_is_resent_to_current_target() {
+        let grant_id = EnvironmentPluginGrantId::new();
+        let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
+        recording_plugin.set_status(InvocationStatus::Pending).await;
+        let mut state = unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
+        // As seeded from a checkpoint after a restart: batch [1..1] sent, unconfirmed.
+        let live = state.plugin_state.get_mut(&grant_id).unwrap();
+        live.target_agent_id = Some(stale_target());
+        live.sending_up_to = OplogIndex::from_u64(1);
+        live.last_batch_start = OplogIndex::from_u64(1);
+
+        state.try_flush().await;
+
+        let sends = recording_plugin.sends().await;
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].target_agent_id, recording_plugin.current_target);
+        assert_eq!(sends[0].initial_oplog_index, OplogIndex::from_u64(1));
+        let live = state.plugin_state.get(&grant_id).unwrap();
+        assert_eq!(
+            live.target_agent_id.as_ref(),
+            Some(&recording_plugin.current_target)
+        );
+        assert_eq!(live.confirmed_up_to, OplogIndex::NONE);
+        let written = state.inner.read_many(OplogIndex::INITIAL, 100).await;
+        let checkpoint_target = written.values().find_map(|e| match e {
+            OplogEntry::OplogProcessorCheckpoint {
+                target_agent_id,
+                sending_up_to,
+                ..
+            } => Some((target_agent_id.clone(), *sending_up_to)),
+            _ => None,
+        });
+        assert_eq!(
+            checkpoint_target,
+            Some((
+                recording_plugin.current_target.clone(),
+                OplogIndex::from_u64(1)
+            )),
+            "The new target must be checkpointed with the unconfirmed range kept"
+        );
+    }
+
+    #[test]
+    async fn new_batch_after_stale_local_target_goes_to_current_target() {
+        let grant_id = EnvironmentPluginGrantId::new();
+        let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
+        let mut state = unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
+        state
+            .plugin_state
+            .get_mut(&grant_id)
+            .unwrap()
+            .target_agent_id = Some(stale_target());
+
+        state.try_flush().await;
+
+        let sends = recording_plugin.sends().await;
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].target_agent_id, recording_plugin.current_target);
+    }
+
+    /// A target owned by another executor is not stale: delivery keeps going there (no
+    /// duplicate delivery to two plugin workers) until locality recovery migrates it.
+    #[test]
+    async fn remote_recorded_target_is_kept() {
+        let grant_id = EnvironmentPluginGrantId::new();
+        let remote = stale_target();
+        let recording_plugin =
+            Arc::new(RecordingOplogProcessorPlugin::new().with_remote_target(remote.clone()));
+        let mut state = unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
+        state
+            .plugin_state
+            .get_mut(&grant_id)
+            .unwrap()
+            .target_agent_id = Some(remote.clone());
+
+        state.try_flush().await;
+
+        let sends = recording_plugin.sends().await;
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].target_agent_id, remote);
+    }
+
+    #[test]
+    async fn current_recorded_target_is_kept() {
+        let grant_id = EnvironmentPluginGrantId::new();
+        let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
+        let mut state = unconfirmed_batch_test_state(grant_id, recording_plugin.clone()).await;
+        state
+            .plugin_state
+            .get_mut(&grant_id)
+            .unwrap()
+            .target_agent_id = Some(recording_plugin.current_target.clone());
+
+        state.try_flush().await;
+
+        let sends = recording_plugin.sends().await;
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].target_agent_id, recording_plugin.current_target);
+        let checkpoints = state
+            .inner
+            .read_many(OplogIndex::INITIAL, 100)
+            .await
+            .into_values()
+            .filter(|e| matches!(e, OplogEntry::OplogProcessorCheckpoint { .. }))
+            .count();
+        assert_eq!(
+            checkpoints, 1,
+            "Only the pre-send checkpoint, no re-target checkpoint for an unchanged target"
+        );
     }
 }

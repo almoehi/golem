@@ -2263,3 +2263,105 @@ pub async fn test_update_call_counts_batch(deps: &Deps) {
         "a2 should not appear in RPC response"
     );
 }
+
+/// The built-in plugin provisioner moves a built-in oplog processor registration to the
+/// component revision holding the wasm it bundles, keeping the one row (no second
+/// registration with the same name and version).
+pub async fn test_plugin_set_oplog_processor_component(deps: &Deps) {
+    let user = deps.create_account().await;
+    let app = deps.create_application(user.revision.account_id).await;
+    let env = deps.create_env(app.revision.application_id).await;
+    let component_id = new_repo_uuid();
+
+    let revision_0 = ComponentRevisionRecord {
+        component_id,
+        revision_id: 0,
+        hash: SqlBlake3Hash::empty(),
+        audit: DeletableRevisionAuditFields::new(user.revision.account_id),
+        size: 10.into(),
+        metadata: Blob::new(ComponentMetadata::from_parts(
+            KnownExports::default(),
+            vec![],
+            None,
+            None,
+            vec![],
+            std::collections::BTreeMap::new(),
+        )),
+        object_store_key: "exporter".to_string(),
+        binary_hash: blake3::hash("exporter-0".as_bytes()).into(),
+    }
+    .with_updated_hash()
+    .unwrap();
+    deps.component_repo
+        .create(
+            env.revision.environment_id,
+            "otlp:exporter",
+            revision_0.clone(),
+        )
+        .await
+        .unwrap();
+    let revision_1 = ComponentRevisionRecord {
+        revision_id: 1,
+        binary_hash: blake3::hash("exporter-1".as_bytes()).into(),
+        ..revision_0.clone()
+    }
+    .with_updated_hash()
+    .unwrap();
+    deps.component_repo.update(revision_1).await.unwrap();
+
+    let plugin = deps
+        .plugin_repo
+        .create(PluginRecord {
+            plugin_id: new_repo_uuid(),
+            account_id: user.revision.account_id,
+            name: "golem-otlp-exporter".to_string(),
+            version: "1.5.0".to_string(),
+            audit: ImmutableAuditFields::new(user.revision.account_id),
+            description: "".to_string(),
+            icon: vec![],
+            homepage: "".to_string(),
+            plugin_type: 0,
+            provided_wit_package: None,
+            json_schema: None,
+            validate_url: None,
+            transform_url: None,
+            component_id: Some(component_id),
+            component_revision_id: Some(0),
+            wasm_content_hash: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let moved = deps
+        .plugin_repo
+        .set_oplog_processor_component(plugin.plugin_id, component_id, 1)
+        .await
+        .unwrap();
+    let_assert!(Some(moved) = moved);
+    check!(moved.component_revision_id == Some(1));
+
+    let read = deps
+        .plugin_repo
+        .get_by_name_and_version(user.revision.account_id, "golem-otlp-exporter", "1.5.0")
+        .await
+        .unwrap();
+    let_assert!(Some(read) = read);
+    check!(read.plugin_id == plugin.plugin_id);
+    check!(read.component_revision_id == Some(1));
+    check!(
+        deps.plugin_repo
+            .list_by_account(user.revision.account_id)
+            .await
+            .unwrap()
+            .len()
+            == 1
+    );
+
+    let missing = deps
+        .plugin_repo
+        .set_oplog_processor_component(new_repo_uuid(), component_id, 1)
+        .await
+        .unwrap();
+    check!(missing.is_none());
+}

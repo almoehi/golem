@@ -1,7 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct WorkerState {
     pub(crate) trace_id: String,
     pub(crate) trace_states: Vec<String>,
@@ -30,7 +31,7 @@ impl WorkerState {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PendingSpan {
     pub(crate) span_id: String,
     pub(crate) parent_span_id: Option<String>,
@@ -39,6 +40,9 @@ pub(crate) struct PendingSpan {
 }
 
 thread_local! {
+    /// Derived per-source-agent state (open spans, ...), keyed by `helpers::worker_key`.
+    /// The only state this component keeps across `process` calls, so it is all a
+    /// snapshot has to carry (see `snapshot.rs`).
     pub(crate) static WORKER_STATES: RefCell<HashMap<String, WorkerState>> =
         RefCell::new(HashMap::new());
 }

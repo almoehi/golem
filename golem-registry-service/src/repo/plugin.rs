@@ -31,6 +31,16 @@ pub trait PluginRepo: Send + Sync {
     ) -> RepoResult<Option<PluginRecord>>;
 
     async fn list_by_account(&self, account_id: Uuid) -> RepoResult<Vec<PluginRecord>>;
+
+    /// Points an oplog processor registration at another component revision. Only the
+    /// built-in plugin provisioner does this, to move a built-in plugin to the revision
+    /// holding the wasm it bundles; user registrations are immutable.
+    async fn set_oplog_processor_component(
+        &self,
+        plugin_id: Uuid,
+        component_id: Uuid,
+        component_revision_id: i64,
+    ) -> RepoResult<Option<PluginRecord>>;
 }
 
 pub struct LoggedPluginRepo<Repo: PluginRepo> {
@@ -98,6 +108,18 @@ impl<Repo: PluginRepo> PluginRepo for LoggedPluginRepo<Repo> {
         self.repo
             .list_by_account(account_id)
             .instrument(Self::span_account(account_id))
+            .await
+    }
+
+    async fn set_oplog_processor_component(
+        &self,
+        plugin_id: Uuid,
+        component_id: Uuid,
+        component_revision_id: i64,
+    ) -> RepoResult<Option<PluginRecord>> {
+        self.repo
+            .set_oplog_processor_component(plugin_id, component_id, component_revision_id)
+            .instrument(Self::span_id(plugin_id))
             .await
     }
 }
@@ -286,6 +308,36 @@ impl PluginRepo for DbPluginRepo<PostgresPool> {
                         AND p.deleted_at IS NULL
                 "#})
                 .bind(account_id),
+            )
+            .await
+    }
+
+    async fn set_oplog_processor_component(
+        &self,
+        plugin_id: Uuid,
+        component_id: Uuid,
+        component_revision_id: i64,
+    ) -> RepoResult<Option<PluginRecord>> {
+        self.with_rw("set_oplog_processor_component")
+            .fetch_optional_as(
+                sqlx::query_as(indoc! {r#"
+                    UPDATE plugins
+                    SET
+                        component_id = $2, component_revision_id = $3
+                    WHERE
+                        plugin_id = $1 AND deleted_at IS NULL AND component_id IS NOT NULL
+                    RETURNING
+                        plugin_id, account_id, name, version,
+                        created_at, created_by, deleted_at, deleted_by,
+                        description, icon, homepage, plugin_type,
+                        provided_wit_package,
+                        json_schema, validate_url, transform_url,
+                        component_id, component_revision_id,
+                        wasm_content_hash
+                "#})
+                .bind(plugin_id)
+                .bind(component_id)
+                .bind(component_revision_id),
             )
             .await
     }

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod error;
+mod plugin_revisions;
 mod utils;
 mod write;
 
@@ -22,6 +23,7 @@ use super::component_object_store::ComponentObjectStore;
 use super::deployment::DeploymentService;
 use super::environment::EnvironmentService;
 use crate::repo::component::ComponentRepo;
+use crate::repo::plugin::PluginRepo;
 use crate::services::deployment::DeploymentError;
 use crate::services::environment::EnvironmentError;
 use futures::stream::BoxStream;
@@ -32,6 +34,8 @@ use golem_common::model::environment::{Environment, EnvironmentId};
 use golem_service_base::model::auth::AuthCtx;
 use golem_service_base::model::auth::EnvironmentAction;
 use golem_service_base::model::component::Component;
+use golem_service_base::model::plugin_registration::{PluginRegistration, PluginSpec};
+use plugin_revisions::RegisteredOplogProcessors;
 use std::sync::Arc;
 use tracing::info;
 
@@ -40,6 +44,7 @@ pub struct ComponentService {
     object_store: Arc<ComponentObjectStore>,
     environment_service: Arc<EnvironmentService>,
     deployment_service: Arc<DeploymentService>,
+    plugin_repo: Arc<dyn PluginRepo>,
 }
 
 impl ComponentService {
@@ -48,13 +53,58 @@ impl ComponentService {
         object_store: Arc<ComponentObjectStore>,
         environment_service: Arc<EnvironmentService>,
         deployment_service: Arc<DeploymentService>,
+        plugin_repo: Arc<dyn PluginRepo>,
     ) -> Self {
         Self {
             component_repo,
             object_store,
             environment_service,
             deployment_service,
+            plugin_repo,
         }
+    }
+
+    /// `component` with its installed oplog processor plugins at the revision their
+    /// registrations name now (see `plugin_revisions`). Every read returns components
+    /// through this.
+    async fn with_current_plugin_revisions(
+        &self,
+        component: Component,
+    ) -> Result<Component, ComponentError> {
+        let mut registered = RegisteredOplogProcessors::new();
+        for registration_id in
+            plugin_revisions::installed_oplog_processor_registrations(&component.metadata)
+        {
+            let Some(record) = self.plugin_repo.get_by_id(registration_id.0, true).await? else {
+                continue;
+            };
+            let registration = PluginRegistration::try_from(record)?;
+            let PluginSpec::OplogProcessor(spec) = registration.spec;
+            registered.insert(
+                registration_id,
+                (spec.component_id, spec.component_revision),
+            );
+        }
+        Ok(
+            match plugin_revisions::with_registered_revisions(&component.metadata, &registered) {
+                Some(metadata) => Component {
+                    metadata,
+                    ..component
+                },
+                None => component,
+            },
+        )
+    }
+
+    async fn all_with_current_plugin_revisions(
+        &self,
+        components: Vec<Component>,
+    ) -> Result<Vec<Component>, ComponentError> {
+        let mut result = Vec::with_capacity(components.len());
+        for component in components {
+            result.push(self.with_current_plugin_revisions(component).await?);
+        }
+        Ok(result)
     }
 
     pub async fn get_staged_component(
@@ -88,7 +138,10 @@ impl ComponentService {
         )
         .map_err(|_| ComponentError::ComponentNotFound(component_id))?;
 
-        Ok(record.try_into_model(environment.application_id, environment.owner_account_id)?)
+        self.with_current_plugin_revisions(
+            record.try_into_model(environment.application_id, environment.owner_account_id)?,
+        )
+        .await
     }
 
     pub async fn get_deployed_component(
@@ -125,7 +178,10 @@ impl ComponentService {
         )
         .map_err(|_| ComponentError::ComponentNotFound(component_id))?;
 
-        Ok(record.try_into_model(environment.application_id, environment.owner_account_id)?)
+        self.with_current_plugin_revisions(
+            record.try_into_model(environment.application_id, environment.owner_account_id)?,
+        )
+        .await
     }
 
     pub async fn get_all_deployed_component_versions(
@@ -170,7 +226,7 @@ impl ComponentService {
             .map(|r| r.try_into_model(environment.application_id, environment.owner_account_id))
             .collect::<Result<_, _>>()?;
 
-        Ok(components)
+        self.all_with_current_plugin_revisions(components).await
     }
 
     pub async fn get_component_revision(
@@ -206,7 +262,10 @@ impl ComponentService {
         )
         .map_err(|_| ComponentError::ComponentNotFound(component_id))?;
 
-        Ok(record.try_into_model(environment.application_id, environment.owner_account_id)?)
+        self.with_current_plugin_revisions(
+            record.try_into_model(environment.application_id, environment.owner_account_id)?,
+        )
+        .await
     }
 
     pub async fn list_staged_components(
@@ -250,7 +309,7 @@ impl ComponentService {
             .map(|r| r.try_into_model(environment.application_id, environment.owner_account_id))
             .collect::<Result<_, _>>()?;
 
-        Ok(result)
+        self.all_with_current_plugin_revisions(result).await
     }
 
     pub async fn get_staged_component_by_name(
@@ -291,7 +350,10 @@ impl ComponentService {
                 component_name.clone(),
             ))?;
 
-        Ok(record.try_into_model(environment.application_id, environment.owner_account_id)?)
+        self.with_current_plugin_revisions(
+            record.try_into_model(environment.application_id, environment.owner_account_id)?,
+        )
+        .await
     }
 
     pub async fn get_deployed_component_by_name(
@@ -335,7 +397,7 @@ impl ComponentService {
         let converted =
             record.try_into_model(environment.application_id, environment.owner_account_id)?;
 
-        Ok(converted)
+        self.with_current_plugin_revisions(converted).await
     }
 
     pub async fn list_deployment_components(
@@ -378,7 +440,7 @@ impl ComponentService {
             .map(|r| r.try_into_model(environment.application_id, environment.owner_account_id))
             .collect::<Result<_, _>>()?;
 
-        Ok(result)
+        self.all_with_current_plugin_revisions(result).await
     }
 
     pub async fn get_deployment_component_by_name(
@@ -428,7 +490,10 @@ impl ComponentService {
                 component_name.clone(),
             ))?;
 
-        Ok(record.try_into_model(environment.application_id, environment.owner_account_id)?)
+        self.with_current_plugin_revisions(
+            record.try_into_model(environment.application_id, environment.owner_account_id)?,
+        )
+        .await
     }
 
     pub async fn download_component_wasm(

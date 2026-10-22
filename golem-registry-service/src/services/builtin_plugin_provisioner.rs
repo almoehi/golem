@@ -368,3 +368,30 @@ async fn register_plugin(
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::BUILTIN_PLUGINS;
+    use golem_common::model::component_metadata::ComponentMetadata;
+    use std::collections::BTreeMap;
+    use test_r::test;
+
+    /// A built-in oplog processor runs as one long-lived plugin worker per executor. Only
+    /// with `save-snapshot` / `load-snapshot` exported does the executor snapshot it
+    /// (`oplog.oplog_processor_snapshotting`); without them every recovery replays every
+    /// batch it ever processed.
+    #[test]
+    fn builtin_oplog_processors_are_snapshot_capable() {
+        for plugin in BUILTIN_PLUGINS {
+            let metadata = ComponentMetadata::analyse_component(
+                plugin.wasm_bytes,
+                Vec::new(),
+                BTreeMap::new(),
+            )
+            .unwrap();
+            assert!(metadata.has_oplog_processor(), "{}", plugin.plugin_name);
+            assert!(metadata.has_save_snapshot(), "{}", plugin.plugin_name);
+            assert!(metadata.has_load_snapshot(), "{}", plugin.plugin_name);
+        }
+    }
+}

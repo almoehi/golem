@@ -4,6 +4,7 @@ mod export;
 mod helpers;
 mod otlp_json;
 mod processing;
+mod snapshot;
 mod state;
 
 use config::ExporterConfig;

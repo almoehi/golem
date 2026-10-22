@@ -457,3 +457,8 @@ async fn test_pg_notify_propagates_through_notifier(db: &PostgresDb) {
 
     join_set.abort_all();
 }
+
+#[test]
+async fn test_plugin_set_oplog_processor_component(#[dimension(postgres_variant)] deps: &Deps) {
+    crate::repo::common::test_plugin_set_oplog_processor_component(deps).await;
+}

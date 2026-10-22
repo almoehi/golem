@@ -238,3 +238,8 @@ async fn test_registry_change_cursor_expired_detection(deps: &Deps) {
 async fn test_registry_change_mixed_event_types(deps: &Deps) {
     crate::repo::common::test_registry_change_mixed_event_types(deps).await;
 }
+
+#[test]
+async fn test_plugin_set_oplog_processor_component(deps: &Deps) {
+    crate::repo::common::test_plugin_set_oplog_processor_component(deps).await;
+}

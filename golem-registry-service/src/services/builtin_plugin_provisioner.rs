@@ -25,7 +25,9 @@ use golem_common::model::application::{
     Application, ApplicationCreation, ApplicationId, ApplicationName,
 };
 use golem_common::model::base64::Base64;
-use golem_common::model::component::{ComponentCreation, ComponentName, ComponentUpdate};
+use golem_common::model::component::{
+    ComponentCreation, ComponentId, ComponentName, ComponentRevision, ComponentUpdate,
+};
 use golem_common::model::deployment::{DeploymentCreation, DeploymentVersion};
 use golem_common::model::diff;
 use golem_common::model::environment::{
@@ -325,6 +327,34 @@ async fn deploy_environment(
     }
 }
 
+/// What provisioning has to do about a built-in plugin's registration.
+#[derive(Debug, PartialEq, Eq)]
+enum RegistrationAction {
+    Create,
+    /// The registration names another component revision than the one holding the
+    /// bundled wasm (the component was just updated to it): move it there.
+    MoveTo(ComponentId, ComponentRevision),
+    UpToDate,
+}
+
+/// `registered` is the component revision an existing registration names, `bundled` the
+/// one holding the wasm this binary bundles (`upload_or_update_component` creates a new
+/// revision only when the wasm content hash differs).
+fn registration_action(
+    registered: Option<(ComponentId, ComponentRevision)>,
+    bundled: (ComponentId, ComponentRevision),
+) -> RegistrationAction {
+    match registered {
+        None => RegistrationAction::Create,
+        Some(registered) if registered == bundled => RegistrationAction::UpToDate,
+        Some(_) => RegistrationAction::MoveTo(bundled.0, bundled.1),
+    }
+}
+
+/// Registers the built-in plugin, or keeps its one existing registration on the
+/// component revision holding the bundled wasm. Existing installations follow the
+/// registration (`ComponentService` reports installed revisions from it), so source
+/// components need no redeploy.
 async fn register_plugin(
     plugin_registration_service: &Arc<PluginRegistrationService>,
     plugin_repo: &Arc<dyn PluginRepo>,
@@ -335,43 +365,78 @@ async fn register_plugin(
 ) -> anyhow::Result<()> {
     let plugin_name = descriptor.plugin_name;
     let plugin_version = descriptor.version;
-    match plugin_registration_service
-        .register_plugin(
-            account_id,
-            PluginRegistrationCreation {
-                name: plugin_name.to_string(),
-                version: plugin_version.to_string(),
-                description: descriptor.description.to_string(),
-                icon: Base64(Vec::new()),
-                homepage: "https://golem.cloud".to_string(),
-                spec: descriptor.plugin_spec(component),
-            },
-            auth,
-        )
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(PluginRegistrationError::PluginNameAndVersionAlreadyExists) => {
-            let _record = plugin_repo
-                .get_by_name_and_version(account_id.0, plugin_name, plugin_version)
+    let bundled = (component.id, component.revision);
+
+    let existing = || async {
+        plugin_repo
+            .get_by_name_and_version(account_id.0, plugin_name, plugin_version)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to look up existing plugin '{plugin_name}': {e}"))
+    };
+
+    let mut record = existing().await?;
+    if record.is_none() {
+        match plugin_registration_service
+            .register_plugin(
+                account_id,
+                PluginRegistrationCreation {
+                    name: plugin_name.to_string(),
+                    version: plugin_version.to_string(),
+                    description: descriptor.description.to_string(),
+                    icon: Base64(Vec::new()),
+                    homepage: "https://golem.cloud".to_string(),
+                    spec: descriptor.plugin_spec(component),
+                },
+                auth,
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            // Registered concurrently (another registry instance): reconcile with it.
+            Err(PluginRegistrationError::PluginNameAndVersionAlreadyExists) => {
+                record = existing().await?;
+            }
+            Err(other) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to register plugin '{plugin_name}': {other}"
+                ));
+            }
+        }
+    }
+    let record = record
+        .ok_or_else(|| anyhow::anyhow!("Plugin '{plugin_name}' exists but could not be loaded"))?;
+
+    let registered = match (record.component_id, record.component_revision_id) {
+        (Some(component_id), Some(revision)) => Some((
+            ComponentId(component_id),
+            ComponentRevision::new(u64::try_from(revision)?)?,
+        )),
+        _ => None,
+    };
+    match registration_action(registered, bundled) {
+        RegistrationAction::UpToDate | RegistrationAction::Create => Ok(()),
+        RegistrationAction::MoveTo(component_id, revision) => {
+            plugin_repo
+                .set_oplog_processor_component(
+                    record.plugin_id,
+                    component_id.0,
+                    i64::try_from(revision.get())?,
+                )
                 .await
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to look up existing plugin '{plugin_name}': {e}")
-                })?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Plugin '{plugin_name}' exists but could not be loaded")
-                })?;
+                .map_err(|e| anyhow::anyhow!("Failed to update plugin '{plugin_name}': {e}"))?
+                .ok_or_else(|| anyhow::anyhow!("Plugin '{plugin_name}' vanished during update"))?;
+            tracing::info!(
+                "Built-in plugin '{plugin_name}@{plugin_version}' now uses component revision {revision}"
+            );
             Ok(())
         }
-        Err(other) => Err(anyhow::anyhow!(
-            "Failed to register plugin '{plugin_name}': {other}"
-        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::BUILTIN_PLUGINS;
+    use super::{BUILTIN_PLUGINS, RegistrationAction, registration_action};
+    use golem_common::model::component::{ComponentId, ComponentRevision};
     use golem_common::model::component_metadata::ComponentMetadata;
     use std::collections::BTreeMap;
     use test_r::test;
@@ -393,5 +458,41 @@ mod tests {
             assert!(metadata.has_save_snapshot(), "{}", plugin.plugin_name);
             assert!(metadata.has_load_snapshot(), "{}", plugin.plugin_name);
         }
+    }
+
+    fn revision(n: u64) -> ComponentRevision {
+        ComponentRevision::new(n).unwrap()
+    }
+
+    #[test]
+    fn missing_registration_is_created() {
+        let bundled = (ComponentId::new(), revision(0));
+        assert_eq!(
+            registration_action(None, bundled),
+            RegistrationAction::Create
+        );
+    }
+
+    #[test]
+    fn registration_on_the_bundled_revision_is_left_alone() {
+        let bundled = (ComponentId::new(), revision(3));
+        assert_eq!(
+            registration_action(Some(bundled), bundled),
+            RegistrationAction::UpToDate
+        );
+    }
+
+    /// Regression test: the registration used to stay on the revision of the first
+    /// provisioning forever, so a rebuilt built-in plugin wasm was never used.
+    #[test]
+    fn registration_on_an_older_revision_moves_to_the_bundled_one() {
+        let component_id = ComponentId::new();
+        assert_eq!(
+            registration_action(
+                Some((component_id, revision(0))),
+                (component_id, revision(1))
+            ),
+            RegistrationAction::MoveTo(component_id, revision(1))
+        );
     }
 }

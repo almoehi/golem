@@ -100,9 +100,15 @@ pub trait OplogProcessorPlugin: Send + Sync {
         entries: Vec<OplogEntry>,
     ) -> Result<(), WorkerExecutorError>;
 
-    /// Evicts the cached plugin worker for the given plugin, forcing a fresh
-    /// instance to be created on the next `resolve_target` call.
-    async fn invalidate_target(&self, environment_id: EnvironmentId, plugin: &InstalledPlugin);
+    /// Evicts the cached plugin worker for the given plugin if it is still `failed_target`,
+    /// forcing a fresh instance to be created on the next `resolve_target` call. A failure
+    /// reported against an older target never evicts a newer one.
+    async fn invalidate_target(
+        &self,
+        environment_id: EnvironmentId,
+        plugin: &InstalledPlugin,
+        failed_target: &AgentId,
+    );
 
     async fn on_shard_assignment_changed(&self) -> Result<(), WorkerExecutorError>;
 
@@ -257,7 +263,7 @@ struct PluginWorkerIdentity {
 /// SAME worker, so a restart neither orphans the previous plugin worker (and its oplog)
 /// nor leaves source agents retrying batches against a worker nobody uses any more.
 /// Executors owning disjoint shard sets derive different workers. If `force_in_shard`
-/// is empty, the first candidate is used.
+/// holds no shard below `number_of_shards`, the first candidate is used.
 fn generate_local_plugin_agent_id(
     component_id: ComponentId,
     identity: &PluginWorkerIdentity,
@@ -268,7 +274,8 @@ fn generate_local_plugin_agent_id(
         component_id,
         agent_id: plugin_worker_name(identity, n),
     };
-    if force_in_shard.is_empty() || number_of_shards == 0 {
+    let in_range = |shard: &ShardId| (0..number_of_shards as i64).contains(&shard.value());
+    if number_of_shards == 0 || !force_in_shard.iter().any(in_range) {
         return candidate(0);
     }
     (0u64..)
@@ -469,10 +476,19 @@ impl<Ctx: WorkerCtx> OplogProcessorPlugin for PerExecutorOplogProcessorPlugin<Ct
         Ok(())
     }
 
-    async fn invalidate_target(&self, environment_id: EnvironmentId, plugin: &InstalledPlugin) {
+    async fn invalidate_target(
+        &self,
+        environment_id: EnvironmentId,
+        plugin: &InstalledPlugin,
+        failed_target: &AgentId,
+    ) {
         let key = (environment_id, plugin.plugin_registration_id);
         let mut workers = self.workers.write().await;
-        if workers.remove(&key).is_some() {
+        if workers
+            .get(&key)
+            .is_some_and(|running| running.owned_agent_id.agent_id == *failed_target)
+        {
+            workers.remove(&key);
             *self.generations.lock().unwrap().entry(key).or_insert(0) += 1;
         }
     }
@@ -1453,7 +1469,7 @@ impl ForwardingOplogState {
                 if target_is_local {
                     // Local failure: invalidate target so next flush creates a fresh instance
                     self.oplog_plugins
-                        .invalidate_target(metadata.environment_id, &plugin)
+                        .invalidate_target(metadata.environment_id, &plugin, &target_agent_id)
                         .await;
                     if let Some(s) = self.plugin_state.get_mut(&grant_id) {
                         s.target_agent_id = None;
@@ -1478,6 +1494,11 @@ impl ForwardingOplogState {
     /// against it would be retried against it forever, waking it (and replaying its
     /// whole oplog) on every attempt. A target on another executor is never stale here:
     /// delivery keeps going to it and `try_locality_recovery` migrates away from it.
+    ///
+    /// Re-targeting is at-least-once: an unconfirmed batch is re-sent to the current
+    /// worker (after the status check on the stale one, which only reads its status and
+    /// does not run it), and plugin state derived by the stale worker for this source
+    /// agent (e.g. spans opened in earlier batches) is not carried over.
     async fn is_stale_local_target(
         &self,
         metadata: &AgentMetadata,
@@ -2015,6 +2036,7 @@ mod tests {
             &self,
             _environment_id: EnvironmentId,
             _plugin: &InstalledPlugin,
+            _failed_target: &AgentId,
         ) {
             // no-op in tests
         }
@@ -2643,6 +2665,18 @@ mod tests {
             let agent_id = generate_local_plugin_agent_id(component_id, &identity, &shards, 8);
             assert_eq!(ShardId::from_agent_id(&agent_id, 8), ShardId::new(owned));
         }
+    }
+
+    #[test]
+    fn plugin_worker_id_without_an_owned_shard_in_range_uses_first_candidate() {
+        let component_id = ComponentId::new();
+        let identity = plugin_identity();
+        let out_of_range = HashSet::from([ShardId::new(42)]);
+
+        assert_eq!(
+            generate_local_plugin_agent_id(component_id, &identity, &out_of_range, 8),
+            generate_local_plugin_agent_id(component_id, &identity, &HashSet::new(), 8)
+        );
     }
 
     // --------------------------------------------------------------------------

@@ -3457,19 +3457,40 @@ impl<Ctx: WorkerCtx> ExternalOperations<Ctx> for DurableWorkerCtx<Ctx> {
                 continue;
             };
 
-            // TODO: there is probably a race here between assignment changing and a suspended worker getting woken up.
-            if should_restart_after_shard_assignment_change(&latest_worker_status)
-                && let Err(err) = Worker::get_or_create_running(
-                    this,
-                    &owned_agent_id,
-                    None,
-                    Vec::new(),
-                    None,
-                    None,
-                    &InvocationContextStack::fresh(),
-                    Principal::anonymous(),
+            let is_oplog_processor = match this
+                .component_service()
+                .get_metadata(
+                    owned_agent_id.component_id(),
+                    Some(latest_worker_status.component_revision),
                 )
                 .await
+            {
+                Ok(component) => component.metadata.has_oplog_processor(),
+                Err(err) => {
+                    warn!(
+                        agent_id = %owned_agent_id,
+                        error = %err,
+                        "Failed to get component metadata during shard-assignment recovery"
+                    );
+                    false
+                }
+            };
+
+            // TODO: there is probably a race here between assignment changing and a suspended worker getting woken up.
+            if should_restart_after_shard_assignment_change(
+                &latest_worker_status,
+                is_oplog_processor,
+            ) && let Err(err) = Worker::get_or_create_running(
+                this,
+                &owned_agent_id,
+                None,
+                Vec::new(),
+                None,
+                None,
+                &InvocationContextStack::fresh(),
+                Principal::anonymous(),
+            )
+            .await
             {
                 // Same isolation rationale: don't let one worker that fails to restart abort
                 // recovery of the rest. It will be retried on demand on its next invocation.
@@ -3485,11 +3506,23 @@ impl<Ctx: WorkerCtx> ExternalOperations<Ctx> for DurableWorkerCtx<Ctx> {
     }
 }
 
-fn should_restart_after_shard_assignment_change(status: &AgentStatusRecord) -> bool {
-    matches!(
-        status.status,
-        AgentStatus::Running | AgentStatus::Idle | AgentStatus::Retrying | AgentStatus::Interrupted
-    ) || status.has_pending_work()
+/// Oplog processor plugin workers are never restarted here: their source agents drive
+/// them (a send activates the plugin worker, unconfirmed batches are re-sent), so the
+/// current plugin worker resumes on its next delivery, while a plugin worker no source
+/// sends to any more (e.g. one of an older plugin component revision) stays asleep instead
+/// of replaying its whole oplog on every executor start.
+fn should_restart_after_shard_assignment_change(
+    status: &AgentStatusRecord,
+    is_oplog_processor: bool,
+) -> bool {
+    !is_oplog_processor
+        && (matches!(
+            status.status,
+            AgentStatus::Running
+                | AgentStatus::Idle
+                | AgentStatus::Retrying
+                | AgentStatus::Interrupted
+        ) || status.has_pending_work())
 }
 
 #[cfg(test)]
@@ -3511,7 +3544,7 @@ mod tests {
             manual_update_target_revision: Some(ComponentRevision::INITIAL),
         });
 
-        assert!(should_restart_after_shard_assignment_change(&status));
+        assert!(should_restart_after_shard_assignment_change(&status, false));
     }
 
     #[test]
@@ -3527,7 +3560,27 @@ mod tests {
             kind: PendingUpdateKind::Automatic,
         });
 
-        assert!(should_restart_after_shard_assignment_change(&status));
+        assert!(should_restart_after_shard_assignment_change(&status, false));
+    }
+
+    /// Regression test: every idle OTLP exporter worker, current or orphaned, was restarted on
+    /// executor start and replayed its whole oplog (8 at once exhausted the memory).
+    #[test]
+    fn shard_assignment_recovery_skips_oplog_processor_plugin_workers() {
+        for status in [
+            AgentStatus::Running,
+            AgentStatus::Idle,
+            AgentStatus::Retrying,
+            AgentStatus::Interrupted,
+        ] {
+            let record = AgentStatusRecord {
+                status,
+                ..AgentStatusRecord::default()
+            };
+
+            assert!(should_restart_after_shard_assignment_change(&record, false));
+            assert!(!should_restart_after_shard_assignment_change(&record, true));
+        }
     }
 
     #[test]
@@ -3537,7 +3590,9 @@ mod tests {
             ..AgentStatusRecord::default()
         };
 
-        assert!(!should_restart_after_shard_assignment_change(&status));
+        assert!(!should_restart_after_shard_assignment_change(
+            &status, false
+        ));
     }
 
     #[test]

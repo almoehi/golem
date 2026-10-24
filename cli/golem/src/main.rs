@@ -20,6 +20,12 @@ use golem_cli::main_wrapper;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+// Same allocator as the standalone worker executor (`golem-worker-executor/src/server.rs`): this
+// binary hosts the executor in-process, and glibc malloc's per-thread arenas make every
+// short-lived executor thread hold memory long after it is idle.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     main_wrapper(|| {
         CommandHandler::handle_args(std::env::args_os(), Arc::new(ServerCommandHandler {}))

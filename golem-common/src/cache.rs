@@ -530,7 +530,11 @@ impl<
     }
 
     pub async fn remove(&self, key: &K) {
-        let removed = self.state.items.remove_async(key).await.is_some();
+        // Only cached items are counted (a pending one is counted once it resolves).
+        let removed = matches!(
+            self.state.items.remove_async(key).await,
+            Some((_, Item::Cached { .. }))
+        );
         if removed {
             let count = self.state.count.fetch_sub(1, Ordering::Relaxed);
             record_cache_size(self.name, count.saturating_sub(1));
@@ -782,6 +786,32 @@ mod tests {
             BackgroundEvictionMode::None,
             name,
         )
+    }
+
+    #[test]
+    async fn removing_a_pending_item_keeps_the_count() {
+        let cache = bounded_cache(4, "remove-pending");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let pending = {
+            let cache = cache.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_insert_simple(&1, async move || {
+                        let _ = release_rx.await;
+                        Ok(1)
+                    })
+                    .await
+            })
+        };
+        while !cache.contains_key(&1).await {
+            tokio::task::yield_now().await;
+        }
+        cache.remove(&1).await;
+        assert_eq!(cache.state.count.load(Ordering::Relaxed), 0);
+
+        release_tx.send(()).unwrap();
+        assert_eq!(pending.await.unwrap(), Ok(1));
+        assert_eq!(cache.state.count.load(Ordering::Relaxed), 1);
     }
 
     // ---- Race condition proof tests ----

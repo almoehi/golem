@@ -18,7 +18,7 @@ use bytes::Bytes;
 use golem_common::SafeDisplay;
 use golem_common::config::DbSqliteConfig;
 use golem_common::metrics::db::record_db_serialized_size;
-use golem_service_base::db::sqlite::SqlitePool;
+use golem_service_base::db::sqlite::{SqlitePool, SqlitePoolTuning};
 use golem_service_base::db::{DBValue, LabelledPoolApi, LabelledPoolTransaction, PoolApi};
 use golem_service_base::migration::{IncludedMigrationsDir, Migrations};
 use include_dir::include_dir;
@@ -35,11 +35,21 @@ pub struct SqliteKeyValueStorage {
 
 impl SqliteKeyValueStorage {
     pub async fn configured(config: &DbSqliteConfig) -> Result<Self, String> {
+        Self::configured_with(config, &SqlitePoolTuning::default()).await
+    }
+
+    /// Migrates the database and opens its pools, adjusted by `tuning`.
+    pub async fn configured_with(
+        config: &DbSqliteConfig,
+        tuning: &SqlitePoolTuning,
+    ) -> Result<Self, String> {
         Self::migrate(config).await?;
 
-        let pool = SqlitePool::configured(config).await.map_err(|err| {
-            format!("Sqlite key-value storage pool initialization failed: {err:?}")
-        })?;
+        let pool = SqlitePool::configured_with(config, tuning)
+            .await
+            .map_err(|err| {
+                format!("Sqlite key-value storage pool initialization failed: {err:?}")
+            })?;
 
         Ok(Self { pool })
     }

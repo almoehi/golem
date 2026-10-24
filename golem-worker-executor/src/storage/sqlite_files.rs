@@ -158,20 +158,25 @@ impl<S: SqliteFileStorage> SqliteFiles<S> {
     }
 
     /// Runs `f` on the existing database `db` without adding it to the cache: an open pool is
-    /// reused, otherwise a temporary one is opened and closed afterwards. For one-off passes over
-    /// many databases (scans).
+    /// reused, otherwise a temporary pool with `scope`'s tuning is opened and closed afterwards
+    /// (dropped, if the future is cancelled). For one-off passes over many databases (scans).
+    /// `None` if the database does not exist (it is not created).
     pub async fn with_uncached<R>(
         &self,
         db: &str,
+        scope: DatabaseScope,
         f: impl AsyncFnOnce(&S) -> R,
-    ) -> Result<R, String> {
+    ) -> Result<Option<R>, String> {
         if let Some(storage) = self.cache.get(&db.to_string()).await {
-            return Ok(f(&storage).await);
+            return Ok(Some(f(&storage).await));
         }
-        let storage = S::open(self.config(db), DatabaseScope::PerAgent.tuning()).await?;
+        if !self.file_exists(db).await? {
+            return Ok(None);
+        }
+        let storage = S::open(self.config(db), scope.tuning()).await?;
         let result = f(&storage).await;
         storage.pool().close().await;
-        Ok(result)
+        Ok(Some(result))
     }
 
     /// Drops the pool of `db` from the cache; its connections close once no caller holds the pool

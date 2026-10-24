@@ -254,9 +254,14 @@ impl IndexedStorage for MultiSqliteIndexedStorage {
         for (idx, file_name) in matching_files.iter().enumerate().skip(file_index) {
             // A scan visits every database once: it must not fill (and churn) the pool cache.
             let remaining = count - results.len() as u64;
-            let (next_cursor, mut file_results) = self
+            let scope = if file_name.ends_with(&format!("{SHARED_EPHEMERAL_STEM}.db")) {
+                DatabaseScope::Shared
+            } else {
+                DatabaseScope::PerAgent
+            };
+            let Some(scanned) = self
                 .files
-                .with_uncached(file_name, async |storage| {
+                .with_uncached(file_name, scope, async |storage| {
                     storage
                         .scan(
                             svc_name,
@@ -269,7 +274,13 @@ impl IndexedStorage for MultiSqliteIndexedStorage {
                         .await
                 })
                 .await
-                .map_err(IndexedStorageError::Other)??;
+                .map_err(IndexedStorageError::Other)?
+            else {
+                // Deleted since the directory was listed.
+                current_file_cursor = 0;
+                continue;
+            };
+            let (next_cursor, mut file_results) = scanned?;
 
             results.append(&mut file_results);
 

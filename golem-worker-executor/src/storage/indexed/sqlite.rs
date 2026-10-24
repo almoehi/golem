@@ -21,7 +21,7 @@ use golem_common::SafeDisplay;
 use golem_common::config::DbSqliteConfig;
 use golem_common::metrics::db::record_db_serialized_size;
 use golem_service_base::db::PoolApi;
-use golem_service_base::db::sqlite::SqlitePool;
+use golem_service_base::db::sqlite::{SqlitePool, SqlitePoolTuning};
 use golem_service_base::migration::{IncludedMigrationsDir, Migrations};
 use golem_service_base::repo::RepoError;
 use include_dir::include_dir;
@@ -38,9 +38,17 @@ pub struct SqliteIndexedStorage {
 
 impl SqliteIndexedStorage {
     pub async fn configured(config: &DbSqliteConfig) -> Result<Self, String> {
+        Self::configured_with(config, &SqlitePoolTuning::default()).await
+    }
+
+    /// Migrates the database and opens its pools, adjusted by `tuning`.
+    pub async fn configured_with(
+        config: &DbSqliteConfig,
+        tuning: &SqlitePoolTuning,
+    ) -> Result<Self, String> {
         Self::migrate(config).await?;
 
-        let pool = SqlitePool::configured(config)
+        let pool = SqlitePool::configured_with(config, tuning)
             .await
             .map_err(|err| format!("Sqlite indexed storage pool initialization failed: {err:?}"))?;
 
@@ -58,6 +66,10 @@ impl SqliteIndexedStorage {
 
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    pub fn pool(&self) -> SqlitePool {
+        self.pool.clone()
     }
 
     fn namespace(namespace: IndexedStorageNamespace) -> String {

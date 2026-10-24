@@ -14,128 +14,88 @@
 
 use crate::storage::keyvalue::sqlite::SqliteKeyValueStorage;
 use crate::storage::keyvalue::{KeyValueStorage, KeyValueStorageNamespace};
+use crate::storage::sqlite_files::{DatabaseScope, SqliteFileStorage, SqliteFiles, agent_db_hash};
 use async_trait::async_trait;
 use bytes::Bytes;
-use golem_common::cache::{BackgroundEvictionMode, Cache, FullCacheEvictionMode, SimpleCache};
 use golem_common::config::DbSqliteConfig;
-use golem_common::model::AgentId;
-use std::collections::HashMap;
+use golem_service_base::db::sqlite::{SqlitePool, SqlitePoolTuning};
 use std::fmt::{Debug, Formatter};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Mutex;
+use std::path::Path;
 
-/// KeyValueStorage implementation that uses multiple separate SQLite databases depending
-/// on the namespace.
+/// KeyValueStorage implementation over multiple SQLite databases: the per-agent namespaces
+/// (worker, status, status checkpoint, promises) of an agent share one database
+/// (`kv-worker-<hash>.db`), the global namespaces have one database each. A per-agent database is
+/// created by the agent's first write; reads of an agent that never wrote create nothing.
 pub struct MultiSqliteKeyValueStorage {
-    cache: Cache<String, (), SqliteKeyValueStorage, String>,
-    hash_cache: Arc<Mutex<HashCache>>,
-    root_dir: PathBuf,
-    max_connections: u32,
-    foreign_keys: bool,
+    files: SqliteFiles<SqliteKeyValueStorage>,
 }
 
-struct HashCache {
-    hash_per_agent_id: HashMap<AgentId, String>,
-    agent_id_per_hash: HashMap<String, AgentId>,
+impl SqliteFileStorage for SqliteKeyValueStorage {
+    async fn open(config: DbSqliteConfig, tuning: SqlitePoolTuning) -> Result<Self, String> {
+        SqliteKeyValueStorage::configured_with(&config, &tuning).await
+    }
+
+    fn pool(&self) -> SqlitePool {
+        SqliteKeyValueStorage::pool(self)
+    }
 }
 
 impl MultiSqliteKeyValueStorage {
     pub fn new(root_dir: &Path, max_connections: u32, foreign_keys: bool) -> Self {
-        if !root_dir.exists() {
-            std::fs::create_dir_all(root_dir)
-                .expect("Failed to create root directory for sqlite storage");
-        }
         Self {
-            cache: Cache::new(
-                Some(1024),
-                FullCacheEvictionMode::LeastRecentlyUsed(1),
-                BackgroundEvictionMode::OlderThan {
-                    ttl: Duration::from_secs(21600),
-                    period: Duration::from_secs(60),
-                },
-                "multi-sqlite-kvs",
-            ),
-            hash_cache: Arc::new(Mutex::new(HashCache {
-                hash_per_agent_id: HashMap::new(),
-                agent_id_per_hash: HashMap::new(),
-            })),
-            root_dir: root_dir.to_path_buf(),
-            max_connections,
-            foreign_keys,
+            files: SqliteFiles::new(root_dir, max_connections, foreign_keys, "multi-sqlite-kvs"),
         }
     }
 
-    async fn init_storage(
-        max_connections: u32,
-        foreign_keys: bool,
-        root_dir: PathBuf,
-        database: String,
-    ) -> Result<SqliteKeyValueStorage, String> {
-        // Recreate root_dir if it was deleted after startup (e.g. by a concurrent `golem server clean`).
-        tokio::fs::create_dir_all(&root_dir)
-            .await
-            .map_err(|e| format!("Failed to create kv-store directory {}: {e}", root_dir.display()))?;
-        let config = DbSqliteConfig {
-            database,
-            max_connections,
-            foreign_keys,
-        };
-        SqliteKeyValueStorage::configured(&config).await
+    /// Number of open (cached) databases.
+    pub async fn open_databases(&self) -> usize {
+        self.files.open_databases().await
     }
 
-    async fn storage_by_namespace(
+    /// Number of open connections of all cached databases.
+    pub async fn open_connections(&self) -> u32 {
+        self.files.open_connections().await
+    }
+
+    /// The database holding `namespace`: the single place a namespace is mapped to a file.
+    fn database_of(namespace: &KeyValueStorageNamespace) -> (String, DatabaseScope) {
+        match namespace {
+            KeyValueStorageNamespace::RunningWorkers => {
+                ("kv-running_workers".to_string(), DatabaseScope::Shared)
+            }
+            KeyValueStorageNamespace::Worker { agent_id }
+            | KeyValueStorageNamespace::AgentStatus { agent_id }
+            | KeyValueStorageNamespace::AgentStatusCheckpoint { agent_id }
+            | KeyValueStorageNamespace::Promise { agent_id } => (
+                format!("kv-worker-{}.db", agent_db_hash(agent_id)),
+                DatabaseScope::PerAgent,
+            ),
+            KeyValueStorageNamespace::Schedule => {
+                ("kv-schedule.db".to_string(), DatabaseScope::Shared)
+            }
+            KeyValueStorageNamespace::UserDefined { .. } => {
+                ("kv-user-defined.db".to_string(), DatabaseScope::Shared)
+            }
+        }
+    }
+
+    /// The database of `namespace`, created if missing. For writes.
+    async fn writable(
         &self,
         namespace: &KeyValueStorageNamespace,
     ) -> Result<SqliteKeyValueStorage, String> {
-        let db = self.namespace_to_db(namespace).await;
-        let max_connections = self.max_connections;
-        let foreign_keys = self.foreign_keys;
-        let root_dir = self.root_dir.clone();
-        let db_path = self.root_dir.join(db.clone()).to_string_lossy().to_string();
-        self.cache
-            .get_or_insert_simple(&db, async move || {
-                Self::init_storage(max_connections, foreign_keys, root_dir, db_path).await
-            })
-            .await
+        let (db, scope) = Self::database_of(namespace);
+        self.files.open_or_create(&db, scope).await
     }
 
-    async fn namespace_to_db(&self, namespace: &KeyValueStorageNamespace) -> String {
-        match namespace {
-            KeyValueStorageNamespace::RunningWorkers => "kv-running_workers".to_string(),
-            KeyValueStorageNamespace::Worker { agent_id } => {
-                format!("kv-worker-{}.db", self.agent_id_hash(agent_id).await)
-            }
-            KeyValueStorageNamespace::AgentStatus { agent_id } => {
-                format!("kv-worker-{}.db", self.agent_id_hash(agent_id).await)
-            }
-            KeyValueStorageNamespace::AgentStatusCheckpoint { agent_id } => {
-                format!("kv-worker-{}.db", self.agent_id_hash(agent_id).await)
-            }
-            KeyValueStorageNamespace::Promise { agent_id } => {
-                format!("kv-worker-{}.db", self.agent_id_hash(agent_id).await)
-            }
-            KeyValueStorageNamespace::Schedule => "kv-schedule.db".to_string(),
-            KeyValueStorageNamespace::UserDefined { .. } => "kv-user-defined.db".to_string(),
-        }
-    }
-
-    async fn agent_id_hash(&self, agent_id: &AgentId) -> String {
-        let mut hash_cache = self.hash_cache.lock().await;
-        match hash_cache.hash_per_agent_id.get(agent_id) {
-            Some(hash) => hash.clone(),
-            None => {
-                let hash = format!("{}", blake3::hash(agent_id.to_string().as_bytes()));
-                hash_cache
-                    .hash_per_agent_id
-                    .insert(agent_id.clone(), hash.clone());
-                hash_cache
-                    .agent_id_per_hash
-                    .insert(hash.clone(), agent_id.clone());
-                hash
-            }
-        }
+    /// The database of `namespace` if it exists. For reads and deletes: a missing database is
+    /// empty, and is not created.
+    async fn readable(
+        &self,
+        namespace: &KeyValueStorageNamespace,
+    ) -> Result<Option<SqliteKeyValueStorage>, String> {
+        let (db, scope) = Self::database_of(namespace);
+        self.files.open_existing(&db, scope).await
     }
 }
 
@@ -156,7 +116,7 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         key: &str,
         value: &[u8],
     ) -> Result<(), String> {
-        self.storage_by_namespace(&namespace)
+        self.writable(&namespace)
             .await?
             .set(svc_name, api_name, entity_name, namespace, key, value)
             .await
@@ -170,7 +130,7 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         namespace: KeyValueStorageNamespace,
         pairs: &[(&str, &[u8])],
     ) -> Result<(), String> {
-        self.storage_by_namespace(&namespace)
+        self.writable(&namespace)
             .await?
             .set_many(svc_name, api_name, entity_name, namespace, pairs)
             .await
@@ -185,7 +145,7 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         key: &str,
         value: &[u8],
     ) -> Result<bool, String> {
-        self.storage_by_namespace(&namespace)
+        self.writable(&namespace)
             .await?
             .set_if_not_exists(svc_name, api_name, entity_name, namespace, key, value)
             .await
@@ -199,10 +159,14 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         namespace: KeyValueStorageNamespace,
         key: &str,
     ) -> Result<Option<Bytes>, String> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .get(svc_name, api_name, entity_name, namespace, key)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => {
+                storage
+                    .get(svc_name, api_name, entity_name, namespace, key)
+                    .await
+            }
+            None => Ok(None),
+        }
     }
 
     async fn get_many(
@@ -213,10 +177,14 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         namespace: KeyValueStorageNamespace,
         keys: Vec<String>,
     ) -> Result<Vec<Option<Bytes>>, String> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .get_many(svc_name, api_name, entity_name, namespace, keys)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => {
+                storage
+                    .get_many(svc_name, api_name, entity_name, namespace, keys)
+                    .await
+            }
+            None => Ok(vec![None; keys.len()]),
+        }
     }
 
     async fn get_all(
@@ -226,10 +194,14 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         entity_name: &'static str,
         namespace: KeyValueStorageNamespace,
     ) -> Result<Vec<(String, Bytes)>, String> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .get_all(svc_name, api_name, entity_name, namespace)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => {
+                storage
+                    .get_all(svc_name, api_name, entity_name, namespace)
+                    .await
+            }
+            None => Ok(vec![]),
+        }
     }
 
     async fn del(
@@ -239,10 +211,10 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         namespace: KeyValueStorageNamespace,
         key: &str,
     ) -> Result<(), String> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .del(svc_name, api_name, namespace, key)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => storage.del(svc_name, api_name, namespace, key).await,
+            None => Ok(()),
+        }
     }
 
     async fn del_many(
@@ -252,10 +224,10 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         namespace: KeyValueStorageNamespace,
         keys: Vec<String>,
     ) -> Result<(), String> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .del_many(svc_name, api_name, namespace, keys)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => storage.del_many(svc_name, api_name, namespace, keys).await,
+            None => Ok(()),
+        }
     }
 
     async fn exists(
@@ -265,10 +237,10 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         namespace: KeyValueStorageNamespace,
         key: &str,
     ) -> Result<bool, String> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .exists(svc_name, api_name, namespace, key)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => storage.exists(svc_name, api_name, namespace, key).await,
+            None => Ok(false),
+        }
     }
 
     async fn keys(
@@ -277,10 +249,10 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         api_name: &'static str,
         namespace: KeyValueStorageNamespace,
     ) -> Result<Vec<String>, String> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .keys(svc_name, api_name, namespace)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => storage.keys(svc_name, api_name, namespace).await,
+            None => Ok(vec![]),
+        }
     }
 
     async fn add_to_set(
@@ -292,7 +264,7 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         key: &str,
         value: &[u8],
     ) -> Result<(), String> {
-        self.storage_by_namespace(&namespace)
+        self.writable(&namespace)
             .await?
             .add_to_set(svc_name, api_name, entity_name, namespace, key, value)
             .await
@@ -307,10 +279,14 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         key: &str,
         value: &[u8],
     ) -> Result<(), String> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .remove_from_set(svc_name, api_name, entity_name, namespace, key, value)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => {
+                storage
+                    .remove_from_set(svc_name, api_name, entity_name, namespace, key, value)
+                    .await
+            }
+            None => Ok(()),
+        }
     }
 
     async fn members_of_set(
@@ -321,10 +297,14 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         namespace: KeyValueStorageNamespace,
         key: &str,
     ) -> Result<Vec<Bytes>, String> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .members_of_set(svc_name, api_name, entity_name, namespace, key)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => {
+                storage
+                    .members_of_set(svc_name, api_name, entity_name, namespace, key)
+                    .await
+            }
+            None => Ok(vec![]),
+        }
     }
 
     async fn add_to_sorted_set(
@@ -337,7 +317,7 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         score: f64,
         value: &[u8],
     ) -> Result<(), String> {
-        self.storage_by_namespace(&namespace)
+        self.writable(&namespace)
             .await?
             .add_to_sorted_set(
                 svc_name,
@@ -360,10 +340,14 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         key: &str,
         value: &[u8],
     ) -> Result<(), String> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .remove_from_sorted_set(svc_name, api_name, entity_name, namespace, key, value)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => {
+                storage
+                    .remove_from_sorted_set(svc_name, api_name, entity_name, namespace, key, value)
+                    .await
+            }
+            None => Ok(()),
+        }
     }
 
     async fn get_sorted_set(
@@ -374,10 +358,14 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         namespace: KeyValueStorageNamespace,
         key: &str,
     ) -> Result<Vec<(f64, Bytes)>, String> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .get_sorted_set(svc_name, api_name, entity_name, namespace, key)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => {
+                storage
+                    .get_sorted_set(svc_name, api_name, entity_name, namespace, key)
+                    .await
+            }
+            None => Ok(vec![]),
+        }
     }
 
     async fn query_sorted_set(
@@ -390,9 +378,13 @@ impl KeyValueStorage for MultiSqliteKeyValueStorage {
         min: f64,
         max: f64,
     ) -> Result<Vec<(f64, Bytes)>, String> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .query_sorted_set(svc_name, api_name, entity_name, namespace, key, min, max)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => {
+                storage
+                    .query_sorted_set(svc_name, api_name, entity_name, namespace, key, min, max)
+                    .await
+            }
+            None => Ok(vec![]),
+        }
     }
 }

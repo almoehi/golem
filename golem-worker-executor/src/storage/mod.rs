@@ -15,3 +15,7 @@
 pub mod indexed;
 pub mod keyvalue;
 pub mod scheduler;
+pub mod sqlite_files;
+
+#[cfg(test)]
+mod multi_sqlite_tests;

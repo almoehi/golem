@@ -20,7 +20,7 @@ use sqlx::migrate::MigrationSource;
 use sqlx::query::{Query, QueryAs};
 use sqlx::sqlite::{SqliteArguments, SqlitePoolOptions, SqliteQueryResult, SqliteRow};
 use sqlx::{Connection, Error, FromRow, IntoArguments, Sqlite, SqliteConnection};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 #[derive(Clone, Debug)]
@@ -38,18 +38,36 @@ impl SqlitePool {
     }
 
     pub async fn configured(config: &DbSqliteConfig) -> Result<Self, anyhow::Error> {
-        let read_pool = SqlitePoolOptions::new()
-            .min_connections(0)
-            .max_connections(config.max_connections)
-            .connect_with(config.connect_options())
-            .await?;
-        let write_pool = SqlitePoolOptions::new()
-            .min_connections(0)
-            .max_connections(1)
-            .connect_with(config.connect_options())
-            .await?;
+        Self::configured_with(config, &SqlitePoolTuning::default()).await
+    }
+
+    /// Creates the read and write pools for `config`, adjusted by `tuning`.
+    pub async fn configured_with(
+        config: &DbSqliteConfig,
+        tuning: &SqlitePoolTuning,
+    ) -> Result<Self, anyhow::Error> {
+        let read_connections = tuning
+            .max_read_connections
+            .map_or(config.max_connections, |max| {
+                max.min(config.max_connections)
+            })
+            .max(1);
+        let read_pool = tuning.connect(config, read_connections).await?;
+        let write_pool = tuning.connect(config, 1).await?;
 
         Ok(Self::new(read_pool, write_pool))
+    }
+
+    /// Closes both pools: idle connections are closed now, borrowed ones when returned. Only for
+    /// pools nobody else uses any more - a query on a closed pool fails.
+    pub async fn close(&self) {
+        self.read_pool.close().await;
+        self.write_pool.close().await;
+    }
+
+    /// Number of open connections (idle and in use) of both pools.
+    pub fn size(&self) -> u32 {
+        self.read_pool.size() + self.write_pool.size()
     }
 
     pub fn with_ro(&self, svc_name: &'static str, api_name: &'static str) -> SqliteLabelledApi {
@@ -82,6 +100,47 @@ impl super::Pool for SqlitePool {
 
     fn with_rw(&self, svc_name: &'static str, api_name: &'static str) -> Self::LabelledApi {
         SqlitePool::with_rw(self, svc_name, api_name)
+    }
+}
+
+/// Resource tuning of a [`SqlitePool`] on top of its [`DbSqliteConfig`]. The default keeps
+/// sqlx's / SQLite's own behaviour. Storages that keep many small databases open at once (one per
+/// agent) shrink it: sqlx-sqlite runs one OS thread per connection and every connection has its own
+/// page cache, so these settings bound threads and memory per open database.
+#[derive(Clone, Debug, Default)]
+pub struct SqlitePoolTuning {
+    /// Upper bound of the read pool, below `DbSqliteConfig::max_connections` (`None`: the config).
+    pub max_read_connections: Option<u32>,
+    /// `PRAGMA cache_size` per connection in KiB (`None`: the SQLite default of 2 MiB).
+    pub page_cache_kib: Option<u32>,
+    /// Closes connections idle for this long (`None`: the sqlx default of 10 minutes).
+    pub idle_timeout: Option<Duration>,
+    /// Opens connections on first use instead of one per pool at creation.
+    pub lazy: bool,
+}
+
+impl SqlitePoolTuning {
+    async fn connect(
+        &self,
+        config: &DbSqliteConfig,
+        max_connections: u32,
+    ) -> Result<sqlx::SqlitePool, sqlx::Error> {
+        let mut pool_options = SqlitePoolOptions::new()
+            .min_connections(0)
+            .max_connections(max_connections);
+        if let Some(idle_timeout) = self.idle_timeout {
+            pool_options = pool_options.idle_timeout(Some(idle_timeout));
+        }
+        let mut connect_options = config.connect_options();
+        if let Some(kib) = self.page_cache_kib {
+            // A negative cache_size is a size in KiB rather than in pages.
+            connect_options = connect_options.pragma("cache_size", format!("-{kib}"));
+        }
+        if self.lazy {
+            Ok(pool_options.connect_lazy_with(connect_options))
+        } else {
+            pool_options.connect_with(connect_options).await
+        }
     }
 }
 

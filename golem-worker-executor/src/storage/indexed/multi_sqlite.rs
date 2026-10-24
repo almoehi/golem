@@ -17,143 +17,149 @@ use super::{
     ScanCursor,
 };
 use crate::storage::indexed::sqlite::SqliteIndexedStorage;
+use crate::storage::sqlite_files::{DatabaseScope, SqliteFileStorage, SqliteFiles, agent_db_hash};
 use async_trait::async_trait;
-use golem_common::cache::{BackgroundEvictionMode, Cache, FullCacheEvictionMode, SimpleCache};
 use golem_common::config::DbSqliteConfig;
-use golem_common::model::AgentId;
-use std::collections::HashMap;
+use golem_common::model::agent::AgentMode;
+use golem_service_base::db::sqlite::{SqlitePool, SqlitePoolTuning};
 use std::fmt::{Debug, Formatter};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
-/// IndexedStorage implementation that uses multiple separate SQLite databases depending
-/// on the namespace.
+/// IndexedStorage implementation over multiple SQLite databases: a durable agent's oplog and
+/// compressed oplog layers each live in a database of their own (`durable-oplog-<hash>.db`,
+/// `durable-compressed-oplog-l<n>-<hash>.db`), while ephemeral agents - short-lived, never
+/// replayed, usually one per call - share one database per namespace
+/// (`ephemeral-oplog-shared.db`, `ephemeral-compressed-oplog-l<n>-shared.db`). An ephemeral agent
+/// whose per-agent database exists from before the shared layout keeps using it.
 pub struct MultiSqliteIndexedStorage {
-    cache: Cache<String, (), SqliteIndexedStorage, IndexedStorageError>,
-    hash_cache: Arc<Mutex<HashCache>>,
-    root_dir: PathBuf,
-    max_connections: u32,
-    foreign_keys: bool,
+    files: SqliteFiles<SqliteIndexedStorage>,
 }
 
-struct HashCache {
-    hash_per_agent_id: HashMap<AgentId, String>,
-    agent_id_per_hash: HashMap<String, AgentId>,
+/// File name stem of the database shared by all ephemeral agents of a namespace.
+const SHARED_EPHEMERAL_STEM: &str = "shared";
+
+impl SqliteFileStorage for SqliteIndexedStorage {
+    async fn open(config: DbSqliteConfig, tuning: SqlitePoolTuning) -> Result<Self, String> {
+        SqliteIndexedStorage::configured_with(&config, &tuning).await
+    }
+
+    fn pool(&self) -> SqlitePool {
+        SqliteIndexedStorage::pool(self)
+    }
 }
 
 impl MultiSqliteIndexedStorage {
     pub fn new(root_dir: &Path, max_connections: u32, foreign_keys: bool) -> Self {
-        if !root_dir.exists() {
-            std::fs::create_dir_all(root_dir)
-                .expect("Failed to create root directory for sqlite storage");
-        }
         Self {
-            cache: Cache::new(
-                Some(1024),
-                FullCacheEvictionMode::LeastRecentlyUsed(1),
-                BackgroundEvictionMode::OlderThan {
-                    ttl: Duration::from_secs(21600),
-                    period: Duration::from_secs(60),
-                },
+            files: SqliteFiles::new(
+                root_dir,
+                max_connections,
+                foreign_keys,
                 "multi-sqlite-indexed",
             ),
-            hash_cache: Arc::new(Mutex::new(HashCache {
-                hash_per_agent_id: HashMap::new(),
-                agent_id_per_hash: HashMap::new(),
-            })),
-            root_dir: root_dir.to_path_buf(),
-            max_connections,
-            foreign_keys,
         }
     }
 
-    async fn init_storage(
-        max_connections: u32,
-        foreign_keys: bool,
-        root_dir: PathBuf,
-        database: String,
-    ) -> Result<SqliteIndexedStorage, IndexedStorageError> {
-        // Recreate root_dir if it was deleted after startup (e.g. by a concurrent `golem server clean`).
-        tokio::fs::create_dir_all(&root_dir).await.map_err(|e| {
-            IndexedStorageError::Other(format!(
-                "Failed to create indexed-store directory {}: {e}",
-                root_dir.display()
-            ))
-        })?;
-        let config = DbSqliteConfig {
-            database,
-            max_connections,
-            foreign_keys,
-        };
-        SqliteIndexedStorage::configured(&config)
-            .await
-            .map_err(IndexedStorageError::Other)
+    /// Number of open (cached) databases.
+    pub async fn open_databases(&self) -> usize {
+        self.files.open_databases().await
     }
 
-    async fn storage_by_namespace(
-        &self,
-        namespace: &IndexedStorageNamespace,
-    ) -> Result<SqliteIndexedStorage, IndexedStorageError> {
-        let db = self.namespace_to_db(namespace).await;
-        self.storage_by_db_name(db).await
+    /// Number of open connections of all cached databases.
+    pub async fn open_connections(&self) -> u32 {
+        self.files.open_connections().await
     }
 
-    async fn storage_by_db_name(
-        &self,
-        db: String,
-    ) -> Result<SqliteIndexedStorage, IndexedStorageError> {
-        let max_connections = self.max_connections;
-        let foreign_keys = self.foreign_keys;
-        let root_dir = self.root_dir.clone();
-        let db_path = self.root_dir.join(db.clone()).to_string_lossy().to_string();
-        self.cache
-            .get_or_insert_simple(&db, async move || {
-                Self::init_storage(max_connections, foreign_keys, root_dir, db_path).await
-            })
-            .await
-    }
-
-    async fn namespace_to_db(&self, namespace: &IndexedStorageNamespace) -> String {
+    /// The file name prefix of every database of a meta namespace (the scan unit).
+    fn database_prefix(namespace: &IndexedStorageMetaNamespace) -> String {
         match namespace {
-            IndexedStorageNamespace::OpLog {
-                agent_id,
-                agent_mode,
-            } => {
-                let mode = super::agent_mode_prefix(*agent_mode);
-                format!("{mode}-oplog-{}.db", self.agent_id_hash(agent_id).await)
+            IndexedStorageMetaNamespace::Oplog { agent_mode } => {
+                format!("{}-oplog-", super::agent_mode_prefix(*agent_mode))
             }
-            IndexedStorageNamespace::CompressedOpLog {
-                agent_id,
-                agent_mode,
-                level,
-            } => {
-                let mode = super::agent_mode_prefix(*agent_mode);
+            IndexedStorageMetaNamespace::CompressedOplog { agent_mode, level } => {
                 format!(
-                    "{mode}-compressed-oplog-l{}-{}.db",
-                    level,
-                    self.agent_id_hash(agent_id).await
+                    "{}-compressed-oplog-l{level}-",
+                    super::agent_mode_prefix(*agent_mode)
                 )
             }
         }
     }
 
-    async fn agent_id_hash(&self, agent_id: &AgentId) -> String {
-        let mut hash_cache = self.hash_cache.lock().await;
-        match hash_cache.hash_per_agent_id.get(agent_id) {
-            Some(hash) => hash.clone(),
-            None => {
-                let hash = format!("{}", blake3::hash(agent_id.to_string().as_bytes()));
-                hash_cache
-                    .hash_per_agent_id
-                    .insert(agent_id.clone(), hash.clone());
-                hash_cache
-                    .agent_id_per_hash
-                    .insert(hash.clone(), agent_id.clone());
-                hash
+    /// The database holding `namespace`: the single place a namespace is mapped to a file.
+    async fn database_of(
+        &self,
+        namespace: &IndexedStorageNamespace,
+    ) -> Result<(String, DatabaseScope), IndexedStorageError> {
+        let (meta, agent_id, agent_mode) = match namespace {
+            IndexedStorageNamespace::OpLog {
+                agent_id,
+                agent_mode,
+            } => (
+                IndexedStorageMetaNamespace::Oplog {
+                    agent_mode: *agent_mode,
+                },
+                agent_id,
+                *agent_mode,
+            ),
+            IndexedStorageNamespace::CompressedOpLog {
+                agent_id,
+                agent_mode,
+                level,
+            } => (
+                IndexedStorageMetaNamespace::CompressedOplog {
+                    agent_mode: *agent_mode,
+                    level: *level,
+                },
+                agent_id,
+                *agent_mode,
+            ),
+        };
+        let prefix = Self::database_prefix(&meta);
+        let per_agent = format!("{prefix}{}.db", agent_db_hash(agent_id));
+        match agent_mode {
+            AgentMode::Durable => Ok((per_agent, DatabaseScope::PerAgent)),
+            AgentMode::Ephemeral => {
+                if self
+                    .files
+                    .is_present(&per_agent)
+                    .await
+                    .map_err(IndexedStorageError::Other)?
+                {
+                    Ok((per_agent, DatabaseScope::PerAgent))
+                } else {
+                    Ok((
+                        format!("{prefix}{SHARED_EPHEMERAL_STEM}.db"),
+                        DatabaseScope::Shared,
+                    ))
+                }
             }
         }
+    }
+
+    /// The database of `namespace`, created if missing. For writes.
+    async fn writable(
+        &self,
+        namespace: &IndexedStorageNamespace,
+    ) -> Result<SqliteIndexedStorage, IndexedStorageError> {
+        let (db, scope) = self.database_of(namespace).await?;
+        self.files
+            .open_or_create(&db, scope)
+            .await
+            .map_err(IndexedStorageError::Other)
+    }
+
+    /// The database of `namespace` if it exists. For reads and deletes: a missing database is
+    /// empty, and is not created.
+    async fn readable(
+        &self,
+        namespace: &IndexedStorageNamespace,
+    ) -> Result<Option<SqliteIndexedStorage>, IndexedStorageError> {
+        let (db, scope) = self.database_of(namespace).await?;
+        self.files
+            .open_existing(&db, scope)
+            .await
+            .map_err(IndexedStorageError::Other)
     }
 }
 
@@ -190,10 +196,10 @@ impl IndexedStorage for MultiSqliteIndexedStorage {
         namespace: IndexedStorageNamespace,
         key: &str,
     ) -> Result<bool, IndexedStorageError> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .exists(svc_name, api_name, namespace, key)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => storage.exists(svc_name, api_name, namespace, key).await,
+            None => Ok(false),
+        }
     }
 
     async fn scan(
@@ -207,20 +213,11 @@ impl IndexedStorage for MultiSqliteIndexedStorage {
     ) -> Result<(ScanCursor, Vec<String>), IndexedStorageError> {
         use std::fs;
 
-        let db_prefix = match namespace {
-            IndexedStorageMetaNamespace::Oplog { agent_mode } => {
-                let mode = super::agent_mode_prefix(agent_mode);
-                format!("{mode}-oplog-")
-            }
-            IndexedStorageMetaNamespace::CompressedOplog { agent_mode, level } => {
-                let mode = super::agent_mode_prefix(agent_mode);
-                format!("{mode}-compressed-oplog-l{}-", level)
-            }
-        };
+        let db_prefix = Self::database_prefix(&namespace);
 
         // List all .db files matching the namespace prefix, sorted consistently.
         // The root_dir may not exist yet (e.g. after `golem server clean`); treat as empty.
-        let read_dir_iter = match fs::read_dir(&self.root_dir) {
+        let read_dir_iter = match fs::read_dir(self.files.root_dir()) {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok((0, vec![]));
@@ -255,18 +252,24 @@ impl IndexedStorage for MultiSqliteIndexedStorage {
         let mut current_file_cursor = file_cursor;
 
         for (idx, file_name) in matching_files.iter().enumerate().skip(file_index) {
-            let storage = self.storage_by_db_name(file_name.clone()).await?;
-
-            let (next_cursor, mut file_results) = storage
-                .scan(
-                    svc_name,
-                    api_name,
-                    namespace.clone(),
-                    prefix,
-                    current_file_cursor,
-                    count - results.len() as u64,
-                )
-                .await?;
+            // A scan visits every database once: it must not fill (and churn) the pool cache.
+            let remaining = count - results.len() as u64;
+            let (next_cursor, mut file_results) = self
+                .files
+                .with_uncached(file_name, async |storage| {
+                    storage
+                        .scan(
+                            svc_name,
+                            api_name,
+                            namespace.clone(),
+                            prefix,
+                            current_file_cursor,
+                            remaining,
+                        )
+                        .await
+                })
+                .await
+                .map_err(IndexedStorageError::Other)??;
 
             results.append(&mut file_results);
 
@@ -295,7 +298,7 @@ impl IndexedStorage for MultiSqliteIndexedStorage {
         id: u64,
         value: Vec<u8>,
     ) -> Result<(), IndexedStorageError> {
-        self.storage_by_namespace(&namespace)
+        self.writable(&namespace)
             .await?
             .append(svc_name, api_name, entity_name, namespace, key, id, value)
             .await
@@ -308,10 +311,10 @@ impl IndexedStorage for MultiSqliteIndexedStorage {
         namespace: IndexedStorageNamespace,
         key: &str,
     ) -> Result<u64, IndexedStorageError> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .length(svc_name, api_name, namespace, key)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => storage.length(svc_name, api_name, namespace, key).await,
+            None => Ok(0),
+        }
     }
 
     async fn delete(
@@ -321,10 +324,22 @@ impl IndexedStorage for MultiSqliteIndexedStorage {
         namespace: IndexedStorageNamespace,
         key: &str,
     ) -> Result<(), IndexedStorageError> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .delete(svc_name, api_name, namespace, key)
+        let (db, scope) = self.database_of(&namespace).await?;
+        let Some(storage) = self
+            .files
+            .open_existing(&db, scope)
             .await
+            .map_err(IndexedStorageError::Other)?
+        else {
+            return Ok(());
+        };
+        storage.delete(svc_name, api_name, namespace, key).await?;
+        if scope == DatabaseScope::PerAgent {
+            // The agent's only index in this database is gone: free its connections now instead
+            // of when the cache evicts it. A later write reopens it.
+            self.files.release(&db).await;
+        }
+        Ok(())
     }
 
     async fn read(
@@ -337,18 +352,22 @@ impl IndexedStorage for MultiSqliteIndexedStorage {
         start_id: u64,
         end_id: u64,
     ) -> Result<Vec<(u64, Vec<u8>)>, IndexedStorageError> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .read(
-                svc_name,
-                api_name,
-                entity_name,
-                namespace,
-                key,
-                start_id,
-                end_id,
-            )
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => {
+                storage
+                    .read(
+                        svc_name,
+                        api_name,
+                        entity_name,
+                        namespace,
+                        key,
+                        start_id,
+                        end_id,
+                    )
+                    .await
+            }
+            None => Ok(vec![]),
+        }
     }
 
     async fn first(
@@ -359,10 +378,14 @@ impl IndexedStorage for MultiSqliteIndexedStorage {
         namespace: IndexedStorageNamespace,
         key: &str,
     ) -> Result<Option<(u64, Vec<u8>)>, IndexedStorageError> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .first(svc_name, api_name, entity_name, namespace, key)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => {
+                storage
+                    .first(svc_name, api_name, entity_name, namespace, key)
+                    .await
+            }
+            None => Ok(None),
+        }
     }
 
     async fn last(
@@ -373,10 +396,14 @@ impl IndexedStorage for MultiSqliteIndexedStorage {
         namespace: IndexedStorageNamespace,
         key: &str,
     ) -> Result<Option<(u64, Vec<u8>)>, IndexedStorageError> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .last(svc_name, api_name, entity_name, namespace, key)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => {
+                storage
+                    .last(svc_name, api_name, entity_name, namespace, key)
+                    .await
+            }
+            None => Ok(None),
+        }
     }
 
     async fn closest(
@@ -388,10 +415,14 @@ impl IndexedStorage for MultiSqliteIndexedStorage {
         key: &str,
         id: u64,
     ) -> Result<Option<(u64, Vec<u8>)>, IndexedStorageError> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .closest(svc_name, api_name, entity_name, namespace, key, id)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => {
+                storage
+                    .closest(svc_name, api_name, entity_name, namespace, key, id)
+                    .await
+            }
+            None => Ok(None),
+        }
     }
 
     async fn drop_prefix(
@@ -402,9 +433,13 @@ impl IndexedStorage for MultiSqliteIndexedStorage {
         key: &str,
         last_dropped_id: u64,
     ) -> Result<(), IndexedStorageError> {
-        self.storage_by_namespace(&namespace)
-            .await?
-            .drop_prefix(svc_name, api_name, namespace, key, last_dropped_id)
-            .await
+        match self.readable(&namespace).await? {
+            Some(storage) => {
+                storage
+                    .drop_prefix(svc_name, api_name, namespace, key, last_dropped_id)
+                    .await
+            }
+            None => Ok(()),
+        }
     }
 }

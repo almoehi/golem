@@ -601,6 +601,7 @@ struct CreateOplogConstructor {
     execution_status: read_only_lock::std::ReadOnlyLock<ExecutionStatus>,
     plugin_max_commit_count: usize,
     plugin_max_elapsed_time: Duration,
+    plugin_max_batch_entries: u64,
 }
 
 impl CreateOplogConstructor {
@@ -618,6 +619,7 @@ impl CreateOplogConstructor {
         execution_status: read_only_lock::std::ReadOnlyLock<ExecutionStatus>,
         plugin_max_commit_count: usize,
         plugin_max_elapsed_time: Duration,
+        plugin_max_batch_entries: u64,
     ) -> Self {
         Self {
             owned_agent_id,
@@ -632,6 +634,7 @@ impl CreateOplogConstructor {
             execution_status,
             plugin_max_commit_count,
             plugin_max_elapsed_time,
+            plugin_max_batch_entries,
         }
     }
 }
@@ -682,6 +685,7 @@ impl OplogConstructor for CreateOplogConstructor {
                 close,
                 self.plugin_max_commit_count,
                 self.plugin_max_elapsed_time,
+                self.plugin_max_batch_entries,
             )
             .await,
         )
@@ -696,6 +700,7 @@ pub struct ForwardingOplogService {
     components: Arc<dyn ComponentService>,
     plugin_max_commit_count: usize,
     plugin_max_elapsed_time: Duration,
+    plugin_max_batch_entries: u64,
 }
 
 impl ForwardingOplogService {
@@ -705,6 +710,7 @@ impl ForwardingOplogService {
         components: Arc<dyn ComponentService>,
         plugin_max_commit_count: usize,
         plugin_max_elapsed_time: Duration,
+        plugin_max_batch_entries: u64,
     ) -> Self {
         Self {
             inner,
@@ -713,6 +719,7 @@ impl ForwardingOplogService {
             components,
             plugin_max_commit_count,
             plugin_max_elapsed_time,
+            plugin_max_batch_entries,
         }
     }
 }
@@ -750,6 +757,7 @@ impl OplogService for ForwardingOplogService {
                     execution_status,
                     self.plugin_max_commit_count,
                     self.plugin_max_elapsed_time,
+                    self.plugin_max_batch_entries,
                 ),
             )
             .await
@@ -780,6 +788,7 @@ impl OplogService for ForwardingOplogService {
                     execution_status,
                     self.plugin_max_commit_count,
                     self.plugin_max_elapsed_time,
+                    self.plugin_max_batch_entries,
                 ),
             )
             .await
@@ -868,6 +877,7 @@ impl ForwardingOplog {
         close_fn: Box<dyn FnOnce() + Send + Sync>,
         max_commit_count: usize,
         max_elapsed_time: Duration,
+        max_batch_entries: u64,
     ) -> Self {
         // Seed per-plugin live state from the current status snapshot (not the
         // potentially stale initial_worker_metadata.last_known_status)
@@ -923,6 +933,7 @@ impl ForwardingOplog {
             plugin_state,
             pending_direct_commits: BTreeMap::new(),
             worker_event_service: None,
+            max_batch_entries,
         }));
 
         let timer = tokio::spawn({
@@ -1076,6 +1087,10 @@ struct ForwardingOplogState {
     /// so the Worker folds them into `AgentStatusRecord`.
     pending_direct_commits: BTreeMap<OplogIndex, OplogEntry>,
     worker_event_service: Option<Arc<dyn WorkerEventService>>,
+    /// Upper bound on the number of oplog entries shipped to a plugin in one batch
+    /// (`oplog.plugin_max_batch_entries`). A backlog is drained one bounded batch at a
+    /// time, so memory per in-flight batch stays bounded however far a plugin fell behind.
+    max_batch_entries: u64,
 }
 
 impl ForwardingOplogState {
@@ -1295,15 +1310,12 @@ impl ForwardingOplogState {
             }
         }
 
-        let batch = if live.sending_up_to > live.confirmed_up_to {
-            // RETRY: exact same range — never widen
-            Some((live.confirmed_up_to.next(), live.sending_up_to, true))
-        } else if live.confirmed_up_to < committed_tail {
-            // NEW BATCH: from confirmed+1 to committed tail
-            Some((live.confirmed_up_to.next(), committed_tail, false))
-        } else {
-            None
-        };
+        let batch = select_batch(
+            live.confirmed_up_to,
+            live.sending_up_to,
+            committed_tail,
+            self.max_batch_entries,
+        );
 
         let (batch_start, batch_end, is_retry) = match batch {
             Some(b) => b,
@@ -1417,6 +1429,7 @@ impl ForwardingOplogState {
             .await;
             if let Some(s) = self.plugin_state.get_mut(&grant_id) {
                 s.sending_up_to = batch_end;
+                s.last_batch_start = batch_start;
             }
         }
 
@@ -1812,6 +1825,40 @@ impl ForwardingOplogState {
     }
 }
 
+/// Chooses the next batch `(start, end, is_retry)` for one plugin, or `None` when there
+/// is nothing to send. Every batch holds at most `max_batch_entries` entries (at least 1).
+///
+/// - RETRY (`sending_up_to > confirmed_up_to`): the unconfirmed range is resent exactly —
+///   never widened. If it is longer than the cap (left behind by an earlier, uncapped
+///   build) it is NARROWED to its first `max_batch_entries` entries and returned as a NEW
+///   send (`is_retry = false`): the caller then checkpoints the narrowed range
+///   (`sending_up_to` = narrowed end, `last_batch_start` = start) before sending, so the
+///   batch gets a fresh identity — its idempotency key and every later status check use
+///   `(start, narrowed end)`, never the original over-long range — and the remainder is
+///   sent as later NEW batches once it is confirmed. Narrowing is safe for at-least-once
+///   delivery: the plugin may see a prefix of the original range again.
+/// - NEW: `confirmed_up_to + 1 ..= min(committed_tail, confirmed_up_to + max_batch_entries)`.
+fn select_batch(
+    confirmed_up_to: OplogIndex,
+    sending_up_to: OplogIndex,
+    committed_tail: OplogIndex,
+    max_batch_entries: u64,
+) -> Option<(OplogIndex, OplogIndex, bool)> {
+    let start = confirmed_up_to.next();
+    let cap_end = OplogIndex::from_u64(confirmed_up_to.as_u64() + max_batch_entries.max(1));
+    if sending_up_to > confirmed_up_to {
+        if sending_up_to <= cap_end {
+            Some((start, sending_up_to, true))
+        } else {
+            Some((start, cap_end, false))
+        }
+    } else if confirmed_up_to < committed_tail {
+        Some((start, committed_tail.min(cap_end), false))
+    } else {
+        None
+    }
+}
+
 const OPLOG_PROC_NS: Uuid = uuid!("A7E3F1B2-8C4D-5E6F-9A0B-1C2D3E4F5A6B");
 
 fn oplog_processor_idempotency_key(
@@ -1835,6 +1882,7 @@ fn oplog_processor_idempotency_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::golem_config::DEFAULT_PLUGIN_MAX_BATCH_ENTRIES;
     use golem_common::base_model::component_metadata::KnownExports;
     use golem_common::model::account::AccountId;
     use golem_common::model::application::ApplicationId;
@@ -1968,6 +2016,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct RecordedLookup {
         caller_account_id: AccountId,
+        idempotency_key: IdempotencyKey,
     }
 
     impl RecordingOplogProcessorPlugin {
@@ -2055,12 +2104,12 @@ mod tests {
             _plugin: &InstalledPlugin,
             _target_agent_id: &AgentId,
             caller_account_id: AccountId,
-            _idempotency_key: &IdempotencyKey,
+            idempotency_key: &IdempotencyKey,
         ) -> Result<InvocationStatus, WorkerExecutorError> {
-            self.lookups
-                .lock()
-                .await
-                .push(RecordedLookup { caller_account_id });
+            self.lookups.lock().await.push(RecordedLookup {
+                caller_account_id,
+                idempotency_key: idempotency_key.clone(),
+            });
             Ok(*self.status.lock().await)
         }
     }
@@ -2335,6 +2384,7 @@ mod tests {
             )]),
             pending_direct_commits: BTreeMap::new(),
             worker_event_service: None,
+            max_batch_entries: DEFAULT_PLUGIN_MAX_BATCH_ENTRIES,
         };
 
         // No committed entries (last_committed_idx = NONE) — try_flush should be a no-op
@@ -2376,6 +2426,7 @@ mod tests {
             plugin_state: HashMap::new(),
             pending_direct_commits: BTreeMap::new(),
             worker_event_service: None,
+            max_batch_entries: DEFAULT_PLUGIN_MAX_BATCH_ENTRIES,
         };
 
         state.try_flush().await;
@@ -2438,6 +2489,7 @@ mod tests {
             )]),
             pending_direct_commits: BTreeMap::new(),
             worker_event_service: None,
+            max_batch_entries: DEFAULT_PLUGIN_MAX_BATCH_ENTRIES,
         };
 
         state.try_flush().await;
@@ -2489,6 +2541,7 @@ mod tests {
             )]),
             pending_direct_commits: BTreeMap::new(),
             worker_event_service: None,
+            max_batch_entries: DEFAULT_PLUGIN_MAX_BATCH_ENTRIES,
         }
     }
 
@@ -2592,6 +2645,181 @@ mod tests {
         );
         let live = state.plugin_state.get(&grant_id).unwrap();
         assert_eq!(live.confirmed_up_to, OplogIndex::NONE);
+    }
+
+    // --------------------------------------------------------------------------
+    // Batch size cap: a backlog is shipped in bounded batches, never as one range
+    // --------------------------------------------------------------------------
+
+    /// Extends `unconfirmed_batch_test_state` to `total` committed entries with a batch
+    /// cap of `max_batch_entries`.
+    async fn backlog_test_state(
+        grant_id: EnvironmentPluginGrantId,
+        recording_plugin: Arc<RecordingOplogProcessorPlugin>,
+        total: u64,
+        max_batch_entries: u64,
+    ) -> ForwardingOplogState {
+        let mut state = unconfirmed_batch_test_state(grant_id, recording_plugin).await;
+        for _ in 1..total {
+            let entry = OplogEntry::GrowMemory {
+                timestamp: Timestamp::now_utc(),
+                delta: 100,
+            };
+            state.inner.add(entry.clone()).await;
+            state.buffer.push_back(entry);
+        }
+        state.last_oplog_idx = OplogIndex::from_u64(total);
+        state.last_committed_idx = OplogIndex::from_u64(total);
+        state.max_batch_entries = max_batch_entries;
+        state
+    }
+
+    fn last_checkpoint(
+        entries: BTreeMap<OplogIndex, OplogEntry>,
+    ) -> Option<(OplogIndex, OplogIndex, OplogIndex)> {
+        entries.into_values().rev().find_map(|e| match e {
+            OplogEntry::OplogProcessorCheckpoint {
+                confirmed_up_to,
+                sending_up_to,
+                last_batch_start,
+                ..
+            } => Some((confirmed_up_to, sending_up_to, last_batch_start)),
+            _ => None,
+        })
+    }
+
+    /// Regression test for the OOM crash loop: a source agent whose plugin fell behind
+    /// had ~18,700 committed entries past `confirmed_up_to`; the next NEW batch shipped
+    /// the whole range at once (and ~100 agents did the same within seconds), so the
+    /// executor ran out of memory. A NEW batch must be capped at `max_batch_entries`.
+    #[test]
+    async fn new_batch_over_long_backlog_is_capped() {
+        let grant_id = EnvironmentPluginGrantId::new();
+        let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
+        let mut state = backlog_test_state(grant_id, recording_plugin.clone(), 10, 4).await;
+
+        state.try_flush().await;
+
+        let sends = recording_plugin.sends().await;
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].initial_oplog_index, OplogIndex::from_u64(1));
+        assert_eq!(sends[0].entry_count, 4, "NEW batch must be capped");
+        let live = state.plugin_state.get(&grant_id).unwrap();
+        assert_eq!(live.sending_up_to, OplogIndex::from_u64(4));
+        assert_eq!(live.last_batch_start, OplogIndex::from_u64(1));
+
+        // Once confirmed, the rest follows in further capped batches.
+        recording_plugin
+            .set_status(InvocationStatus::Complete)
+            .await;
+        state.try_flush().await;
+        state.try_flush().await;
+        let sends = recording_plugin.sends().await;
+        assert_eq!(sends.len(), 3);
+        assert_eq!(sends[1].initial_oplog_index, OplogIndex::from_u64(5));
+        assert_eq!(sends[1].entry_count, 4);
+        assert_eq!(sends[2].initial_oplog_index, OplogIndex::from_u64(9));
+        assert!(sends[2].entry_count <= 4);
+    }
+
+    /// Regression test for the OOM crash loop: an over-long range left unconfirmed by an
+    /// earlier (uncapped) build is RETRIED (e.g. after re-targeting to a new plugin
+    /// worker). The retry must be narrowed to its first `max_batch_entries` entries, the
+    /// narrowing must be checkpointed, the narrowed batch's status must be checked under
+    /// its own (narrowed) identity, and the remainder must follow as NEW batches.
+    #[test]
+    async fn retry_of_over_long_unconfirmed_range_is_narrowed() {
+        let grant_id = EnvironmentPluginGrantId::new();
+        let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
+        recording_plugin.set_status(InvocationStatus::Unknown).await;
+        let mut state = backlog_test_state(grant_id, recording_plugin.clone(), 10, 4).await;
+        // As seeded from a checkpoint: batch [1..10] sent, unconfirmed.
+        let live = state.plugin_state.get_mut(&grant_id).unwrap();
+        live.target_agent_id = Some(recording_plugin.current_target.clone());
+        live.sending_up_to = OplogIndex::from_u64(10);
+        live.last_batch_start = OplogIndex::from_u64(1);
+
+        state.try_flush().await; // status Unknown -> retry, narrowed
+
+        let sends = recording_plugin.sends().await;
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].initial_oplog_index, OplogIndex::from_u64(1));
+        assert_eq!(sends[0].entry_count, 4, "RETRY must be narrowed to the cap");
+        let live = state.plugin_state.get(&grant_id).unwrap();
+        assert_eq!(live.confirmed_up_to, OplogIndex::NONE);
+        assert_eq!(live.sending_up_to, OplogIndex::from_u64(4));
+        assert_eq!(live.last_batch_start, OplogIndex::from_u64(1));
+        assert_eq!(
+            last_checkpoint(state.inner.read_many(OplogIndex::INITIAL, 100).await),
+            Some((
+                OplogIndex::NONE,
+                OplogIndex::from_u64(4),
+                OplogIndex::from_u64(1)
+            )),
+            "The narrowing must be persisted"
+        );
+
+        // The next status check refers to the narrowed batch, then the rest follows.
+        recording_plugin
+            .set_status(InvocationStatus::Complete)
+            .await;
+        state.try_flush().await;
+        let lookups = recording_plugin.lookups().await;
+        assert_eq!(
+            lookups.last().unwrap().idempotency_key,
+            oplog_processor_idempotency_key(
+                &state.initial_worker_metadata.agent_id,
+                &grant_id,
+                OplogIndex::from_u64(1),
+                OplogIndex::from_u64(4),
+            )
+        );
+        let sends = recording_plugin.sends().await;
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[1].initial_oplog_index, OplogIndex::from_u64(5));
+        assert_eq!(sends[1].entry_count, 4);
+        assert_eq!(
+            state.plugin_state.get(&grant_id).unwrap().confirmed_up_to,
+            OplogIndex::from_u64(4)
+        );
+    }
+
+    /// A retry within the cap is resent exactly (never widened, never narrowed).
+    #[test]
+    async fn retry_within_cap_is_resent_unchanged() {
+        let grant_id = EnvironmentPluginGrantId::new();
+        let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
+        recording_plugin.set_status(InvocationStatus::Unknown).await;
+        let mut state = backlog_test_state(grant_id, recording_plugin.clone(), 10, 4).await;
+        let live = state.plugin_state.get_mut(&grant_id).unwrap();
+        live.target_agent_id = Some(recording_plugin.current_target.clone());
+        live.sending_up_to = OplogIndex::from_u64(3);
+        live.last_batch_start = OplogIndex::from_u64(1);
+
+        state.try_flush().await;
+
+        let sends = recording_plugin.sends().await;
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].initial_oplog_index, OplogIndex::from_u64(1));
+        assert_eq!(sends[0].entry_count, 3);
+        assert_eq!(
+            state.plugin_state.get(&grant_id).unwrap().sending_up_to,
+            OplogIndex::from_u64(3)
+        );
+    }
+
+    /// A batch below the cap is sent whole.
+    #[test]
+    async fn small_new_batch_is_not_capped() {
+        let grant_id = EnvironmentPluginGrantId::new();
+        let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
+        let mut state = backlog_test_state(grant_id, recording_plugin.clone(), 3, 4).await;
+
+        state.try_flush().await;
+
+        let sends = recording_plugin.sends().await;
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].entry_count, 3);
     }
 
     // --------------------------------------------------------------------------

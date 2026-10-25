@@ -638,6 +638,15 @@ impl SafeDisplay for SchedulerConfig {
     }
 }
 
+/// Default for `OplogConfig::plugin_max_batch_entries`: large enough that a normal
+/// flush interval (a few seconds of activity) fits in one batch, small enough that a
+/// fleet of agents draining large backlogs at once stays within memory.
+pub const DEFAULT_PLUGIN_MAX_BATCH_ENTRIES: u64 = 256;
+
+fn default_plugin_max_batch_entries() -> u64 {
+    DEFAULT_PLUGIN_MAX_BATCH_ENTRIES
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OplogConfig {
     pub max_operations_before_commit: u64,
@@ -657,6 +666,12 @@ pub struct OplogConfig {
     /// entries to oplog processor plugins.
     #[serde(with = "humantime_serde")]
     pub plugin_max_elapsed_time: Duration,
+    /// Maximum number of oplog entries sent to an oplog processor plugin in one batch.
+    /// A source agent whose plugin fell behind drains its backlog in batches of at most
+    /// this size (one batch in flight per agent and plugin), instead of reading and
+    /// shipping the whole unconfirmed range at once.
+    #[serde(default = "default_plugin_max_batch_entries")]
+    pub plugin_max_batch_entries: u64,
     /// When true, wraps the oplog service with a per-account rate-limiting layer that
     /// throttles `add` calls according to each account's plan limit
     /// (`oplog_writes_per_second`). Defaults to false (disabled).
@@ -715,6 +730,11 @@ impl SafeDisplay for OplogConfig {
             &mut result,
             "plugin max elapsed time: {:?}",
             self.plugin_max_elapsed_time
+        );
+        let _ = writeln!(
+            &mut result,
+            "plugin max batch entries: {}",
+            self.plugin_max_batch_entries
         );
         let _ = writeln!(
             &mut result,
@@ -1598,6 +1618,7 @@ impl Default for OplogConfig {
             oplog_processor_snapshotting: SnapshotPolicy::EveryNInvocation { count: 10 },
             plugin_max_commit_count: 3,
             plugin_max_elapsed_time: Duration::from_secs(5),
+            plugin_max_batch_entries: DEFAULT_PLUGIN_MAX_BATCH_ENTRIES,
             oplog_rate_limit_enabled: false,
             indexed_storage_retry: default_oplog_indexed_storage_retry(),
         }

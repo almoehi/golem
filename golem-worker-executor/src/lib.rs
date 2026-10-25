@@ -872,6 +872,7 @@ pub async fn create_worker_executor_impl<
         component_service.clone(),
         golem_config.oplog.plugin_max_commit_count,
         golem_config.oplog.plugin_max_elapsed_time,
+        golem_config.oplog.plugin_max_batch_entries,
     ));
 
     let oplog_service: Arc<dyn OplogService> = if golem_config.oplog.oplog_rate_limit_enabled {

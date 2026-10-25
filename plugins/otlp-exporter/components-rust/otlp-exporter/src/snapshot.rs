@@ -21,17 +21,25 @@ struct SnapshotV1 {
     worker_states: HashMap<String, WorkerState>,
 }
 
+/// Encodes the worker states. Never panics: a trap in `save` makes the executor restart this
+/// worker, so a state that cannot be encoded is dropped (an empty snapshot) instead — losing
+/// open spans is better than a worker that cannot snapshot.
 pub(crate) fn encode(worker_states: &HashMap<String, WorkerState>) -> Vec<u8> {
     #[derive(Serialize)]
     struct SnapshotRef<'a> {
         version: u32,
         worker_states: &'a HashMap<String, WorkerState>,
     }
-    serde_json::to_vec(&SnapshotRef {
-        version: SNAPSHOT_VERSION,
-        worker_states,
+    let encode_states = |worker_states| {
+        serde_json::to_vec(&SnapshotRef {
+            version: SNAPSHOT_VERSION,
+            worker_states,
+        })
+    };
+    encode_states(worker_states).unwrap_or_else(|err| {
+        eprintln!("OTLP exporter: cannot encode the worker states, snapshotting none: {err}");
+        format!(r#"{{"version":{SNAPSHOT_VERSION},"worker_states":{{}}}}"#).into_bytes()
     })
-    .expect("worker states serialize to JSON")
 }
 
 pub(crate) fn decode(payload: &[u8]) -> Result<HashMap<String, WorkerState>, String> {
@@ -94,6 +102,7 @@ mod tests {
             invocation_start_ns: Some(1_700_000_000_000_000_000),
             total_memory_bytes: 65_536,
             active_resources: -1,
+            last_seen_ns: 1_700_000_000_000_000_001,
         }
     }
 
@@ -114,5 +123,18 @@ mod tests {
     #[test]
     fn unreadable_snapshot_is_refused() {
         assert!(decode(b"not json").is_err());
+    }
+}
+
+#[cfg(test)]
+mod compat_tests {
+    use super::*;
+
+    // A snapshot written before the eviction clock existed still loads.
+    #[test]
+    fn snapshot_without_last_seen_loads() {
+        let payload = br#"{"version":1,"worker_states":{"c/a":{"trace_id":"","trace_states":[],"pending_spans":{},"implicit_spans":[],"terminal_error":null,"inherited_span_parents":{"x":"x"},"invocation_start_ns":null,"total_memory_bytes":0,"active_resources":0}}}"#;
+
+        assert_eq!(decode(payload).unwrap()["c/a"].last_seen_ns, 0);
     }
 }

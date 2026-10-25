@@ -35,6 +35,9 @@ pub(crate) fn process_entries(
     let mut counters = CounterAccumulator::default();
 
     for entry in entries {
+        if let Some(time_ns) = entry_time_ns(&entry) {
+            state.last_seen_ns = state.last_seen_ns.max(time_ns);
+        }
         match entry {
             OplogEntry::Create(params) => {
                 handle_create(state, params, &mut metrics);
@@ -227,6 +230,28 @@ pub(crate) fn process_entries(
         spans: completed_spans,
         log_records,
         metrics,
+    }
+}
+
+/// The time of the entry kinds that carry nearly every batch — the eviction clock of
+/// `state::commit`. Other kinds leave the clock where it is (an approximation is enough for
+/// an hour-long TTL).
+fn entry_time_ns(entry: &OplogEntry) -> Option<u128> {
+    match entry {
+        OplogEntry::Create(params) => Some(datetime_to_nanos(&params.timestamp)),
+        OplogEntry::HostCall(params) => Some(datetime_to_nanos(&params.timestamp)),
+        OplogEntry::AgentInvocationStarted(params) => Some(datetime_to_nanos(&params.timestamp)),
+        OplogEntry::AgentInvocationFinished(params) => Some(datetime_to_nanos(&params.timestamp)),
+        OplogEntry::PendingAgentInvocation(params) => Some(datetime_to_nanos(&params.timestamp)),
+        OplogEntry::StartSpan(params) => Some(datetime_to_nanos(&params.timestamp)),
+        OplogEntry::FinishSpan(params) => Some(datetime_to_nanos(&params.timestamp)),
+        OplogEntry::Log(params) => Some(datetime_to_nanos(&params.timestamp)),
+        OplogEntry::GrowMemory(params) => Some(datetime_to_nanos(&params.timestamp)),
+        OplogEntry::Error(params) => Some(datetime_to_nanos(&params.timestamp)),
+        OplogEntry::Interrupted(ts) | OplogEntry::Exited(ts) | OplogEntry::Restart(ts) => {
+            Some(timestamp_to_nanos(ts))
+        }
+        _ => None,
     }
 }
 
@@ -723,6 +748,8 @@ fn handle_invocation_finished(
             gauge: None,
         });
     }
+
+    end_invocation_context(state);
 }
 
 fn handle_terminal(
@@ -733,6 +760,18 @@ fn handle_terminal(
 ) {
     flush_implicit_spans(state, end_time_ns, is_error, completed);
     flush_remaining_explicit_spans(state, end_time_ns, is_error, completed);
+    end_invocation_context(state);
+}
+
+/// Drops what only the ended invocation needed, once its spans are flushed: nothing can
+/// resolve a parent through its inherited spans or report its error any more. Left in
+/// place, it kept every agent ever invoked from another agent (or that ever failed) in
+/// `WORKER_STATES` forever, since `is_empty()` never held again. The trace id stays: the
+/// terminal entries' log records still name it, and it is not carried by itself.
+fn end_invocation_context(state: &mut WorkerState) {
+    state.inherited_span_parents.clear();
+    state.terminal_error = None;
+    state.invocation_start_ns = None;
 }
 
 fn combined_trace_state(trace_states: &[String]) -> Option<String> {
@@ -997,17 +1036,7 @@ mod tests {
     }
 
     fn fresh_state() -> WorkerState {
-        WorkerState {
-            trace_id: String::new(),
-            trace_states: Vec::new(),
-            pending_spans: HashMap::new(),
-            implicit_spans: Vec::new(),
-            terminal_error: None,
-            inherited_span_parents: HashMap::new(),
-            invocation_start_ns: None,
-            total_memory_bytes: 0,
-            active_resources: 0,
-        }
+        WorkerState::new()
     }
 
     // Fix verification: a batch containing many `HostCall` entries across a few distinct
@@ -1207,5 +1236,73 @@ mod tests {
             ),
             Some("external".to_string())
         );
+    }
+
+    fn invocation_started(sec: u64, invocation_context: Vec<SpanData>) -> OplogEntry {
+        OplogEntry::AgentInvocationStarted(RawAgentInvocationStartedParameters {
+            timestamp: ts(sec),
+            idempotency_key: "key".to_string(),
+            payload: OplogPayload::Inline(Vec::new()),
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+            trace_states: vec!["vendor=1".to_string()],
+            invocation_context,
+        })
+    }
+
+    fn invocation_finished(sec: u64) -> OplogEntry {
+        OplogEntry::AgentInvocationFinished(RawAgentInvocationFinishedParameters {
+            timestamp: ts(sec),
+            result: OplogPayload::Inline(Vec::new()),
+            consumed_fuel: 0,
+            component_revision: 0,
+        })
+    }
+
+    fn local_span(span_id: &str, parent: Option<&str>, inherited: bool) -> SpanData {
+        SpanData::LocalSpan(golem_rust::bindings::golem::api::oplog::LocalSpanData {
+            span_id: span_id.to_string(),
+            start: ts(10),
+            parent: parent.map(str::to_string),
+            linked_context: None,
+            attributes: Vec::new(),
+            inherited,
+        })
+    }
+
+    // Regression (2026-10-25 stall): the inherited span parents of an invocation's context
+    // outlived the invocation, so `is_empty()` never held for an agent that had ever been
+    // invoked from another agent and its entry stayed in WORKER_STATES forever. With one
+    // entry per ephemeral phantom agent this grew the plugin's state (and every snapshot of
+    // it) without bound. Everything an invocation derives must end with the invocation.
+    #[test]
+    fn finished_invocation_leaves_no_per_agent_state() {
+        let mut state = fresh_state();
+        let context = vec![
+            SpanData::ExternalSpan(golem_rust::bindings::golem::api::oplog::ExternalSpanData {
+                span_id: "ext".to_string(),
+            }),
+            local_span("inherited", Some("ext"), true),
+            local_span("own", Some("inherited"), false),
+        ];
+
+        let output = process_entries(
+            &mut state,
+            vec![invocation_started(10, context), invocation_finished(20)],
+        );
+
+        assert_eq!(output.spans.len(), 1, "the invocation's own span is exported");
+        assert!(state.is_empty(), "state left behind: {state:?}");
+    }
+
+    #[test]
+    fn processing_records_the_latest_entry_time() {
+        let mut state = fresh_state();
+
+        let _ = process_entries(
+            &mut state,
+            vec![invocation_started(10, Vec::new()), invocation_finished(20)],
+        );
+
+        assert_eq!(state.last_seen_ns, datetime_to_nanos(&ts(20)));
     }
 }

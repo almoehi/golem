@@ -22,8 +22,6 @@ use golem_rust::bindings::golem::api::oplog::{OplogEntry, OplogIndex};
 use golem_rust::golem_wasm::golem_core_1_5_x::types::{AgentId, ComponentId};
 use golem_rust::oplog_processor::exports::golem::api::oplog_processor::Guest as OplogProcessorGuest;
 
-use std::collections::HashMap;
-
 struct OtlpExporterComponent;
 
 impl OplogProcessorGuest for OtlpExporterComponent {
@@ -54,18 +52,11 @@ impl OplogProcessorGuest for OtlpExporterComponent {
 
         // Clone current state for processing — do NOT mutate the stored state yet
         let mut working_state = WORKER_STATES.with(|states| {
-            let states = states.borrow();
-            states.get(&key).cloned().unwrap_or_else(|| state::WorkerState {
-                trace_id: String::new(),
-                trace_states: Vec::new(),
-                pending_spans: HashMap::new(),
-                implicit_spans: Vec::new(),
-                terminal_error: None,
-                inherited_span_parents: HashMap::new(),
-                invocation_start_ns: None,
-                total_memory_bytes: 0,
-                active_resources: 0,
-            })
+            states
+                .borrow()
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(state::WorkerState::new)
         });
 
         let output = process_entries(&mut working_state, entries);
@@ -75,20 +66,13 @@ impl OplogProcessorGuest for OtlpExporterComponent {
         // inherited_span_parents, ...) is the ONLY record of how this batch's oplog entries
         // were interpreted; the batch itself is never redelivered once handed to this
         // function (redelivery, where it happens, retries the OTLP send, not
-        // re-derivation — see the is_empty() cleanup below, unchanged). If the commit were
+        // re-derivation — see `state::commit`). If the commit were
         // deferred until after a successful export (the previous behavior), any export
         // failure — including a transient one, e.g. the collector being briefly
         // unreachable — would silently discard this batch's derived spans/timestamps,
         // permanently orphaning any StartSpan/AgentInvocationStarted whose matching
         // FinishSpan/AgentInvocationFinished arrives in a later, successful batch.
-        WORKER_STATES.with(|states| {
-            let mut states = states.borrow_mut();
-            if working_state.is_empty() {
-                states.remove(&key);
-            } else {
-                states.insert(key, working_state);
-            }
-        });
+        WORKER_STATES.with(|states| state::commit(&mut states.borrow_mut(), key, working_state));
 
         let has_traces = exporter_config.signals.traces && !output.spans.is_empty();
         let has_logs = exporter_config.signals.logs && !output.log_records.is_empty();

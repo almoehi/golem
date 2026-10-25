@@ -23,7 +23,7 @@ use crate::worker::invocation::{
 use crate::worker::status_checkpointer;
 use crate::worker::{
     FinalWorkerState, QueuedWorkerInvocation, RetryDecision, RunningWorker, Worker, WorkerCommand,
-    WorkerTrace,
+    WorkerTrace, periodic_snapshot_backoff_factor,
 };
 use crate::workerctx::{PublicWorkerIo, WorkerCtx};
 use anyhow::anyhow;
@@ -784,7 +784,9 @@ impl<Ctx: WorkerCtx> InnerInvocationLoop<'_, Ctx> {
         self.invocations_since_snapshot += 1;
         match self.parent.snapshot_policy() {
             SnapshotPolicy::EveryNInvocation { count } => {
-                if self.invocations_since_snapshot >= *count as u64 {
+                let due_after =
+                    *count as u64 * self.parent.periodic_snapshot_backoff_factor() as u64;
+                if self.invocations_since_snapshot >= due_after {
                     self.invocations_since_snapshot = 0;
                     self.inject_snapshot_as_next_action().await;
                     true
@@ -817,7 +819,11 @@ impl<Ctx: WorkerCtx> InnerInvocationLoop<'_, Ctx> {
         let last_snapshot_timestamp =
             snapshot_baseline_timestamp(status.last_automatic_snapshot_timestamp, created_at);
 
-        snapshot_action_at(last_snapshot_timestamp, *period, Timestamp::now_utc())
+        snapshot_action_at(
+            last_snapshot_timestamp,
+            *period * self.parent.periodic_snapshot_backoff_factor(),
+            Timestamp::now_utc(),
+        )
     }
 
     fn schedule_idle_snapshot(&mut self, delay: Duration) {
@@ -1480,15 +1486,19 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
         }
 
         if let Some(outcome) = periodic_snapshot_failure_outcome(&result) {
+            let failures = self.parent.record_periodic_snapshot_outcome(false);
+            let next_in = periodic_snapshot_backoff_factor(failures);
             match &result {
-                Ok(InvokeResult::Failed { .. }) => {
+                Ok(InvokeResult::Failed { error, .. }) => {
                     warn!(
-                        "Periodic snapshot save function failed; restarting worker to recover the store"
+                        consecutive_failures = failures,
+                        "Periodic snapshot save function failed: {error:?}; restarting worker to recover the store, next periodic snapshot after {next_in}x the snapshot interval"
                     );
                 }
                 Err(err) => {
                     warn!(
-                        "Periodic snapshot save invocation error: {err}; restarting worker to recover the store"
+                        consecutive_failures = failures,
+                        "Periodic snapshot save invocation error: {err}; restarting worker to recover the store, next periodic snapshot after {next_in}x the snapshot interval"
                     );
                 }
                 _ => unreachable!(),
@@ -1521,6 +1531,7 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
                                         ))
                                         .await;
                                     debug!("Periodic snapshot saved successfully");
+                                    self.parent.record_periodic_snapshot_outcome(true);
 
                                     // A snapshot is committed between invocations, so no jumpable
                                     // region is open: a clean boundary to checkpoint the status,
@@ -1683,8 +1694,8 @@ mod tests {
         periodic_snapshot_failure_outcome, should_yield_for_fairness, snapshot_action_at,
         snapshot_baseline_timestamp, successful_agent_invocation_outcome,
     };
-    use crate::worker::RetryDecision;
     use crate::worker::invocation::InvokeResult;
+    use crate::worker::{RetryDecision, periodic_snapshot_backoff_factor};
     use golem_common::model::AgentInvocationKind;
     use golem_common::model::agent::AgentMode;
     use golem_common::model::oplog::AgentError;
@@ -1723,6 +1734,18 @@ mod tests {
             action,
             PeriodicSnapshotAction::Wait(Duration::from_millis(1_750))
         );
+    }
+
+    // Regression (2026-10-25): a deterministically failing periodic snapshot restarted the
+    // OTLP exporter plugin worker after every 10 invocations, for hours. Each consecutive
+    // failure must space the next attempt out further, up to a bound.
+    #[test]
+    fn periodic_snapshot_interval_doubles_with_each_consecutive_failure() {
+        assert_eq!(periodic_snapshot_backoff_factor(0), 1);
+        assert_eq!(periodic_snapshot_backoff_factor(1), 2);
+        assert_eq!(periodic_snapshot_backoff_factor(3), 8);
+        assert_eq!(periodic_snapshot_backoff_factor(10), 1024);
+        assert_eq!(periodic_snapshot_backoff_factor(u32::MAX), 1024);
     }
 
     #[test]

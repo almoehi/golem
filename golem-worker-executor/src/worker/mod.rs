@@ -82,7 +82,7 @@ use golem_service_base::error::worker_executor::{
 };
 use golem_service_base::model::GetFileSystemNodeResult;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::broadcast::Receiver;
@@ -202,6 +202,25 @@ pub struct Worker<Ctx: WorkerCtx> {
     /// at least that many bytes from the blocking eviction path, ensuring
     /// enough idle workers are evicted to satisfy the pending write.
     desired_extra_filesystem_storage: AtomicU64,
+    /// Periodic snapshots that failed in a row (reset by a successful one). Lives on the
+    /// worker, not the invocation loop, because every failure restarts the loop; it spaces
+    /// the next attempts out (`periodic_snapshot_backoff_factor`).
+    consecutive_periodic_snapshot_failures: AtomicU32,
+}
+
+/// Upper bound of the periodic snapshot backoff: at most 2^10 times the configured interval.
+const MAX_PERIODIC_SNAPSHOT_BACKOFF_SHIFT: u32 = 10;
+
+/// The interval multiplier after `consecutive_failures` failed periodic snapshots.
+///
+/// A failed periodic snapshot restarts the worker (a trap leaves the store unusable), and the
+/// restart replays everything since the last good snapshot. A snapshot that fails
+/// deterministically used to be retried after the very next interval, so such a worker spent
+/// its time restarting and replaying an ever longer oplog instead of processing its queue (the
+/// OTLP exporter plugin worker, 2026-10-25). Doubling the interval per failure bounds that
+/// while still retrying, so a transient failure costs little.
+pub(crate) fn periodic_snapshot_backoff_factor(consecutive_failures: u32) -> u32 {
+    1 << consecutive_failures.min(MAX_PERIODIC_SNAPSHOT_BACKOFF_SHIFT)
 }
 
 impl<Ctx: WorkerCtx> HasOplog for Worker<Ctx> {
@@ -456,6 +475,7 @@ impl<Ctx: WorkerCtx> Worker<Ctx> {
             last_resume_request: Mutex::new(Timestamp::now_utc()),
             snapshot_recovery_disabled: AtomicBool::new(false),
             desired_extra_filesystem_storage: AtomicU64::new(0),
+            consecutive_periodic_snapshot_failures: AtomicU32::new(0),
         };
 
         // Wire the worker event service into the forwarding oplog so plugin errors
@@ -500,6 +520,28 @@ impl<Ctx: WorkerCtx> Worker<Ctx> {
 
     pub(crate) fn snapshot_policy(&self) -> &SnapshotPolicy {
         &self.snapshot_policy
+    }
+
+    /// How many times the configured snapshot interval to wait before the next periodic
+    /// snapshot: 1 normally, doubling with every consecutive failure.
+    pub(crate) fn periodic_snapshot_backoff_factor(&self) -> u32 {
+        periodic_snapshot_backoff_factor(
+            self.consecutive_periodic_snapshot_failures
+                .load(Ordering::Acquire),
+        )
+    }
+
+    /// Records the outcome of a periodic snapshot; returns the consecutive failures so far.
+    pub(crate) fn record_periodic_snapshot_outcome(&self, succeeded: bool) -> u32 {
+        if succeeded {
+            self.consecutive_periodic_snapshot_failures
+                .store(0, Ordering::Release);
+            0
+        } else {
+            self.consecutive_periodic_snapshot_failures
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1)
+        }
     }
 
     pub async fn start_if_needed(this: Arc<Worker<Ctx>>) -> Result<bool, WorkerExecutorError> {
@@ -3345,6 +3387,7 @@ impl RunningWorker {
 
         let engine = parent.engine();
         let mut store = Store::new(&engine, context);
+        invocation::configure_export_result_hostcall_fuel(&mut store);
 
         // Set initial epoch deadline to 0 so the callback fires immediately on the
         // first epoch check point in WASM code, ensuring fuel is checked even for

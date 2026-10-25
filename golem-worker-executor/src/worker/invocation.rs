@@ -461,6 +461,24 @@ async fn call_exported_function<Ctx: WorkerCtx>(
     Ok((result.map(|_| results), consumed_fuel_for_call))
 }
 
+/// The largest `list<u8>` an exported function may return (a save-snapshot payload, an agent
+/// method result), in guest bytes.
+const MAX_EXPORT_RESULT_LIST_BYTES: usize = 16 << 20;
+
+/// Sets a worker store's hostcall fuel so that an exported function may return a
+/// `list<u8>` of up to `MAX_EXPORT_RESULT_LIST_BYTES`.
+///
+/// `call_exported_function` lifts results into dynamic `Val`s, and wasmtime charges
+/// `size_of::<Val>()` fuel per list element for that (its fuel bounds the HOST memory a lift
+/// allocates). With wasmtime's default of 128 MiB, any byte list above ~2.7 MB therefore
+/// trapped with "too much data is being copied between the host and the guest" — an
+/// accidental limit nobody chose: the OTLP exporter plugin's snapshot crossed it and every
+/// periodic snapshot of its worker failed from then on (2026-10-25). Typed host-call lifts
+/// (bindgen, 1 fuel per byte) only get more headroom from this.
+pub(crate) fn configure_export_result_hostcall_fuel<T>(store: &mut wasmtime::Store<T>) {
+    store.set_hostcall_fuel(MAX_EXPORT_RESULT_LIST_BYTES * size_of::<Val>());
+}
+
 async fn finish_invocation_and_get_fuel_consumption<Ctx: WorkerCtx>(
     store: &mut StoreContextMut<'_, Ctx>,
     display_name: &str,
@@ -973,6 +991,57 @@ mod tests {
     use golem_wasm::IntoValue;
     use golem_wasm::analysis::analysed_type::{result, result_err, str};
     use test_r::test;
+
+    /// A component whose `get` export returns a `list<u8>` of `LARGE_RESULT_LEN` bytes.
+    const LARGE_RESULT_LEN: usize = 3_000_000;
+    const LARGE_RESULT_COMPONENT: &str = r#"
+        (component
+          (core module $m
+            (memory (export "mem") 64)
+            (func (export "get") (result i32)
+              (i32.store (i32.const 0) (i32.const 16))
+              (i32.store (i32.const 4) (i32.const 3000000))
+              (i32.const 0))
+            (func (export "realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0)))
+          (core instance $i (instantiate $m))
+          (func (export "get") (result (list u8))
+            (canon lift (core func $i "get") (memory $i "mem") (realloc (func $i "realloc")))))
+    "#;
+
+    fn lift_large_result(configure_fuel: bool) -> anyhow::Result<usize> {
+        let engine = wasmtime::Engine::default();
+        let component = wasmtime::component::Component::new(&engine, LARGE_RESULT_COMPONENT)?;
+        let mut store = wasmtime::Store::new(&engine, ());
+        if configure_fuel {
+            configure_export_result_hostcall_fuel(&mut store);
+        }
+        let instance =
+            wasmtime::component::Linker::new(&engine).instantiate(&mut store, &component)?;
+        let func = instance.get_func(&mut store, "get").expect("get export");
+        let mut results = vec![Val::Bool(false)];
+        func.call(&mut store, &[], &mut results)?;
+        match &results[0] {
+            Val::List(bytes) => Ok(bytes.len()),
+            other => panic!("unexpected result {other:?}"),
+        }
+    }
+
+    // Regression (2026-10-25 stall): exported-function results are lifted into dynamic
+    // `Val`s, which charge `size_of::<Val>()` hostcall fuel per list element. With wasmtime's
+    // default 128 MiB fuel every `list<u8>` above ~2.7 MB trapped ("too much data is being
+    // copied between the host and the guest"): the OTLP exporter plugin's save-snapshot
+    // payload crossed that size and every periodic snapshot of its worker failed from then on.
+    #[test]
+    fn default_hostcall_fuel_refuses_a_multi_megabyte_export_result() {
+        let err = lift_large_result(false).unwrap_err();
+
+        assert!(format!("{err:#}").contains("too much data"), "{err:#}");
+    }
+
+    #[test]
+    fn executor_hostcall_fuel_lifts_a_multi_megabyte_export_result() {
+        assert_eq!(lift_large_result(true).unwrap(), LARGE_RESULT_LEN);
+    }
 
     #[test]
     fn analysed_result_type_matches_each_agent_invocation_kind() {

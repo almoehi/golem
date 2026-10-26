@@ -934,6 +934,7 @@ impl ForwardingOplog {
             pending_direct_commits: BTreeMap::new(),
             worker_event_service: None,
             max_batch_entries,
+            uninstalled_grants: HashSet::new(),
         }));
 
         let timer = tokio::spawn({
@@ -1091,6 +1092,11 @@ struct ForwardingOplogState {
     /// (`oplog.plugin_max_batch_entries`). A backlog is drained one bounded batch at a
     /// time, so memory per in-flight batch stays bounded however far a plugin fell behind.
     max_batch_entries: u64,
+    /// Grants whose plugin is no longer installed for this agent — on its own component
+    /// revision or on the component's currently deployed revision. Their forwarding state
+    /// was dropped and they are not re-seeded from the status record while they stay
+    /// uninstalled (see `retire_uninstalled_plugins`).
+    uninstalled_grants: HashSet<EnvironmentPluginGrantId>,
 }
 
 impl ForwardingOplogState {
@@ -1104,11 +1110,24 @@ impl ForwardingOplogState {
         let status = self.last_known_status.read().await.clone();
         let flush_set = self.reconcile_plugin_state(&status);
 
-        if flush_set.is_empty() {
+        // Uninstalled plugins are re-checked even with nothing to flush, so one installed
+        // again is picked up (cached component metadata, no extra registry round trip).
+        if flush_set.is_empty() && self.uninstalled_grants.is_empty() {
             self.finish_empty_flush();
         } else if let Some((metadata, component_metadata)) =
             self.prepare_flush_context(&status).await
         {
+            let Some(flush_set) = self
+                .retire_uninstalled_plugins(flush_set, &metadata, &component_metadata)
+                .await
+            else {
+                return;
+            };
+            if flush_set.is_empty() {
+                self.finish_empty_flush();
+                return;
+            }
+
             let committed_tail = self.last_committed_idx;
 
             for grant_id in flush_set {
@@ -1130,6 +1149,9 @@ impl ForwardingOplogState {
         status: &AgentStatusRecord,
     ) -> Vec<EnvironmentPluginGrantId> {
         for grant_id in &status.active_plugins {
+            if self.uninstalled_grants.contains(grant_id) {
+                continue;
+            }
             if let Entry::Vacant(e) = self.plugin_state.entry(*grant_id) {
                 let live = if let Some(cp) = status.oplog_processor_checkpoints.get(grant_id) {
                     LivePluginState {
@@ -1154,8 +1176,11 @@ impl ForwardingOplogState {
             }
         }
 
+        let uninstalled = &self.uninstalled_grants;
         self.plugin_state.retain(|grant_id, state| {
-            status.active_plugins.contains(grant_id) || state.sending_up_to > state.confirmed_up_to
+            !uninstalled.contains(grant_id)
+                && (status.active_plugins.contains(grant_id)
+                    || state.sending_up_to > state.confirmed_up_to)
         });
 
         self.plugin_state
@@ -1194,6 +1219,80 @@ impl ForwardingOplogState {
                 None
             }
         }
+    }
+
+    /// Restricts the flush set to the plugins still installed for this agent, on its own
+    /// component revision AND on the component's currently deployed revision, and drops
+    /// the forwarding state of every other one (logged once, with any unsent range).
+    ///
+    /// Uninstalling an oplog processor plugin creates a component revision without it,
+    /// but agents that are not (or cannot be) updated stay on a revision that still lists
+    /// it — ephemeral agents can never be updated. Without the deployed-revision check
+    /// such an agent forwards its whole backlog to the uninstalled plugin whenever its
+    /// oplog is opened again (e.g. by the scheduled oplog archival, `archive_interval`
+    /// after it finished), re-targeting and retrying against a plugin nobody runs any
+    /// more. Telemetry is best-effort: an unsent range of an uninstalled plugin is
+    /// dropped, not delivered. The checkpoint in the oplog is left as it is; a plugin
+    /// installed again resumes from it (at-least-once, as after any restart).
+    ///
+    /// Returns `None` when the deployed revision cannot be read (the tick is skipped).
+    async fn retire_uninstalled_plugins(
+        &mut self,
+        flush_set: Vec<EnvironmentPluginGrantId>,
+        metadata: &AgentMetadata,
+        component_metadata: &Component,
+    ) -> Option<Vec<EnvironmentPluginGrantId>> {
+        let component_id = metadata.owned_agent_id().component_id();
+        let deployed = match self.components.get_metadata(component_id, None).await {
+            Ok(deployed) => Some(deployed),
+            // No deployed revision (component deleted): nothing is installed any more.
+            Err(WorkerExecutorError::ComponentNotFound { .. }) => None,
+            Err(err) => {
+                tracing::error!(
+                    "Failed to get deployed component metadata for oplog processor flush: {err}"
+                );
+                return None;
+            }
+        };
+        let agent_type =
+            ParsedAgentId::parse_agent_type_name(&self.initial_worker_metadata.agent_id.agent_id)
+                .ok();
+        let is_installed = |grant_id: &EnvironmentPluginGrantId| {
+            let installed_on = |component: &Component| {
+                agent_type
+                    .as_ref()
+                    .and_then(|t| component.metadata.agent_type_plugins(t))
+                    .is_some_and(|plugins| {
+                        plugins
+                            .iter()
+                            .any(|p| p.environment_plugin_grant_id == *grant_id)
+                    })
+            };
+            installed_on(component_metadata) && deployed.as_ref().is_some_and(installed_on)
+        };
+
+        // Installed again: re-seeded from the status record by the next reconcile.
+        self.uninstalled_grants
+            .retain(|grant_id| !is_installed(grant_id));
+
+        let (installed, uninstalled): (Vec<_>, Vec<_>) = flush_set
+            .into_iter()
+            .partition(|grant_id| is_installed(grant_id));
+        for grant_id in uninstalled {
+            if let Some(dropped) = self.plugin_state.remove(&grant_id) {
+                tracing::warn!(
+                    plugin_grant = %grant_id,
+                    source_agent = %self.initial_worker_metadata.agent_id,
+                    agent_revision = %component_metadata.revision,
+                    confirmed_up_to = %dropped.confirmed_up_to,
+                    sending_up_to = %dropped.sending_up_to,
+                    committed_tail = %self.last_committed_idx,
+                    "Oplog processor: plugin is no longer installed, dropping its forwarding state and unsent entries"
+                );
+            }
+            self.uninstalled_grants.insert(grant_id);
+        }
+        Some(installed)
     }
 
     /// Flush a single plugin: resolve target, read entries, write checkpoints, send.
@@ -2116,7 +2215,11 @@ mod tests {
 
     /// A fake ComponentService that returns a component with one installed oplog processor plugin
     struct FakeComponentService {
+        /// Plugins installed on the agent's own (forced) revision.
         installed_plugins: Vec<InstalledPlugin>,
+        /// Plugins installed on the currently deployed revision (`forced_revision: None`);
+        /// `None` = the same as `installed_plugins`.
+        deployed_plugins: std::sync::Mutex<Option<Vec<InstalledPlugin>>>,
     }
 
     impl FakeComponentService {
@@ -2132,13 +2235,27 @@ mod tests {
                     oplog_processor_component_id: Some(ComponentId::new()),
                     oplog_processor_component_revision: Some(ComponentRevision::INITIAL),
                 }],
+                deployed_plugins: std::sync::Mutex::new(None),
             }
         }
 
         fn empty() -> Self {
             Self {
                 installed_plugins: Vec::new(),
+                deployed_plugins: std::sync::Mutex::new(None),
             }
+        }
+
+        /// The agent's revision still has the plugin, but it was uninstalled from the
+        /// component: the currently deployed revision has no plugins.
+        fn uninstalled_from_deployed_revision(grant_id: EnvironmentPluginGrantId) -> Self {
+            let service = Self::with_one_oplog_processor_plugin(grant_id);
+            service.set_deployed_plugins(Vec::new());
+            service
+        }
+
+        fn set_deployed_plugins(&self, plugins: Vec<InstalledPlugin>) {
+            *self.deployed_plugins.lock().unwrap() = Some(plugins);
         }
     }
 
@@ -2156,19 +2273,23 @@ mod tests {
         async fn get_metadata(
             &self,
             component_id: ComponentId,
-            _forced_revision: Option<ComponentRevision>,
+            forced_revision: Option<ComponentRevision>,
         ) -> Result<Component, WorkerExecutorError> {
             use golem_common::base_model::component_metadata::AgentTypeProvisionConfig;
             use golem_common::model::agent::AgentTypeName;
             use std::collections::BTreeMap;
 
-            let provision_configs = if self.installed_plugins.is_empty() {
+            let plugins = match (forced_revision, &*self.deployed_plugins.lock().unwrap()) {
+                (None, Some(deployed)) => deployed.clone(),
+                _ => self.installed_plugins.clone(),
+            };
+            let provision_configs = if plugins.is_empty() {
                 BTreeMap::new()
             } else {
                 BTreeMap::from([(
                     AgentTypeName("TestPlugin".to_string()),
                     AgentTypeProvisionConfig {
-                        plugins: self.installed_plugins.clone(),
+                        plugins,
                         ..Default::default()
                     },
                 )])
@@ -2385,6 +2506,7 @@ mod tests {
             pending_direct_commits: BTreeMap::new(),
             worker_event_service: None,
             max_batch_entries: DEFAULT_PLUGIN_MAX_BATCH_ENTRIES,
+            uninstalled_grants: HashSet::new(),
         };
 
         // No committed entries (last_committed_idx = NONE) — try_flush should be a no-op
@@ -2427,6 +2549,7 @@ mod tests {
             pending_direct_commits: BTreeMap::new(),
             worker_event_service: None,
             max_batch_entries: DEFAULT_PLUGIN_MAX_BATCH_ENTRIES,
+            uninstalled_grants: HashSet::new(),
         };
 
         state.try_flush().await;
@@ -2490,6 +2613,7 @@ mod tests {
             pending_direct_commits: BTreeMap::new(),
             worker_event_service: None,
             max_batch_entries: DEFAULT_PLUGIN_MAX_BATCH_ENTRIES,
+            uninstalled_grants: HashSet::new(),
         };
 
         state.try_flush().await;
@@ -2505,10 +2629,22 @@ mod tests {
         grant_id: EnvironmentPluginGrantId,
         recording_plugin: Arc<RecordingOplogProcessorPlugin>,
     ) -> ForwardingOplogState {
+        unconfirmed_batch_test_state_with_components(
+            grant_id,
+            recording_plugin,
+            Arc::new(FakeComponentService::with_one_oplog_processor_plugin(
+                grant_id,
+            )),
+        )
+        .await
+    }
+
+    async fn unconfirmed_batch_test_state_with_components(
+        grant_id: EnvironmentPluginGrantId,
+        recording_plugin: Arc<RecordingOplogProcessorPlugin>,
+        components: Arc<dyn ComponentService>,
+    ) -> ForwardingOplogState {
         let (metadata, status_lock) = test_worker_metadata(HashSet::from([grant_id]));
-        let components: Arc<dyn ComponentService> = Arc::new(
-            FakeComponentService::with_one_oplog_processor_plugin(grant_id),
-        );
         let inner: Arc<dyn Oplog> = Arc::new(InMemoryOplog::new());
         let entry = OplogEntry::GrowMemory {
             timestamp: Timestamp::now_utc(),
@@ -2542,6 +2678,7 @@ mod tests {
             pending_direct_commits: BTreeMap::new(),
             worker_event_service: None,
             max_batch_entries: DEFAULT_PLUGIN_MAX_BATCH_ENTRIES,
+            uninstalled_grants: HashSet::new(),
         }
     }
 
@@ -3032,5 +3169,118 @@ mod tests {
             checkpoints, 1,
             "Only the pre-send checkpoint, no re-target checkpoint for an unchanged target"
         );
+    }
+
+    // --------------------------------------------------------------------------
+    // Plugins uninstalled from the component
+    // --------------------------------------------------------------------------
+
+    /// Seeds the state the live incident showed: a finished agent on an old revision
+    /// (plugin installed there) whose checkpoint names a stale plugin worker with an
+    /// unconfirmed range — what the archive scheduler finds when it re-opens the oplog.
+    fn seed_unconfirmed_range_to_stale_target(
+        state: &mut ForwardingOplogState,
+        grant_id: EnvironmentPluginGrantId,
+    ) {
+        let live = state.plugin_state.get_mut(&grant_id).unwrap();
+        live.target_agent_id = Some(stale_target());
+        live.sending_up_to = OplogIndex::from_u64(1);
+        live.last_batch_start = OplogIndex::from_u64(1);
+    }
+
+    fn checkpoint_count(entries: &BTreeMap<OplogIndex, OplogEntry>) -> usize {
+        entries
+            .values()
+            .filter(|e| matches!(e, OplogEntry::OplogProcessorCheckpoint { .. }))
+            .count()
+    }
+
+    /// Regression test (2026-10-25): the plugin was uninstalled from the component (the
+    /// deployed revision has none), but agents still on an older revision — ephemeral
+    /// agents can never be updated — kept forwarding their whole backlog to it whenever
+    /// their oplog was re-opened (oplog archival), re-targeting and retrying forever.
+    /// Uninstalling a plugin must stop forwarding to it: nothing is sent, looked up,
+    /// re-targeted or checkpointed, now or on later ticks.
+    #[test]
+    async fn plugin_uninstalled_from_deployed_revision_is_not_forwarded() {
+        let grant_id = EnvironmentPluginGrantId::new();
+        let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
+        let mut state = unconfirmed_batch_test_state_with_components(
+            grant_id,
+            recording_plugin.clone(),
+            Arc::new(FakeComponentService::uninstalled_from_deployed_revision(
+                grant_id,
+            )),
+        )
+        .await;
+        seed_unconfirmed_range_to_stale_target(&mut state, grant_id);
+
+        state.try_flush().await;
+        state.try_flush().await;
+
+        assert_eq!(recording_plugin.send_count().await, 0);
+        assert!(recording_plugin.lookups().await.is_empty());
+        assert!(
+            !state.plugin_state.contains_key(&grant_id),
+            "The forwarding state of an uninstalled plugin must be dropped"
+        );
+        assert!(
+            state.buffer.is_empty(),
+            "Buffered entries must not be held for an uninstalled plugin"
+        );
+        let written = state.inner.read_many(OplogIndex::INITIAL, 100).await;
+        assert_eq!(
+            checkpoint_count(&written),
+            0,
+            "No checkpoint may be written"
+        );
+    }
+
+    /// The plugin is gone from the agent's own revision (e.g. after a manual update to a
+    /// revision without it) while an unconfirmed range is still recorded: the state is
+    /// dropped instead of being kept forever, which also pinned the entry buffer.
+    #[test]
+    async fn plugin_not_installed_on_agent_revision_drops_forwarding_state() {
+        let grant_id = EnvironmentPluginGrantId::new();
+        let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
+        let mut state = unconfirmed_batch_test_state_with_components(
+            grant_id,
+            recording_plugin.clone(),
+            Arc::new(FakeComponentService::empty()),
+        )
+        .await;
+        seed_unconfirmed_range_to_stale_target(&mut state, grant_id);
+
+        state.try_flush().await;
+
+        assert_eq!(recording_plugin.send_count().await, 0);
+        assert!(!state.plugin_state.contains_key(&grant_id));
+        assert!(state.buffer.is_empty());
+    }
+
+    /// Re-installing the plugin on the deployed revision resumes forwarding from the
+    /// recorded checkpoint.
+    #[test]
+    async fn plugin_reinstalled_on_deployed_revision_resumes_forwarding() {
+        let grant_id = EnvironmentPluginGrantId::new();
+        let recording_plugin = Arc::new(RecordingOplogProcessorPlugin::new());
+        let components = Arc::new(FakeComponentService::uninstalled_from_deployed_revision(
+            grant_id,
+        ));
+        let mut state = unconfirmed_batch_test_state_with_components(
+            grant_id,
+            recording_plugin.clone(),
+            components.clone(),
+        )
+        .await;
+
+        state.try_flush().await;
+        assert_eq!(recording_plugin.send_count().await, 0);
+
+        components.set_deployed_plugins(components.installed_plugins.clone());
+        state.try_flush().await; // re-seeds the plugin's state from the status record
+        state.try_flush().await;
+
+        assert_eq!(recording_plugin.send_count().await, 1);
     }
 }

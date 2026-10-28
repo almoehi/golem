@@ -75,6 +75,7 @@ use crate::worker::invocation::{
     InvocationMode, InvokeResult, invoke_observed_and_traced, lower_invocation,
 };
 use crate::worker::status::calculate_last_known_status_with_checkpoint;
+use crate::worker::update_memory_wait::{UpdateMemoryDecision, UpdateSnapshotStep};
 use crate::worker::{RetryDecision, Worker};
 use crate::workerctx::{
     ExternalOperations, FileSystemReading, InvocationContextManagement, InvocationHooks,
@@ -689,6 +690,12 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
         self.state.total_linear_memory_size
     }
 
+    /// Whether the agent is running one of its snapshotting functions (saving
+    /// or loading a snapshot) right now.
+    pub fn is_calling_snapshotting_function(&self) -> bool {
+        self.state.snapshotting_mode.is_some()
+    }
+
     pub fn current_filesystem_storage_usage(&self) -> u64 {
         self.state.current_filesystem_storage_usage
     }
@@ -817,8 +824,12 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
                 .add_to_oplog(OplogEntry::grow_memory(delta))
                 .await;
 
-            self.public_state.worker().increase_memory(delta).await?;
-            self.state.total_linear_memory_size += delta;
+            let new_total = self.state.total_linear_memory_size + delta;
+            self.public_state
+                .worker()
+                .increase_memory(new_total)
+                .await?;
+            self.state.total_linear_memory_size = new_total;
             Ok(())
         }
     }
@@ -1871,6 +1882,13 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
                                 .remove_span(&span_id);
                         }
 
+                        let load_ran_out_of_memory = matches!(
+                            load_result,
+                            Ok(InvokeResult::Failed {
+                                error: AgentError::OutOfMemory,
+                                ..
+                            })
+                        );
                         let failed = match load_result {
                             Err(error) => {
                                 Some(format!("Manual update failed to load snapshot: {error}"))
@@ -1897,6 +1915,39 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
                             ),
                             _ => None,
                         };
+
+                        if load_ran_out_of_memory {
+                            // The executor could not grant the memory the load
+                            // needs right now. That is temporary: keep the update
+                            // pending (nothing is recorded) and retry after the
+                            // agent is unloaded, until it has waited too long.
+                            let decision = store
+                                .as_context()
+                                .data()
+                                .get_public_state()
+                                .worker()
+                                .on_update_out_of_memory(target_revision, UpdateSnapshotStep::Load);
+                            match decision {
+                                UpdateMemoryDecision::Retry { .. } => {
+                                    return Ok(Some(RetryDecision::ReacquirePermits));
+                                }
+                                UpdateMemoryDecision::GiveUp { retries, waited } => {
+                                    store
+                                        .as_context_mut()
+                                        .data_mut()
+                                        .on_worker_update_failed(
+                                            target_revision,
+                                            Some(UpdateMemoryDecision::failure_details(
+                                                UpdateSnapshotStep::Load,
+                                                retries,
+                                                waited,
+                                            )),
+                                        )
+                                        .await;
+                                    return Ok(Some(RetryDecision::Immediate));
+                                }
+                            }
+                        }
 
                         if let Some(error) = failed {
                             store
@@ -2802,6 +2853,7 @@ impl<Ctx: WorkerCtx> UpdateManagement for DurableWorkerCtx<Ctx> {
     ) {
         let entry = OplogEntry::failed_update(target_revision, details.clone());
         self.public_state.worker().add_and_commit_oplog(entry).await;
+        self.public_state.worker().clear_update_memory_wait();
 
         warn!(
             "Worker failed to update to {}: {}, update attempt aborted",
@@ -2825,6 +2877,7 @@ impl<Ctx: WorkerCtx> UpdateManagement for DurableWorkerCtx<Ctx> {
             new_active_plugins.clone(),
         );
         self.public_state.worker().add_and_commit_oplog(entry).await;
+        self.public_state.worker().clear_update_memory_wait();
     }
 }
 

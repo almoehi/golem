@@ -15,9 +15,11 @@
 pub mod agent_config;
 pub mod invocation;
 mod invocation_loop;
+pub(crate) mod memory_coverage;
 pub mod status;
 pub mod status_checkpointer;
 pub mod status_flusher;
+pub(crate) mod update_memory_wait;
 
 use self::agent_config::{
     ensure_required_agent_secrets_are_configured, parse_worker_creation_agent_config,
@@ -189,6 +191,10 @@ pub struct Worker<Ctx: WorkerCtx> {
     execution_status: Arc<std::sync::RwLock<ExecutionStatus>>,
     update_state_lock: Mutex<()>,
     worker_estimate_coefficient: f64,
+    /// How long the pending snapshot-based update may wait for memory, and how
+    /// long it has been waiting (see [`update_memory_wait`]).
+    update_oom_retry_timeout: Duration,
+    update_memory_wait: std::sync::Mutex<update_memory_wait::UpdateMemoryWait>,
 
     // IMPORTANT: Every external operation must acquire the instance lock, even briefly, to confirm the worker isn’t deleting.
     instance: Arc<Mutex<WorkerInstance>>,
@@ -466,6 +472,8 @@ impl<Ctx: WorkerCtx> Worker<Ctx> {
             last_known_status: current_status,
             metrics_status,
             worker_estimate_coefficient: deps.config().memory.worker_estimate_coefficient,
+            update_oom_retry_timeout: deps.config().memory.update_oom_retry_timeout,
+            update_memory_wait: std::sync::Mutex::new(Default::default()),
             oom_retry_config: deps.config().memory.oom_retry_config.clone(),
             snapshot_policy,
             update_state_lock: Mutex::new(()),
@@ -561,15 +569,16 @@ impl<Ctx: WorkerCtx> Worker<Ctx> {
             WorkerInstance::Unloaded { .. } => {
                 this.mark_as_loading();
                 crate::metrics::workers::inc_worker_waiting_for_memory();
-                crate::metrics::wasm::record_worker_resident_linear_memory(
-                    this.get_latest_worker_metadata()
-                        .await
-                        .last_known_status
-                        .total_linear_memory_size,
-                );
+                let linear_memory_bytes = this
+                    .get_latest_worker_metadata()
+                    .await
+                    .last_known_status
+                    .total_linear_memory_size;
+                crate::metrics::wasm::record_worker_resident_linear_memory(linear_memory_bytes);
                 *instance_guard = WorkerInstance::WaitingForPermit(WaitingWorker::new(
                     this.clone(),
-                    this.memory_requirement().await?,
+                    linear_memory_bytes,
+                    this.memory_requirement_for(linear_memory_bytes),
                     this.filesystem_storage_requirement().await?,
                     oom_retry_count,
                 ));
@@ -1071,10 +1080,53 @@ impl<Ctx: WorkerCtx> Worker<Ctx> {
     /// resident component via the component-charge registry, not per worker.
     pub async fn memory_requirement(&self) -> Result<u64, WorkerExecutorError> {
         let metadata = self.get_latest_worker_metadata().await;
+        Ok(self.memory_requirement_for(metadata.last_known_status.total_linear_memory_size))
+    }
 
-        let linear_memory_bytes = metadata.last_known_status.total_linear_memory_size as f64;
-        let estimate_coefficient = self.worker_estimate_coefficient;
-        Ok((estimate_coefficient * linear_memory_bytes) as u64)
+    /// The memory reserved for a worker with `linear_memory_bytes` of linear
+    /// memory: the linear memory scaled by `worker_estimate_coefficient`.
+    fn memory_requirement_for(&self, linear_memory_bytes: u64) -> u64 {
+        (self.worker_estimate_coefficient * linear_memory_bytes as f64) as u64
+    }
+
+    /// Decides what to do about the pending snapshot-based update to
+    /// `target_revision` after the admission gate refused a memory grow during
+    /// its `step` (see [`update_memory_wait`]), and logs the waiting state.
+    pub(crate) fn on_update_out_of_memory(
+        &self,
+        target_revision: ComponentRevision,
+        step: update_memory_wait::UpdateSnapshotStep,
+    ) -> update_memory_wait::UpdateMemoryDecision {
+        let timeout = self.update_oom_retry_timeout;
+        let decision = self.update_memory_wait.lock().unwrap().on_refused(
+            target_revision,
+            std::time::Instant::now(),
+            timeout,
+        );
+        match &decision {
+            update_memory_wait::UpdateMemoryDecision::Retry { retry, waited } => warn!(
+                agent_id = %self.owned_agent_id.agent_id,
+                %target_revision,
+                retry,
+                waited_secs = waited.as_secs(),
+                timeout_secs = timeout.as_secs(),
+                "Update pending: waiting for memory - the executor refused a memory grow while {step}; unloading the agent and retrying"
+            ),
+            update_memory_wait::UpdateMemoryDecision::GiveUp { retries, waited } => warn!(
+                agent_id = %self.owned_agent_id.agent_id,
+                %target_revision,
+                retries,
+                waited_secs = waited.as_secs(),
+                "Update failed: still out of memory while {step} after waiting the maximum time"
+            ),
+        }
+        decision
+    }
+
+    /// The pending update finished, successfully or not: forget its wait for
+    /// memory.
+    pub(crate) fn clear_update_memory_wait(&self) {
+        self.update_memory_wait.lock().unwrap().clear();
     }
 
     /// Startup module-charge requirement for a worker about to be (re)started.
@@ -1341,22 +1393,33 @@ impl<Ctx: WorkerCtx> Worker<Ctx> {
         self.execution_status.read().unwrap().timestamp()
     }
 
-    // Should only be called from invocation loop
-    pub async fn increase_memory(&self, delta: u64) -> anyhow::Result<()> {
+    /// Reserves memory for the running instance growing its linear memory to
+    /// `new_total_linear_memory` bytes. Only growth beyond what the worker's
+    /// grant already covers is reserved with the admission gate (see
+    /// [`memory_coverage::LinearMemoryCoverage`]); a refused reservation is the
+    /// retriable out-of-memory trap.
+    ///
+    /// Should only be called from invocation loop
+    pub async fn increase_memory(&self, new_total_linear_memory: u64) -> anyhow::Result<()> {
         // The instance lock must not be held while running the admission gate:
         // it may run the eviction scan, which takes other workers' instance
         // locks. Holding this worker's instance lock across that scan while
         // another growing worker does the same is an AB-BA deadlock. So check the
         // state, release the lock, then run the gate.
-        match &*self.instance.lock().await {
-            WorkerInstance::Running(_) => {}
+        let uncovered = match &*self.instance.lock().await {
+            WorkerInstance::Running(running) => running
+                .linear_memory_coverage
+                .uncovered_growth(new_total_linear_memory),
             WorkerInstance::Stopping(_)
             | WorkerInstance::WaitingForPermit(_)
             | WorkerInstance::Unloaded { .. }
             | WorkerInstance::Deleting => return Ok(()),
+        };
+        if uncovered == 0 {
+            return Ok(());
         }
 
-        let Some(extra_grant) = self.active_workers().try_acquire(delta).await else {
+        let Some(extra_grant) = self.active_workers().try_acquire(uncovered).await else {
             crate::metrics::workers::record_worker_memory_grow_rejected();
             return Err(anyhow!(GolemSpecificWasmTrap::WorkerOutOfMemory));
         };
@@ -1369,6 +1432,9 @@ impl<Ctx: WorkerCtx> Worker<Ctx> {
         match &mut *self.instance.lock().await {
             WorkerInstance::Running(running) => {
                 running.merge_extra_memory_grant(extra_grant);
+                running
+                    .linear_memory_coverage
+                    .cover(new_total_linear_memory);
             }
             WorkerInstance::Stopping(_)
             | WorkerInstance::WaitingForPermit(_)
@@ -2697,6 +2763,7 @@ impl<Ctx: WorkerCtx> Worker<Ctx> {
     async fn start_waiting_worker(
         this: Arc<Worker<Ctx>>,
         memory_grant: MemoryGrant,
+        linear_memory_coverage: memory_coverage::LinearMemoryCoverage,
         component_charge: WorkerComponentCharge,
         filesystem_storage_permit: Option<FilesystemStoragePermit>,
         concurrent_agent_permit: crate::services::active_workers::ConcurrentAgentPermit,
@@ -2714,6 +2781,7 @@ impl<Ctx: WorkerCtx> Worker<Ctx> {
                     this.queue.clone(),
                     this.clone(),
                     memory_grant,
+                    linear_memory_coverage,
                     component_charge,
                     concurrent_agent_permit,
                     oom_retry_count,
@@ -2925,6 +2993,7 @@ struct WaitingWorker {
 impl WaitingWorker {
     pub fn new<Ctx: WorkerCtx>(
         parent: Arc<Worker<Ctx>>,
+        linear_memory_bytes: u64,
         memory_requirement: u64,
         filesystem_storage_requirement: u64,
         oom_retry_count: u32,
@@ -3077,6 +3146,7 @@ impl WaitingWorker {
             Worker::start_waiting_worker(
                 parent,
                 memory_grant,
+                memory_coverage::LinearMemoryCoverage::new(linear_memory_bytes),
                 component_charge,
                 filesystem_storage_permit,
                 concurrent_agent_permit,
@@ -3115,6 +3185,9 @@ struct RunningWorker {
     /// symmetric with what was reserved.
     #[allow(dead_code)]
     memory_grant: MemoryGrant,
+    /// The linear memory `memory_grant` covers, so a regrowing instance is
+    /// charged only for growth beyond it.
+    linear_memory_coverage: memory_coverage::LinearMemoryCoverage,
     /// Keeps this worker's component module charge alive while it is resident.
     /// Held only to be dropped: dropping it releases the component's residency
     /// (and the module reservation if this was the last worker of the component).
@@ -3151,6 +3224,7 @@ impl RunningWorker {
         queue: Arc<RwLock<VecDeque<QueuedWorkerInvocation>>>,
         parent: Arc<Worker<Ctx>>,
         memory_grant: MemoryGrant,
+        linear_memory_coverage: memory_coverage::LinearMemoryCoverage,
         component_charge: WorkerComponentCharge,
         concurrent_agent_permit: crate::services::active_workers::ConcurrentAgentPermit,
         oom_retry_count: u32,
@@ -3189,6 +3263,7 @@ impl RunningWorker {
             sender,
             queue,
             memory_grant,
+            linear_memory_coverage,
             component_charge: Box::new(component_charge),
             filesystem_storage_permit: None,
             waiting_for_command,

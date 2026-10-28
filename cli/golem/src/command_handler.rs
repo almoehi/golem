@@ -14,9 +14,10 @@
 
 use anyhow::anyhow;
 use clap_verbosity_flag::Verbosity;
-use golem_cli::command::server::{RunArgs, ServerSubcommand};
+use golem_cli::command::server::{MemoryProbeArg, RunArgs, ServerSubcommand};
 use golem_cli::command_handler::CommandHandlerHooks;
 use golem_cli::context::Context;
+use golem_worker_executor::services::golem_config::MemoryProbeSource;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::debug;
@@ -25,6 +26,13 @@ use crate::compat::map_local_server_startup_error;
 use crate::launch::{LaunchArgs, launch_golem_services};
 
 pub struct ServerCommandHandler;
+
+fn memory_probe_source(arg: MemoryProbeArg) -> MemoryProbeSource {
+    match arg {
+        MemoryProbeArg::Process => MemoryProbeSource::Process,
+        MemoryProbeArg::Cgroup => MemoryProbeSource::Cgroup,
+    }
+}
 
 impl CommandHandlerHooks for ServerCommandHandler {
     async fn handler_server_commands(
@@ -58,6 +66,7 @@ impl CommandHandlerHooks for ServerCommandHandler {
                     ports_file: args.ports_file.clone(),
                     data_dir: data_dir.clone(),
                     agent_filesystem_root: args.agent_filesystem_root.clone(),
+                    memory_probe_source: memory_probe_source(args.memory_probe),
                 })
                 .await
                 .map_err(|err| map_local_server_startup_error(err, &data_dir))?;
@@ -84,6 +93,7 @@ impl CommandHandlerHooks for ServerCommandHandler {
             ports_file: args.ports_file.clone(),
             data_dir: data_dir.clone(),
             agent_filesystem_root: args.agent_filesystem_root.clone(),
+            memory_probe_source: memory_probe_source(args.memory_probe),
         })
         .await
         .map_err(|err| map_local_server_startup_error(err, &data_dir))?;

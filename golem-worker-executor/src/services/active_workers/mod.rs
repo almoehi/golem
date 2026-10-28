@@ -111,8 +111,11 @@ impl<Ctx: WorkerCtx> ActiveWorkers<Ctx> {
     ) -> Self {
         // Build the probe once and hand it to the measured-headroom gate, which
         // bases its decision on the pod's cgroup limit when constrained (not host
-        // RAM).
-        let probe = default_probe(memory_config.system_memory_override);
+        // RAM), measuring what `probe_source` selects against it.
+        let probe = default_probe(
+            memory_config.system_memory_override,
+            memory_config.probe_source,
+        );
         Self::new_with_probe(
             probe,
             memory_config,

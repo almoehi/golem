@@ -41,8 +41,8 @@ use golem_worker_executor::services::golem_config::{
     AgentTypesServiceConfig, AgentWebhooksServiceConfig, EnvironmentStateServiceConfig,
     FilesystemStorageConfig, GolemConfig as WorkerExecutorConfig, IndexedStorageConfig,
     IndexedStorageKVStoreMultiSqliteConfig, KeyValueStorageConfig,
-    KeyValueStorageMultiSqliteConfig, ResourceLimitsConfig, ResourceLimitsGrpcConfig,
-    SchedulerStorageConfig, WorkerServiceGrpcConfig,
+    KeyValueStorageMultiSqliteConfig, MemoryConfig, MemoryProbeSource, ResourceLimitsConfig,
+    ResourceLimitsGrpcConfig, SchedulerStorageConfig, WorkerServiceGrpcConfig,
 };
 use golem_worker_service::WorkerService;
 use golem_worker_service::config::{
@@ -69,6 +69,7 @@ pub struct LaunchArgs {
     pub ports_file: Option<PathBuf>,
     pub data_dir: PathBuf,
     pub agent_filesystem_root: Option<PathBuf>,
+    pub memory_probe_source: MemoryProbeSource,
 }
 
 impl LaunchArgs {
@@ -414,6 +415,14 @@ fn worker_executor_config(
         },
         filesystem_storage: FilesystemStorageConfig {
             deterministic_root_dir: args.agent_filesystem_root.clone(),
+            ..Default::default()
+        },
+        // The single binary usually shares its container with whatever else
+        // runs next to it, which the executor cannot free by evicting agents, so
+        // by default (`--memory-probe`) it measures its own process rather than
+        // the whole cgroup.
+        memory: MemoryConfig {
+            probe_source: args.memory_probe_source,
             ..Default::default()
         },
         ..Default::default()

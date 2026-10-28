@@ -59,7 +59,9 @@ use golem_common::model::{
 };
 use golem_service_base::clients::registry::RegistryService;
 use golem_service_base::config::{BlobStorageConfig, LocalFileSystemBlobStorageConfig};
-use golem_service_base::error::worker_executor::{InterruptKind, WorkerExecutorError};
+use golem_service_base::error::worker_executor::{
+    GolemSpecificWasmTrap, InterruptKind, WorkerExecutorError,
+};
 use golem_service_base::grpc::server::GrpcServerTlsConfig;
 use golem_service_base::model::GetFileSystemNodeResult;
 use golem_service_base::model::auth::{AuthCtx, UserAuthCtx};
@@ -88,7 +90,7 @@ use golem_worker_executor::preview2::golem::agent::host::{
 };
 use golem_worker_executor::preview2::{golem_api_1_x, golem_durability};
 use golem_worker_executor::services::active_workers::ActiveWorkers;
-use golem_worker_executor::services::active_workers::memory_probe::FixedProbe;
+use golem_worker_executor::services::active_workers::memory_probe::{FixedProbe, SharedUsageProbe};
 use golem_worker_executor::services::agent_types::AgentTypesService;
 use golem_worker_executor::services::agent_webhooks::AgentWebhooksService;
 use golem_worker_executor::services::blob_store::{
@@ -145,7 +147,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
@@ -523,6 +525,56 @@ pub struct TestExecutorOverrides {
     /// should expose to running agents (mirrors `retryPolicyDefaults` in
     /// `golem.yaml`).  When `None`, an empty policy list is used.
     pub retry_policies: Option<Vec<NamedRetryPolicy>>,
+    /// Lets a test refuse an agent's memory grows the way the executor's
+    /// admission gate does when it is out of memory (see [`MemoryGrowRefusal`]).
+    pub memory_grow_refusal: Option<MemoryGrowRefusal>,
+    /// Measured memory usage the admission gate reads, movable by the test at
+    /// any time. Only used when `system_memory_override` pins the limit (which
+    /// also enables the gate); otherwise the usage is pinned to zero.
+    pub measured_memory_usage: Option<Arc<AtomicU64>>,
+}
+
+/// Refuses an agent's memory grows while it runs a snapshotting function (a
+/// snapshot save or load) in a chosen component revision, with exactly the trap
+/// the executor's admission gate raises when it cannot admit a grow
+/// (`GolemSpecificWasmTrap::WorkerOutOfMemory`).
+///
+/// The gate itself cannot be steered into refusing one particular grow of one
+/// particular phase: a worker restarted in place keeps its memory grant, which
+/// covers the snapshot load's growth. This seam lets a test exercise how an
+/// update reacts to the gate's refusal without depending on which grows the
+/// gate happens to see.
+#[derive(Clone, Default)]
+pub struct MemoryGrowRefusal {
+    refused_revision: Arc<Mutex<Option<ComponentRevision>>>,
+    refusals: Arc<AtomicUsize>,
+}
+
+impl MemoryGrowRefusal {
+    /// Refuse every memory grow of an agent running a snapshotting function in
+    /// `revision` (the target revision refuses the update's snapshot load).
+    pub fn refuse_while_snapshotting(&self, revision: ComponentRevision) {
+        *self.refused_revision.lock().unwrap() = Some(revision);
+    }
+
+    /// Stop refusing grows.
+    pub fn allow(&self) {
+        *self.refused_revision.lock().unwrap() = None;
+    }
+
+    /// How many grows have been refused so far.
+    pub fn refusals(&self) -> usize {
+        self.refusals.load(Ordering::SeqCst)
+    }
+
+    fn refuses(&self, revision: ComponentRevision, calling_snapshotting_function: bool) -> bool {
+        let refuses = calling_snapshotting_function
+            && *self.refused_revision.lock().unwrap() == Some(revision);
+        if refuses {
+            self.refusals.fetch_add(1, Ordering::SeqCst);
+        }
+        refuses
+    }
 }
 
 fn make_base_test_config(deps: &WorkerExecutorTestDependencies) -> GolemConfig {
@@ -782,6 +834,7 @@ async fn run(
 
 struct TestWorkerCtx {
     durable_ctx: DurableWorkerCtx<TestWorkerCtx>,
+    memory_grow_refusal: MemoryGrowRefusal,
 }
 
 impl DurableWorkerCtxView<TestWorkerCtx> for TestWorkerCtx {
@@ -1060,6 +1113,7 @@ impl WorkerCtx for TestWorkerCtx {
         pending_update: Option<TimestampedUpdateDescription>,
         original_phantom_id: Option<Uuid>,
     ) -> Result<Self, WorkerExecutorError> {
+        let memory_grow_refusal = extra_deps.memory_grow_refusal.clone();
         let oplog = Arc::new(TestOplog::new(
             owned_agent_id.clone(),
             oplog.clone(),
@@ -1109,7 +1163,10 @@ impl WorkerCtx for TestWorkerCtx {
             u64::MAX,
         )
         .await?;
-        Ok(Self { durable_ctx })
+        Ok(Self {
+            durable_ctx,
+            memory_grow_refusal,
+        })
     }
 
     fn as_wasi_view(&mut self) -> impl WasiView {
@@ -1197,6 +1254,14 @@ impl ResourceLimiterAsync for TestWorkerCtx {
             current,
             desired
         );
+        if self.memory_grow_refusal.refuses(
+            self.durable_ctx.component_metadata().revision,
+            self.durable_ctx.is_calling_snapshotting_function(),
+        ) {
+            return Err(wasmtime::Error::from_anyhow(anyhow!(
+                GolemSpecificWasmTrap::WorkerOutOfMemory
+            )));
+        }
         let current_known = self.durable_ctx.total_linear_memory_size();
         let delta = (desired as u64).saturating_sub(current_known);
         if delta > 0 {
@@ -1411,7 +1476,10 @@ impl Bootstrap<TestWorkerCtx> for TestServerBootstrap {
         // the pre-gate semaphore pool size of system_memory_override * ratio.
         match golem_config.memory.system_memory_override {
             Some(limit) => Arc::new(ActiveWorkers::new_with_probe(
-                Box::new(FixedProbe::new(limit, 0)),
+                match &self.overrides.measured_memory_usage {
+                    Some(usage) => Box::new(SharedUsageProbe::new(limit, usage.clone())),
+                    None => Box::new(FixedProbe::new(limit, 0)),
+                },
                 &golem_config.memory,
                 &golem_config.filesystem_storage,
                 &golem_config.agent_status_flush,
@@ -1483,7 +1551,11 @@ impl Bootstrap<TestWorkerCtx> for TestServerBootstrap {
         &self,
         _registry_service: Arc<dyn RegistryService>,
     ) -> AdditionalTestDeps {
-        AdditionalTestDeps::new()
+        let mut deps = AdditionalTestDeps::new();
+        if let Some(refusal) = &self.overrides.memory_grow_refusal {
+            deps.memory_grow_refusal = refusal.clone();
+        }
+        deps
     }
 
     fn create_direct_invocation_auth_service(
@@ -2373,6 +2445,7 @@ impl<T: RdbmsType> Rdbms<T> for TestRdms<T> {
 pub struct AdditionalTestDeps {
     oplog_failures: Arc<scc::HashMap<AgentId, scc::HashMap<String, usize>>>,
     rdbms_tx_failures: Arc<scc::HashMap<AgentId, scc::HashMap<String, usize>>>,
+    memory_grow_refusal: MemoryGrowRefusal,
 }
 
 impl Default for AdditionalTestDeps {
@@ -2388,6 +2461,7 @@ impl AdditionalTestDeps {
         Self {
             oplog_failures,
             rdbms_tx_failures,
+            memory_grow_refusal: MemoryGrowRefusal::default(),
         }
     }
 

@@ -2213,8 +2213,19 @@ pub mod account {
 }
 
 pub mod server {
-    use clap::{Args, Subcommand};
+    use clap::{Args, Subcommand, ValueEnum};
     use std::path::PathBuf;
+
+    /// What the local server's memory admission measures as memory in use.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+    pub enum MemoryProbeArg {
+        /// Only the server's own process (resident memory). The default: other
+        /// processes sharing its container are not memory it can free.
+        #[default]
+        Process,
+        /// The whole cgroup (container) the server runs in.
+        Cgroup,
+    }
 
     #[derive(Debug, Args, Default)]
     pub struct RunArgs {
@@ -2261,6 +2272,12 @@ pub mod server {
         ///   <root>/<environment_id>/<component_id>/<agent_name>/
         #[clap(long)]
         pub agent_filesystem_root: Option<PathBuf>,
+
+        /// What memory admission measures against the memory limit (the
+        /// container's limit, or host RAM): the server process alone, or the
+        /// whole cgroup including every other process in the container
+        #[clap(long, value_enum, default_value_t)]
+        pub memory_probe: MemoryProbeArg,
     }
 
     impl RunArgs {

@@ -1031,6 +1031,7 @@ pub async fn bootstrap_and_run_worker_executor<
 
     let memory_snapshot = crate::services::active_workers::memory_probe::default_probe(
         golem_config.memory.system_memory_override,
+        golem_config.memory.probe_source,
     )
     .snapshot();
     let total_system_memory = memory_snapshot.limit_bytes;

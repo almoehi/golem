@@ -21,6 +21,7 @@ use crate::worker::invocation::{
     InvocationMode, InvokeResult, invoke_observed_and_traced, lower_invocation,
 };
 use crate::worker::status_checkpointer;
+use crate::worker::update_memory_wait::{UpdateMemoryDecision, UpdateSnapshotStep};
 use crate::worker::{
     FinalWorkerState, QueuedWorkerInvocation, RetryDecision, RunningWorker, Worker, WorkerCommand,
     WorkerTrace, periodic_snapshot_backoff_factor,
@@ -1301,6 +1302,34 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
                         .to_string(),
                 )
                 .await
+            }
+            Ok(InvokeResult::Failed {
+                error: AgentError::OutOfMemory,
+                ..
+            }) => {
+                // The executor could not grant the memory the save needs right
+                // now. That is temporary: leave the manual update pending
+                // (nothing is recorded, so it is picked up again) and retry after
+                // the agent is unloaded, until it has waited too long.
+                match self
+                    .parent
+                    .on_update_out_of_memory(target_revision, UpdateSnapshotStep::Save)
+                {
+                    UpdateMemoryDecision::Retry { .. } => {
+                        CommandOutcome::BreakInnerLoop(RetryDecision::ReacquirePermits)
+                    }
+                    UpdateMemoryDecision::GiveUp { retries, waited } => {
+                        self.fail_update(
+                            target_revision,
+                            UpdateMemoryDecision::failure_details(
+                                UpdateSnapshotStep::Save,
+                                retries,
+                                waited,
+                            ),
+                        )
+                        .await
+                    }
+                }
             }
             Ok(InvokeResult::Failed { error, .. }) => {
                 let stderr = self

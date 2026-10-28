@@ -50,6 +50,7 @@ pub mod rpc;
 pub mod scalability;
 pub mod storage_quota;
 pub mod transactions;
+pub mod update_memory;
 pub mod wasi;
 pub mod websocket;
 
@@ -69,6 +70,7 @@ tag_suite!(hot_update, group2);
 tag_suite!(transactions, group2);
 tag_suite!(observability, group2);
 tag_suite!(retry_policies, group2);
+tag_suite!(update_memory, group2);
 
 tag_suite!(durability, group3);
 tag_suite!(rpc, group3);

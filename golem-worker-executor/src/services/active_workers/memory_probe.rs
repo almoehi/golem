@@ -23,8 +23,11 @@
 //! a configured override pins it explicitly. Backend fidelity is asymmetric —
 //! cgroup v2 gives the exact kernel-enforced number; other targets fall back to
 //! best-effort process RSS via [`ProcessRssProbe`] until dedicated macOS and
-//! Windows backends land.
+//! Windows backends land. What is measured against a cgroup limit is
+//! configurable ([`MemoryProbeSource`]): the whole cgroup, or only this process
+//! when the container also runs other processes.
 
+use crate::services::golem_config::MemoryProbeSource;
 use std::fmt::Debug;
 
 /// A snapshot of the executor environment's memory state.
@@ -132,6 +135,39 @@ impl MemoryProbe for FixedProbe {
     }
 }
 
+/// A probe with a fixed limit whose current usage is read from a shared
+/// counter the owner can move at any time. Lets the in-process test harness
+/// put the gate under pressure (or relieve it) at a chosen moment of a test,
+/// with the same isolation rationale as [`FixedProbe`].
+#[derive(Debug)]
+pub struct SharedUsageProbe {
+    limit_bytes: u64,
+    current_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SharedUsageProbe {
+    pub fn new(
+        limit_bytes: u64,
+        current_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self {
+            limit_bytes,
+            current_bytes,
+        }
+    }
+}
+
+impl MemoryProbe for SharedUsageProbe {
+    fn snapshot(&self) -> MemorySnapshot {
+        MemorySnapshot {
+            limit_bytes: self.limit_bytes,
+            current_bytes: self
+                .current_bytes
+                .load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+}
+
 /// Linux cgroup v2 probe. Reads `memory.max` and `memory.current` from the
 /// process's cgroup.
 #[cfg(target_os = "linux")]
@@ -196,22 +232,54 @@ impl MemoryProbe for CgroupV2Probe {
     }
 }
 
-/// Constructs the best available probe.
-///
-/// When `memory_override` is set, the limit is self-declared and treated as an
-/// isolated budget measured against this process's RSS — the executor does not
-/// assume it owns a cgroup. When it is `None`, the executor is assumed to own
-/// its memory environment, so on Linux the exact cgroup v2 numbers are used
-/// (falling back to host RAM / process RSS otherwise).
-pub fn default_probe(memory_override: Option<u64>) -> Box<dyn MemoryProbe> {
-    if let Some(limit) = memory_override {
-        tracing::info!(
-            limit_bytes = limit,
-            "Memory probe: ProcessRssProbe (limit pinned by system_memory_override)"
-        );
-        return Box::new(ProcessRssProbe::new(limit));
-    }
+/// Which probe [`default_probe`] builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeChoice {
+    /// The cgroup's own `memory.max` / `memory.current`.
+    Cgroup,
+    /// This process's RSS against a fixed limit.
+    ProcessRss { limit_bytes: u64 },
+}
 
+/// Decides which probe to build. `cgroup_limit_bytes` is the cgroup's limit
+/// when a cgroup v2 memory controller is available (`None` otherwise).
+fn choose_probe(
+    memory_override: Option<u64>,
+    source: MemoryProbeSource,
+    cgroup_limit_bytes: Option<u64>,
+    host_ram_bytes: u64,
+) -> ProbeChoice {
+    if let Some(limit_bytes) = memory_override {
+        // The limit is self-declared and treated as an isolated budget measured
+        // against this process's RSS: the executor does not assume it owns a
+        // cgroup.
+        return ProbeChoice::ProcessRss { limit_bytes };
+    }
+    match (source, cgroup_limit_bytes) {
+        (MemoryProbeSource::Cgroup, Some(_)) => ProbeChoice::Cgroup,
+        (MemoryProbeSource::Cgroup, None) => ProbeChoice::ProcessRss {
+            limit_bytes: host_ram_bytes,
+        },
+        // Measure only this process, but still against the container's limit:
+        // that is what an OOM kill enforces.
+        (MemoryProbeSource::Process, limit) => ProbeChoice::ProcessRss {
+            limit_bytes: limit.unwrap_or(host_ram_bytes),
+        },
+    }
+}
+
+/// Constructs the probe the configuration asks for.
+///
+/// When `memory_override` is set, the limit is self-declared and measured
+/// against this process's RSS. Otherwise the limit is the cgroup v2 `memory.max`
+/// on Linux (host RAM elsewhere or when unlimited), and `source` decides what is
+/// measured against it: the whole cgroup's `memory.current`
+/// ([`MemoryProbeSource::Cgroup`], which counts every process in the container)
+/// or only this process's RSS ([`MemoryProbeSource::Process`]).
+pub fn default_probe(
+    memory_override: Option<u64>,
+    source: MemoryProbeSource,
+) -> Box<dyn MemoryProbe> {
     let host_ram = {
         let mut sysinfo = sysinfo::System::new();
         sysinfo.refresh_memory();
@@ -219,20 +287,98 @@ pub fn default_probe(memory_override: Option<u64>) -> Box<dyn MemoryProbe> {
     };
 
     #[cfg(target_os = "linux")]
-    {
-        if let Some(probe) = CgroupV2Probe::try_new(host_ram) {
-            let snapshot = probe.snapshot();
+    let cgroup = if memory_override.is_none() {
+        CgroupV2Probe::try_new(host_ram)
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let cgroup_limit = cgroup.as_ref().map(|probe| probe.snapshot().limit_bytes);
+    #[cfg(not(target_os = "linux"))]
+    let cgroup_limit: Option<u64> = None;
+
+    match choose_probe(memory_override, source, cgroup_limit, host_ram) {
+        ProbeChoice::Cgroup => {
+            #[cfg(target_os = "linux")]
+            if let Some(probe) = cgroup {
+                let snapshot = probe.snapshot();
+                tracing::info!(
+                    limit_bytes = snapshot.limit_bytes,
+                    current_bytes = snapshot.current_bytes,
+                    "Memory probe: CgroupV2Probe (cgroup memory.max/current)"
+                );
+                return Box::new(probe);
+            }
+            unreachable!("the cgroup probe is chosen only when a cgroup limit was read")
+        }
+        ProbeChoice::ProcessRss { limit_bytes } => {
             tracing::info!(
-                limit_bytes = snapshot.limit_bytes,
-                current_bytes = snapshot.current_bytes,
-                "Memory probe: CgroupV2Probe (cgroup memory.max/current)"
+                limit_bytes,
+                ?source,
+                pinned_by_override = memory_override.is_some(),
+                "Memory probe: ProcessRssProbe (this process's RSS)"
             );
-            return Box::new(probe);
+            Box::new(ProcessRssProbe::new(limit_bytes))
         }
     }
-    tracing::info!(
-        limit_bytes = host_ram,
-        "Memory probe: ProcessRssProbe (host RAM, no cgroup v2 limit)"
-    );
-    Box::new(ProcessRssProbe::new(host_ram))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_r::test;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn an_override_pins_the_limit_against_process_rss() {
+        for source in [MemoryProbeSource::Cgroup, MemoryProbeSource::Process] {
+            assert_eq!(
+                choose_probe(Some(2 * GIB), source, Some(12 * GIB), 64 * GIB),
+                ProbeChoice::ProcessRss {
+                    limit_bytes: 2 * GIB
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn cgroup_source_measures_the_cgroup_when_there_is_one() {
+        assert_eq!(
+            choose_probe(None, MemoryProbeSource::Cgroup, Some(12 * GIB), 64 * GIB),
+            ProbeChoice::Cgroup
+        );
+        assert_eq!(
+            choose_probe(None, MemoryProbeSource::Cgroup, None, 64 * GIB),
+            ProbeChoice::ProcessRss {
+                limit_bytes: 64 * GIB
+            }
+        );
+    }
+
+    #[test]
+    fn process_source_measures_this_process_against_the_cgroup_limit() {
+        assert_eq!(
+            choose_probe(None, MemoryProbeSource::Process, Some(12 * GIB), 64 * GIB),
+            ProbeChoice::ProcessRss {
+                limit_bytes: 12 * GIB
+            }
+        );
+        assert_eq!(
+            choose_probe(None, MemoryProbeSource::Process, None, 64 * GIB),
+            ProbeChoice::ProcessRss {
+                limit_bytes: 64 * GIB
+            }
+        );
+    }
+
+    #[test]
+    fn the_process_probe_reads_this_processs_resident_memory() {
+        // Touch a buffer so the process is certainly resident beyond it.
+        let buffer = vec![1u8; 32 * 1024 * 1024];
+        let snapshot = default_probe(None, MemoryProbeSource::Process).snapshot();
+        assert!(snapshot.current_bytes >= buffer.len() as u64);
+        assert!(snapshot.limit_bytes > snapshot.current_bytes);
+        drop(buffer);
+    }
 }

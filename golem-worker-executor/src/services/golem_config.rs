@@ -1113,6 +1113,34 @@ pub struct MemoryConfig {
     #[serde(with = "humantime_serde")]
     pub acquire_retry_delay: Duration,
     pub oom_retry_config: RetryConfig,
+    /// How long a snapshot-based (manual) update may keep waiting for memory
+    /// before it is recorded as failed. A memory grow the admission gate refuses
+    /// while the update saves or loads its snapshot is temporary: the agent is
+    /// unloaded and the step retried with the `oom_retry_config` backoff, like
+    /// an ordinary invocation that runs out of memory, until this much time has
+    /// passed since the first refusal.
+    #[serde(with = "humantime_serde")]
+    pub update_oom_retry_timeout: Duration,
+    /// What the admission gate measures as current memory use (see
+    /// [`MemoryProbeSource`]).
+    pub probe_source: MemoryProbeSource,
+}
+
+/// What the admission gate measures as the current memory use. The limit is
+/// the same in both cases: `system_memory_override` when set, else the cgroup's
+/// `memory.max` on Linux, else host RAM.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemoryProbeSource {
+    /// The whole cgroup's `memory.current` (on Linux with cgroup v2, else this
+    /// process's RSS). Right when the executor owns its container, as in a pod.
+    #[default]
+    Cgroup,
+    /// This executor process's resident memory. Right when the container also
+    /// runs other processes, whose memory the executor cannot free by evicting
+    /// agents (e.g. the single-binary `golem server run` next to other services);
+    /// the share of the limit outside `worker_memory_ratio` has to cover them.
+    Process,
 }
 
 impl MemoryConfig {
@@ -1159,6 +1187,12 @@ impl SafeDisplay for MemoryConfig {
             "acquire retry delay: {:?}",
             self.acquire_retry_delay
         );
+        let _ = writeln!(
+            &mut result,
+            "update oom retry timeout: {:?}",
+            self.update_oom_retry_timeout
+        );
+        let _ = writeln!(&mut result, "probe source: {:?}", self.probe_source);
         let _ = writeln!(&mut result, "oom retry config:");
         let _ = writeln!(
             &mut result,
@@ -1701,6 +1735,8 @@ impl Default for MemoryConfig {
                 multiplier: 2.0,
                 max_jitter_factor: None, // TODO: should we add jitter here?
             },
+            update_oom_retry_timeout: Duration::from_secs(30 * 60),
+            probe_source: MemoryProbeSource::Cgroup,
         }
     }
 }

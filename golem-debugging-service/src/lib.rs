@@ -378,6 +378,7 @@ pub async fn run_debug_worker_executor<T: Bootstrap<DebugContext> + ?Sized + Sen
     let memory_snapshot =
         golem_worker_executor::services::active_workers::memory_probe::default_probe(
             golem_config.memory.system_memory_override,
+            golem_config.memory.probe_source,
         )
         .snapshot();
     let total_system_memory = memory_snapshot.limit_bytes;

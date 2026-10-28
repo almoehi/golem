@@ -1091,15 +1091,17 @@ impl<Ctx: WorkerCtx> Worker<Ctx> {
 
     /// Decides what to do about the pending snapshot-based update to
     /// `target_revision` after the admission gate refused a memory grow during
-    /// its `step` (see [`update_memory_wait`]), and logs the waiting state.
+    /// its `step`, requested by the oplog entry at `request` (see
+    /// [`update_memory_wait`]), and logs the waiting state.
     pub(crate) fn on_update_out_of_memory(
         &self,
         target_revision: ComponentRevision,
+        request: OplogIndex,
         step: update_memory_wait::UpdateSnapshotStep,
     ) -> update_memory_wait::UpdateMemoryDecision {
         let timeout = self.update_oom_retry_timeout;
         let decision = self.update_memory_wait.lock().unwrap().on_refused(
-            target_revision,
+            request,
             std::time::Instant::now(),
             timeout,
         );

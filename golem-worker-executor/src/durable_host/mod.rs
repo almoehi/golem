@@ -1769,6 +1769,7 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
         match pending_update {
             Some(TimestampedUpdateDescription {
                 description: description @ UpdateDescription::SnapshotBased { .. },
+                oplog_index: pending_update_index,
                 ..
             }) => {
                 let target_revision = *description.target_revision();
@@ -1926,7 +1927,11 @@ impl<Ctx: WorkerCtx> DurableWorkerCtx<Ctx> {
                                 .data()
                                 .get_public_state()
                                 .worker()
-                                .on_update_out_of_memory(target_revision, UpdateSnapshotStep::Load);
+                                .on_update_out_of_memory(
+                                    target_revision,
+                                    pending_update_index,
+                                    UpdateSnapshotStep::Load,
+                                );
                             match decision {
                                 UpdateMemoryDecision::Retry { .. } => {
                                     return Ok(Some(RetryDecision::ReacquirePermits));

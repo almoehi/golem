@@ -109,3 +109,51 @@ impl JsonSnapshotCounter for JsonSnapshotCounterImpl {
         self.count
     }
 }
+
+/// Size of a [`PaddedSnapshotCounter`] snapshot. Large enough that saving or
+/// loading one always grows the agent's linear memory, so a test can have the
+/// executor refuse that grow.
+const PADDED_SNAPSHOT_SIZE: usize = 4 * 1024 * 1024;
+
+#[agent_definition(snapshotting = "enabled")]
+trait PaddedSnapshotCounter {
+    fn new(id: String) -> Self;
+    fn increment(&mut self) -> u32;
+    fn get(&self) -> u32;
+}
+
+struct PaddedSnapshotCounterImpl {
+    count: u32,
+    _id: String,
+}
+
+#[agent_implementation]
+impl PaddedSnapshotCounter for PaddedSnapshotCounterImpl {
+    fn new(id: String) -> Self {
+        Self { _id: id, count: 0 }
+    }
+
+    fn increment(&mut self) -> u32 {
+        self.count += 1;
+        self.count
+    }
+
+    fn get(&self) -> u32 {
+        self.count
+    }
+
+    async fn save_snapshot(&self) -> Result<Vec<u8>, String> {
+        let mut bytes = vec![0u8; PADDED_SNAPSHOT_SIZE];
+        bytes[..4].copy_from_slice(&self.count.to_le_bytes());
+        Ok(bytes)
+    }
+
+    async fn load_snapshot(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        if bytes.len() == PADDED_SNAPSHOT_SIZE {
+            self.count = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            Ok(())
+        } else {
+            Err(format!("Invalid snapshot size: {}", bytes.len()))
+        }
+    }
+}

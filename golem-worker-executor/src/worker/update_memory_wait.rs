@@ -20,10 +20,17 @@
 //! step is therefore retried — the agent is unloaded, releasing its memory, and
 //! restarted with the out-of-memory backoff — instead of recording the update as
 //! failed. [`UpdateMemoryWait`] decides how long that may go on: from the first
-//! refusal for an update until `timeout` has passed, after which the update is
-//! recorded as failed after all.
+//! refusal for an update request until `timeout` has passed, after which the
+//! update is recorded as failed after all.
+//!
+//! The wait belongs to one request, identified by the oplog index of the entry
+//! that asked for the refused step: the pending `ManualUpdate` invocation for
+//! the save, the `PendingUpdate` entry for the load. A pending update can end
+//! without the executor recording its outcome here (a revert drops it, a missing
+//! target revision fails it while the instance is created), so a later update —
+//! even to the same revision — must not inherit an earlier request's clock.
 
-use golem_common::model::component::ComponentRevision;
+use golem_common::model::oplog::OplogIndex;
 use std::fmt::{Display, Formatter};
 use std::time::{Duration, Instant};
 
@@ -67,7 +74,7 @@ impl UpdateMemoryDecision {
 
 #[derive(Debug, Clone, Copy)]
 struct Waiting {
-    target_revision: ComponentRevision,
+    request: OplogIndex,
     since: Instant,
     retries: u32,
 }
@@ -81,19 +88,19 @@ pub struct UpdateMemoryWait {
 }
 
 impl UpdateMemoryWait {
-    /// Called when a memory grow of the update to `target_revision` was refused
-    /// at `now`. The wait starts at the first refusal for that revision; a
-    /// refusal for another revision starts a new wait.
+    /// Called when a memory grow of the update step requested by the oplog entry
+    /// at `request` was refused at `now`. The wait starts at the first refusal
+    /// for that request; a refusal for another request starts a new wait.
     pub fn on_refused(
         &mut self,
-        target_revision: ComponentRevision,
+        request: OplogIndex,
         now: Instant,
         timeout: Duration,
     ) -> UpdateMemoryDecision {
         let waiting = match self.waiting {
-            Some(waiting) if waiting.target_revision == target_revision => waiting,
+            Some(waiting) if waiting.request == request => waiting,
             _ => Waiting {
-                target_revision,
+                request,
                 since: now,
                 retries: 0,
             },
@@ -128,8 +135,8 @@ mod tests {
 
     const TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-    fn revision(n: u64) -> ComponentRevision {
-        ComponentRevision::new(n).unwrap()
+    fn request(n: u64) -> OplogIndex {
+        OplogIndex::from_u64(n)
     }
 
     #[test]
@@ -137,7 +144,7 @@ mod tests {
         let mut wait = UpdateMemoryWait::default();
         let now = Instant::now();
         assert_eq!(
-            wait.on_refused(revision(2), now, TIMEOUT),
+            wait.on_refused(request(20), now, TIMEOUT),
             UpdateMemoryDecision::Retry {
                 retry: 1,
                 waited: Duration::ZERO
@@ -149,16 +156,16 @@ mod tests {
     fn retries_until_the_timeout_counted_from_the_first_refusal() {
         let mut wait = UpdateMemoryWait::default();
         let start = Instant::now();
-        wait.on_refused(revision(2), start, TIMEOUT);
+        wait.on_refused(request(20), start, TIMEOUT);
         assert_eq!(
-            wait.on_refused(revision(2), start + Duration::from_secs(60), TIMEOUT),
+            wait.on_refused(request(20), start + Duration::from_secs(60), TIMEOUT),
             UpdateMemoryDecision::Retry {
                 retry: 2,
                 waited: Duration::from_secs(60)
             }
         );
         assert_eq!(
-            wait.on_refused(revision(2), start + TIMEOUT, TIMEOUT),
+            wait.on_refused(request(20), start + TIMEOUT, TIMEOUT),
             UpdateMemoryDecision::GiveUp {
                 retries: 2,
                 waited: TIMEOUT
@@ -167,12 +174,30 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_for_another_revision_starts_a_new_wait() {
+    fn a_new_request_for_the_same_revision_does_not_inherit_a_stale_wait() {
+        // The first request's update ended without being cleared here (a revert
+        // dropped it, or the target revision was missing). A later request — even
+        // one updating to the same revision — gets its own full wait instead of
+        // giving up on its first refusal.
         let mut wait = UpdateMemoryWait::default();
         let start = Instant::now();
-        wait.on_refused(revision(2), start, TIMEOUT);
+        wait.on_refused(request(20), start, TIMEOUT);
         assert_eq!(
-            wait.on_refused(revision(3), start + TIMEOUT, TIMEOUT),
+            wait.on_refused(request(45), start + TIMEOUT * 2, TIMEOUT),
+            UpdateMemoryDecision::Retry {
+                retry: 1,
+                waited: Duration::ZERO
+            }
+        );
+    }
+
+    #[test]
+    fn a_refusal_for_another_request_starts_a_new_wait() {
+        let mut wait = UpdateMemoryWait::default();
+        let start = Instant::now();
+        wait.on_refused(request(20), start, TIMEOUT);
+        assert_eq!(
+            wait.on_refused(request(30), start + TIMEOUT, TIMEOUT),
             UpdateMemoryDecision::Retry {
                 retry: 1,
                 waited: Duration::ZERO
@@ -184,10 +209,10 @@ mod tests {
     fn giving_up_or_clearing_forgets_the_wait() {
         let mut wait = UpdateMemoryWait::default();
         let start = Instant::now();
-        wait.on_refused(revision(2), start, TIMEOUT);
-        wait.on_refused(revision(2), start + TIMEOUT, TIMEOUT);
+        wait.on_refused(request(20), start, TIMEOUT);
+        wait.on_refused(request(20), start + TIMEOUT, TIMEOUT);
         assert_eq!(
-            wait.on_refused(revision(2), start + TIMEOUT * 2, TIMEOUT),
+            wait.on_refused(request(20), start + TIMEOUT * 2, TIMEOUT),
             UpdateMemoryDecision::Retry {
                 retry: 1,
                 waited: Duration::ZERO
@@ -196,7 +221,7 @@ mod tests {
 
         wait.clear();
         assert_eq!(
-            wait.on_refused(revision(2), start + TIMEOUT * 3, TIMEOUT),
+            wait.on_refused(request(20), start + TIMEOUT * 3, TIMEOUT),
             UpdateMemoryDecision::Retry {
                 retry: 1,
                 waited: Duration::ZERO

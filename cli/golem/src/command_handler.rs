@@ -29,8 +29,9 @@ pub struct ServerCommandHandler;
 
 fn memory_probe_source(arg: MemoryProbeArg) -> MemoryProbeSource {
     match arg {
-        MemoryProbeArg::Process => MemoryProbeSource::Process,
+        MemoryProbeArg::CgroupWorkingSet => MemoryProbeSource::CgroupWorkingSet,
         MemoryProbeArg::Cgroup => MemoryProbeSource::Cgroup,
+        MemoryProbeArg::Process => MemoryProbeSource::Process,
     }
 }
 

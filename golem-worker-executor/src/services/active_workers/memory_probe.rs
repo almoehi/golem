@@ -168,8 +168,29 @@ impl MemoryProbe for SharedUsageProbe {
     }
 }
 
+/// The cgroup's working set: `memory.current` minus the reclaimable inactive
+/// page cache (`inactive_file` in `memory.stat`), the measure kubelet uses for
+/// eviction. The kernel drops inactive file pages before it OOM-kills, so they
+/// are not memory the gate has to keep headroom for. Falls back to `current`
+/// when `memory.stat` is unavailable or has no `inactive_file` line (e.g. under
+/// gVisor), and never goes below zero.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn cgroup_working_set_bytes(current_bytes: u64, memory_stat: Option<&str>) -> u64 {
+    let inactive_file = memory_stat.and_then(|stat| {
+        stat.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            match (fields.next(), fields.next()) {
+                (Some("inactive_file"), Some(value)) => value.parse::<u64>().ok(),
+                _ => None,
+            }
+        })
+    });
+    current_bytes.saturating_sub(inactive_file.unwrap_or(0))
+}
+
 /// Linux cgroup v2 probe. Reads `memory.max` and `memory.current` from the
-/// process's cgroup.
+/// process's cgroup; in working-set mode `memory.stat` too, to leave out the
+/// reclaimable page cache (see [`cgroup_working_set_bytes`]).
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct CgroupV2Probe {
@@ -178,6 +199,8 @@ pub struct CgroupV2Probe {
     /// Fallback limit used when `memory.max` reads `max` (unlimited) — usually
     /// host RAM or the configured override.
     fallback_limit_bytes: u64,
+    /// Report the working set instead of the raw `memory.current`.
+    working_set: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -195,10 +218,18 @@ impl CgroupV2Probe {
             Some(Self {
                 base,
                 fallback_limit_bytes,
+                working_set: false,
             })
         } else {
             None
         }
+    }
+
+    /// Report the working set (`memory.current` minus inactive page cache)
+    /// instead of the raw `memory.current`.
+    pub fn measuring_working_set(mut self) -> Self {
+        self.working_set = true;
+        self
     }
 
     fn read_u64(&self, file: &str) -> Option<u64> {
@@ -225,9 +256,16 @@ impl CgroupV2Probe {
 #[cfg(target_os = "linux")]
 impl MemoryProbe for CgroupV2Probe {
     fn snapshot(&self) -> MemorySnapshot {
+        let current = self.read_u64("memory.current").unwrap_or(0);
+        let current_bytes = if self.working_set {
+            let stat = std::fs::read_to_string(self.base.join("memory.stat")).ok();
+            cgroup_working_set_bytes(current, stat.as_deref())
+        } else {
+            current
+        };
         MemorySnapshot {
             limit_bytes: self.read_limit(),
-            current_bytes: self.read_u64("memory.current").unwrap_or(0),
+            current_bytes,
         }
     }
 }
@@ -237,6 +275,8 @@ impl MemoryProbe for CgroupV2Probe {
 enum ProbeChoice {
     /// The cgroup's own `memory.max` / `memory.current`.
     Cgroup,
+    /// The cgroup's `memory.max` against its working set.
+    CgroupWorkingSet,
     /// This process's RSS against a fixed limit.
     ProcessRss { limit_bytes: u64 },
 }
@@ -257,9 +297,12 @@ fn choose_probe(
     }
     match (source, cgroup_limit_bytes) {
         (MemoryProbeSource::Cgroup, Some(_)) => ProbeChoice::Cgroup,
-        (MemoryProbeSource::Cgroup, None) => ProbeChoice::ProcessRss {
-            limit_bytes: host_ram_bytes,
-        },
+        (MemoryProbeSource::CgroupWorkingSet, Some(_)) => ProbeChoice::CgroupWorkingSet,
+        (MemoryProbeSource::Cgroup | MemoryProbeSource::CgroupWorkingSet, None) => {
+            ProbeChoice::ProcessRss {
+                limit_bytes: host_ram_bytes,
+            }
+        }
         // Measure only this process, but still against the container's limit:
         // that is what an OOM kill enforces.
         (MemoryProbeSource::Process, limit) => ProbeChoice::ProcessRss {
@@ -274,8 +317,10 @@ fn choose_probe(
 /// against this process's RSS. Otherwise the limit is the cgroup v2 `memory.max`
 /// on Linux (host RAM elsewhere or when unlimited), and `source` decides what is
 /// measured against it: the whole cgroup's `memory.current`
-/// ([`MemoryProbeSource::Cgroup`], which counts every process in the container)
-/// or only this process's RSS ([`MemoryProbeSource::Process`]).
+/// ([`MemoryProbeSource::Cgroup`], which counts every process in the container),
+/// the cgroup's working set ([`MemoryProbeSource::CgroupWorkingSet`]: the same
+/// without reclaimable page cache) or only this process's RSS
+/// ([`MemoryProbeSource::Process`]).
 pub fn default_probe(
     memory_override: Option<u64>,
     source: MemoryProbeSource,
@@ -298,18 +343,31 @@ pub fn default_probe(
     let cgroup_limit: Option<u64> = None;
 
     match choose_probe(memory_override, source, cgroup_limit, host_ram) {
-        ProbeChoice::Cgroup => {
+        choice @ (ProbeChoice::Cgroup | ProbeChoice::CgroupWorkingSet) => {
             #[cfg(target_os = "linux")]
             if let Some(probe) = cgroup {
+                let probe = if choice == ProbeChoice::CgroupWorkingSet {
+                    probe.measuring_working_set()
+                } else {
+                    probe
+                };
                 let snapshot = probe.snapshot();
                 tracing::info!(
                     limit_bytes = snapshot.limit_bytes,
                     current_bytes = snapshot.current_bytes,
-                    "Memory probe: CgroupV2Probe (cgroup memory.max/current)"
+                    ?source,
+                    "Memory probe: CgroupV2Probe (cgroup memory.max against {})",
+                    if probe.working_set {
+                        "memory.current minus inactive_file"
+                    } else {
+                        "memory.current"
+                    }
                 );
                 return Box::new(probe);
             }
-            unreachable!("the cgroup probe is chosen only when a cgroup limit was read")
+            unreachable!(
+                "the cgroup probe ({choice:?}) is chosen only when a cgroup limit was read"
+            )
         }
         ProbeChoice::ProcessRss { limit_bytes } => {
             tracing::info!(
@@ -332,7 +390,11 @@ mod tests {
 
     #[test]
     fn an_override_pins_the_limit_against_process_rss() {
-        for source in [MemoryProbeSource::Cgroup, MemoryProbeSource::Process] {
+        for source in [
+            MemoryProbeSource::Cgroup,
+            MemoryProbeSource::CgroupWorkingSet,
+            MemoryProbeSource::Process,
+        ] {
             assert_eq!(
                 choose_probe(Some(2 * GIB), source, Some(12 * GIB), 64 * GIB),
                 ProbeChoice::ProcessRss {
@@ -353,6 +415,73 @@ mod tests {
             ProbeChoice::ProcessRss {
                 limit_bytes: 64 * GIB
             }
+        );
+    }
+
+    #[test]
+    fn working_set_source_measures_the_cgroup_when_there_is_one() {
+        assert_eq!(
+            choose_probe(
+                None,
+                MemoryProbeSource::CgroupWorkingSet,
+                Some(12 * GIB),
+                64 * GIB
+            ),
+            ProbeChoice::CgroupWorkingSet
+        );
+        assert_eq!(
+            choose_probe(None, MemoryProbeSource::CgroupWorkingSet, None, 64 * GIB),
+            ProbeChoice::ProcessRss {
+                limit_bytes: 64 * GIB
+            }
+        );
+    }
+
+    const MEMORY_STAT: &str = "anon 3000000000\nfile 2500000000\nkernel 120000000\n\
+active_anon 2900000000\ninactive_anon 100000000\nactive_file 500000000\n\
+inactive_file 2000000000\nunevictable 0\n";
+
+    #[test]
+    fn working_set_leaves_out_inactive_page_cache() {
+        assert_eq!(
+            cgroup_working_set_bytes(5_700_000_000, Some(MEMORY_STAT)),
+            3_700_000_000
+        );
+    }
+
+    #[test]
+    fn working_set_is_current_without_a_usable_memory_stat() {
+        // No memory.stat (e.g. gVisor), one without inactive_file, or a garbled
+        // value: fall back to the plain memory.current reading.
+        assert_eq!(cgroup_working_set_bytes(5_000, None), 5_000);
+        assert_eq!(
+            cgroup_working_set_bytes(5_000, Some("anon 4000\nfile 1000\n")),
+            5_000
+        );
+        assert_eq!(
+            cgroup_working_set_bytes(5_000, Some("inactive_file lots\n")),
+            5_000
+        );
+        assert_eq!(cgroup_working_set_bytes(5_000, Some("")), 5_000);
+    }
+
+    #[test]
+    fn working_set_matches_the_whole_inactive_file_key_only() {
+        // `total_inactive_file` (cgroup v1 style) is a different key.
+        assert_eq!(
+            cgroup_working_set_bytes(
+                5_000,
+                Some("total_inactive_file 4000\ninactive_file 1000\n")
+            ),
+            4_000
+        );
+    }
+
+    #[test]
+    fn working_set_never_goes_below_zero() {
+        assert_eq!(
+            cgroup_working_set_bytes(1_000, Some("inactive_file 5000\n")),
+            0
         );
     }
 

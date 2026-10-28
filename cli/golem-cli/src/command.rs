@@ -2219,12 +2219,17 @@ pub mod server {
     /// What the local server's memory admission measures as memory in use.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
     pub enum MemoryProbeArg {
-        /// Only the server's own process (resident memory). The default: other
-        /// processes sharing its container are not memory it can free.
+        /// The container's working set: the whole cgroup's memory minus the
+        /// reclaimable page cache, as kubelet measures it. The default: other
+        /// processes in the container count (they can get it OOM-killed), page
+        /// cache the kernel can drop does not
         #[default]
-        Process,
-        /// The whole cgroup (container) the server runs in.
+        CgroupWorkingSet,
+        /// The whole cgroup (container) the server runs in, page cache included
         Cgroup,
+        /// Only the server's own process (resident memory); other processes in
+        /// the container are not counted
+        Process,
     }
 
     #[derive(Debug, Args, Default)]
@@ -2274,8 +2279,7 @@ pub mod server {
         pub agent_filesystem_root: Option<PathBuf>,
 
         /// What memory admission measures against the memory limit (the
-        /// container's limit, or host RAM): the server process alone, or the
-        /// whole cgroup including every other process in the container
+        /// container's limit, or host RAM)
         #[clap(long, value_enum, default_value_t)]
         pub memory_probe: MemoryProbeArg,
     }

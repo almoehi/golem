@@ -417,10 +417,9 @@ fn worker_executor_config(
             deterministic_root_dir: args.agent_filesystem_root.clone(),
             ..Default::default()
         },
-        // The single binary usually shares its container with whatever else
-        // runs next to it, which the executor cannot free by evicting agents, so
-        // by default (`--memory-probe`) it measures its own process rather than
-        // the whole cgroup.
+        // `--memory-probe`, by default the container's working set: the single
+        // binary usually shares its container with other processes, which still
+        // count toward the OOM kill, while reclaimable page cache does not.
         memory: MemoryConfig {
             probe_source: args.memory_probe_source,
             ..Default::default()

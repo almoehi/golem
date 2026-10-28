@@ -715,7 +715,9 @@ impl<Ctx: WorkerCtx> InnerInvocationLoop<'_, Ctx> {
                         instance: self.instance,
                         store: store.deref_mut(),
                     };
-                    invocation.external_invocation(timestamped_invocation).await
+                    invocation
+                        .external_invocation(timestamped_invocation, pending_invocation.oplog_index)
+                        .await
                 }
                 .instrument(pickup_span)
                 .await;
@@ -938,10 +940,15 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
     /// Process an external queued worker invocation - this is either an exported function invocation
     /// or a manual update request (which involves invoking the exported save-snapshot functions, so
     /// it is a special case of the exported function invocation).
-    async fn external_invocation(&mut self, inner: TimestampedAgentInvocation) -> CommandOutcome {
+    /// `request` is the oplog index of the pending-invocation entry being run.
+    async fn external_invocation(
+        &mut self,
+        inner: TimestampedAgentInvocation,
+        request: OplogIndex,
+    ) -> CommandOutcome {
         match inner.invocation {
             AgentInvocation::ManualUpdate { target_revision } => {
-                self.manual_update(target_revision).await
+                self.manual_update(target_revision, request).await
             }
             invocation => {
                 if let Some(idempotency_key) = invocation.idempotency_key() {
@@ -1182,7 +1189,12 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
     }
 
     /// Try to perform the save-snapshot step of a manual update on the worker
-    async fn manual_update(&mut self, target_revision: ComponentRevision) -> CommandOutcome {
+    /// `request` is the oplog index of the pending `ManualUpdate` invocation.
+    async fn manual_update(
+        &mut self,
+        target_revision: ComponentRevision,
+        request: OplogIndex,
+    ) -> CommandOutcome {
         let span = span!(
             Level::INFO,
             "manual_update",
@@ -1195,13 +1207,17 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
                 .unwrap_or_else(|| "-".to_string()),
         );
 
-        self.manual_update_inner(target_revision)
+        self.manual_update_inner(target_revision, request)
             .instrument(span)
             .await
     }
 
     /// The inner implementation of the manual update command
-    async fn manual_update_inner(&mut self, target_revision: ComponentRevision) -> CommandOutcome {
+    async fn manual_update_inner(
+        &mut self,
+        target_revision: ComponentRevision,
+        request: OplogIndex,
+    ) -> CommandOutcome {
         let idempotency_key = {
             let ctx = self.store.data_mut();
             let idempotency_key = IdempotencyKey::fresh();
@@ -1311,10 +1327,11 @@ impl<Ctx: WorkerCtx> Invocation<'_, Ctx> {
                 // now. That is temporary: leave the manual update pending
                 // (nothing is recorded, so it is picked up again) and retry after
                 // the agent is unloaded, until it has waited too long.
-                match self
-                    .parent
-                    .on_update_out_of_memory(target_revision, UpdateSnapshotStep::Save)
-                {
+                match self.parent.on_update_out_of_memory(
+                    target_revision,
+                    request,
+                    UpdateSnapshotStep::Save,
+                ) {
                     UpdateMemoryDecision::Retry { .. } => {
                         CommandOutcome::BreakInnerLoop(RetryDecision::ReacquirePermits)
                     }

@@ -389,3 +389,80 @@ async fn second_manual_update_waits_for_memory_to_load_its_snapshot(
 
     Ok(())
 }
+
+/// The snapshot save of a manual update, refused memory, waits the same way:
+/// the update request stays queued and is retried once memory is back. The
+/// agent's snapshot is large enough that saving it has to grow its memory.
+#[test]
+#[tracing::instrument]
+async fn manual_update_waits_for_memory_to_save_its_snapshot(
+    last_unique_id: &LastUniqueId,
+    deps: &WorkerExecutorTestDependencies,
+    #[tagged_as("agent_counters")] agent_counters: &PrecompiledComponent,
+    _tracing: &Tracing,
+) -> anyhow::Result<()> {
+    let context = TestContext::new(last_unique_id);
+    let refusal = MemoryGrowRefusal::default();
+    let executor = start_with_overrides(
+        deps,
+        &context,
+        TestExecutorOverrides {
+            memory_grow_refusal: Some(refusal.clone()),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    let component = executor
+        .component_dep(&context.default_environment_id, agent_counters)
+        .store()
+        .await?;
+    let counter_id = agent_id!("PaddedSnapshotCounter", "save-waits-for-memory");
+    let worker_id = executor
+        .start_agent(&component.id, counter_id.clone())
+        .await?;
+    for _ in 0..3 {
+        executor
+            .invoke_and_await_agent(&component, &counter_id, "increment", data_value!())
+            .await?;
+    }
+
+    let target = executor
+        .update_component(&component.id, "it_agent_counters_v2_release")
+        .await?;
+    // Only the snapshot save needs more than 2 MiB of linear memory: refuse it.
+    refusal.refuse_beyond(component.revision, 2 * 1024 * 1024);
+    executor
+        .manual_update_worker(&worker_id, target.revision, false)
+        .await?;
+    await_condition(
+        Duration::from_secs(60),
+        "two refused snapshot saves",
+        || refusal.refusals() >= 2,
+    )
+    .await?;
+    let while_waiting = executor.get_worker_metadata(&worker_id).await?;
+
+    refusal.allow();
+    let metadata = await_metadata(
+        &executor,
+        &worker_id,
+        Duration::from_secs(60),
+        "the update to finish",
+        |metadata| update_counts(metadata) == (0, 1, 0),
+    )
+    .await?;
+    let after = executor
+        .invoke_and_await_agent(&component, &counter_id, "get", data_value!())
+        .await?;
+
+    executor.check_oplog_is_queryable(&worker_id).await?;
+    drop(executor);
+
+    // While the save waits the update is still requested (pending), not failed.
+    assert_eq!(update_counts(&while_waiting), (1, 0, 0));
+    assert_eq!(after, data_value!(3u32));
+    assert_eq!(metadata.component_revision, target.revision);
+
+    Ok(())
+}

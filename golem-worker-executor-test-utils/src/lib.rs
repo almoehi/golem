@@ -534,9 +534,8 @@ pub struct TestExecutorOverrides {
     pub measured_memory_usage: Option<Arc<AtomicU64>>,
 }
 
-/// Refuses an agent's memory grows while it runs a snapshotting function (a
-/// snapshot save or load) in a chosen component revision, with exactly the trap
-/// the executor's admission gate raises when it cannot admit a grow
+/// Refuses chosen memory grows of agents in one component revision with exactly
+/// the trap the executor's admission gate raises when it cannot admit a grow
 /// (`GolemSpecificWasmTrap::WorkerOutOfMemory`).
 ///
 /// The gate itself cannot be steered into refusing one particular grow of one
@@ -546,20 +545,36 @@ pub struct TestExecutorOverrides {
 /// gate happens to see.
 #[derive(Clone, Default)]
 pub struct MemoryGrowRefusal {
-    refused_revision: Arc<Mutex<Option<ComponentRevision>>>,
+    rule: Arc<Mutex<Option<(ComponentRevision, RefusedGrows)>>>,
     refusals: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+enum RefusedGrows {
+    /// Every grow while a snapshotting function runs (a snapshot load).
+    WhileSnapshotting,
+    /// Every grow to more than this many bytes of linear memory.
+    Beyond(usize),
 }
 
 impl MemoryGrowRefusal {
     /// Refuse every memory grow of an agent running a snapshotting function in
-    /// `revision` (the target revision refuses the update's snapshot load).
+    /// `revision`: in the target revision, the update's snapshot load.
     pub fn refuse_while_snapshotting(&self, revision: ComponentRevision) {
-        *self.refused_revision.lock().unwrap() = Some(revision);
+        *self.rule.lock().unwrap() = Some((revision, RefusedGrows::WhileSnapshotting));
+    }
+
+    /// Refuse every memory grow of an agent in `revision` to more than
+    /// `max_linear_memory` bytes. Reaches steps that do not run as snapshotting
+    /// functions, such as a manual update's snapshot save, when only that step
+    /// needs the extra memory.
+    pub fn refuse_beyond(&self, revision: ComponentRevision, max_linear_memory: usize) {
+        *self.rule.lock().unwrap() = Some((revision, RefusedGrows::Beyond(max_linear_memory)));
     }
 
     /// Stop refusing grows.
     pub fn allow(&self) {
-        *self.refused_revision.lock().unwrap() = None;
+        *self.rule.lock().unwrap() = None;
     }
 
     /// How many grows have been refused so far.
@@ -567,9 +582,19 @@ impl MemoryGrowRefusal {
         self.refusals.load(Ordering::SeqCst)
     }
 
-    fn refuses(&self, revision: ComponentRevision, calling_snapshotting_function: bool) -> bool {
-        let refuses = calling_snapshotting_function
-            && *self.refused_revision.lock().unwrap() == Some(revision);
+    fn refuses(
+        &self,
+        revision: ComponentRevision,
+        calling_snapshotting_function: bool,
+        desired: usize,
+    ) -> bool {
+        let refuses = match *self.rule.lock().unwrap() {
+            Some((refused_revision, rule)) if refused_revision == revision => match rule {
+                RefusedGrows::WhileSnapshotting => calling_snapshotting_function,
+                RefusedGrows::Beyond(max) => desired > max,
+            },
+            _ => false,
+        };
         if refuses {
             self.refusals.fetch_add(1, Ordering::SeqCst);
         }
@@ -1257,6 +1282,7 @@ impl ResourceLimiterAsync for TestWorkerCtx {
         if self.memory_grow_refusal.refuses(
             self.durable_ctx.component_metadata().revision,
             self.durable_ctx.is_calling_snapshotting_function(),
+            desired,
         ) {
             return Err(wasmtime::Error::from_anyhow(anyhow!(
                 GolemSpecificWasmTrap::WorkerOutOfMemory

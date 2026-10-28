@@ -1136,10 +1136,17 @@ pub enum MemoryProbeSource {
     /// process's RSS). Right when the executor owns its container, as in a pod.
     #[default]
     Cgroup,
-    /// This executor process's resident memory. Right when the container also
-    /// runs other processes, whose memory the executor cannot free by evicting
-    /// agents (e.g. the single-binary `golem server run` next to other services);
-    /// the share of the limit outside `worker_memory_ratio` has to cover them.
+    /// The cgroup's working set: `memory.current` minus the reclaimable inactive
+    /// page cache (`inactive_file` in `memory.stat`), as kubelet measures it.
+    /// Still counts every process in the container, so it keeps the OOM-kill
+    /// protection of `cgroup`, without letting page cache the kernel can drop
+    /// block admission. Falls back to `memory.current` when `memory.stat` has no
+    /// `inactive_file` (e.g. gVisor).
+    CgroupWorkingSet,
+    /// This executor process's resident memory only. Other processes in the
+    /// container are not counted at all: the share of the limit outside
+    /// `worker_memory_ratio` has to cover them, or the container can be
+    /// OOM-killed although the gate sees headroom.
     Process,
 }
 

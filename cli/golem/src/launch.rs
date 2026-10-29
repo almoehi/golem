@@ -325,6 +325,14 @@ fn shard_manager_config(
             port: registry_service_run_details.grpc_port,
             ..Default::default()
         },
+        // AssignShards makes the (single, local) executor open every shard's oplog DB, which
+        // takes minutes with large state. The 5s default timed out and retried forever, each
+        // retry restarting that work, so the server never became ready.
+        worker_executors: golem_shard_manager::config::WorkerExecutorServiceConfig {
+            assign_shards_timeout: std::time::Duration::from_secs(600),
+            revoke_shards_timeout: std::time::Duration::from_secs(600),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }

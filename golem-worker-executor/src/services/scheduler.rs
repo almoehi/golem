@@ -16,7 +16,7 @@ use crate::metrics::oplog::record_scheduled_archive;
 use crate::metrics::promises::record_scheduled_promise_completed;
 use crate::services::HasOplog;
 use crate::services::oplog::{EphemeralOplog, MultiLayerOplog, Oplog, OplogService};
-use crate::services::promise::PromiseService;
+use crate::services::promise::{OwnerActivation, PromiseService};
 use crate::services::shard::ShardService;
 use crate::services::worker::WorkerService;
 use crate::services::worker_activator::WorkerActivator;
@@ -451,7 +451,7 @@ impl SchedulerServiceDefault {
 
                 let result = self
                     .promise_service
-                    .complete(promise_id.clone(), vec![])
+                    .complete(promise_id.clone(), vec![], OwnerActivation::Activate)
                     .await;
 
                 // TODO: We probably need more error handling here as not completing a promise that is expected to complete can lead to deadlocks.

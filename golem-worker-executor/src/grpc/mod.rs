@@ -21,6 +21,7 @@ use crate::model::public_oplog::{
 };
 use crate::model::{LastError, ReadFileResult};
 use crate::services::events::Event;
+use crate::services::promise::OwnerActivation;
 use crate::services::worker_activator::{
     DefaultWorkerActivator, LazyWorkerActivator, WorkerActivator,
 };
@@ -438,7 +439,10 @@ impl<Ctx: WorkerCtx, Svcs: HasAll<Ctx> + UsesAllDeps<Ctx = Ctx> + Send + Sync + 
             .try_into()
             .map_err(WorkerExecutorError::invalid_request)?;
 
-        let completed = self.promise_service().complete(promise_id, data).await?;
+        let completed = self
+            .promise_service()
+            .complete(promise_id, data, OwnerActivation::Activate)
+            .await?;
 
         let success = golem::workerexecutor::v1::CompletePromiseSuccess { completed };
 

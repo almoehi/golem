@@ -44,7 +44,7 @@ use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
 pub struct PromiseHandle {
@@ -131,6 +131,18 @@ impl PromiseHandle {
     }
 }
 
+/// Whether completing a promise also wakes the agent that owns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerActivation {
+    /// Wake the owning agent (detached, see `DefaultPromiseService::complete`).
+    Activate,
+    /// The completer IS the owning agent, inside its own running host call: it is
+    /// evidently running and needs no wakeup. Activating it would take its own
+    /// worker's instance lock from within its invocation and can deadlock against a
+    /// concurrent stop.
+    SkipSelf,
+}
+
 /// Service implementing creation, completion and polling of promises
 #[async_trait]
 pub trait PromiseService: Send + Sync {
@@ -145,6 +157,7 @@ pub trait PromiseService: Send + Sync {
         &self,
         promise_id: PromiseId,
         data: Vec<u8>,
+        activation: OwnerActivation,
     ) -> Result<bool, WorkerExecutorError>;
 
     // Hint the promise service that a promise might be dropped, making sure it collects any dangling references
@@ -185,12 +198,17 @@ impl PromiseService for LazyPromiseService {
         &self,
         promise_id: PromiseId,
         data: Vec<u8>,
+        activation: OwnerActivation,
     ) -> Result<bool, WorkerExecutorError> {
         crate::metrics::promises::record_promise_data_size(data.len());
         let start = std::time::Instant::now();
 
         let lock = self.0.read().await;
-        let result = lock.as_ref().unwrap().complete(promise_id, data).await;
+        let result = lock
+            .as_ref()
+            .unwrap()
+            .complete(promise_id, data, activation)
+            .await;
 
         let outcome = match &result {
             Ok(true) => "fulfilled",
@@ -366,6 +384,7 @@ impl PromiseService for DefaultPromiseService {
         &self,
         promise_id: PromiseId,
         data: Vec<u8>,
+        activation: OwnerActivation,
     ) -> Result<bool, WorkerExecutorError> {
         let key = get_promise_result_redis_key(&promise_id);
 
@@ -410,9 +429,25 @@ impl PromiseService for DefaultPromiseService {
         // Wake up the worker that owns the promise, ensuring that it resumes its work.
         // We do this unconditionally here as the only reason complete will be called again during replay is if we managed to write
         // the result to storage, but failed before the worker could persist the result.
-        self.worker_access
-            .activate_worker_if_needed(&promise_id)
-            .await?;
+        //
+        // The activation is detached: the result is already persisted and in-memory handles
+        // are woken, so it is only a wakeup hint (`poll` re-reads storage). Awaiting it would
+        // make the completer wait on the owner's instance lock, which a stopping owner holds
+        // until its in-flight work (possibly this very caller) finishes.
+        match activation {
+            OwnerActivation::Activate => {
+                let worker_access = self.worker_access.clone();
+                let promise_id = promise_id.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = worker_access.activate_worker_if_needed(&promise_id).await {
+                        warn!(
+                            "Failed to activate the owner of completed promise {promise_id}: {err}"
+                        );
+                    }
+                });
+            }
+            OwnerActivation::SkipSelf => {}
+        }
 
         Ok(written)
     }
@@ -617,6 +652,7 @@ impl PromiseService for PromiseServiceMock {
         &self,
         promise_id: PromiseId,
         _data: Vec<u8>,
+        _activation: OwnerActivation,
     ) -> Result<bool, WorkerExecutorError> {
         self.completed.lock().await.insert(promise_id);
         Ok(true)
@@ -660,6 +696,81 @@ mod tests {
         }
     }
 
+    /// Owner activation that never finishes, recording that it was invoked.
+    struct BlockingPromiseWorkerAccess {
+        invoked: Arc<Notify>,
+        invocations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl PromiseWorkerAccess for BlockingPromiseWorkerAccess {
+        async fn activate_worker_if_needed(
+            &self,
+            _promise_id: &PromiseId,
+        ) -> Result<(), WorkerExecutorError> {
+            self.invocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.invoked.notify_one();
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    const COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    async fn complete_with_blocking_owner(
+        activation: OwnerActivation,
+    ) -> (
+        Arc<Notify>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        PromiseHandle,
+    ) {
+        let invoked = Arc::new(Notify::new());
+        let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = DefaultPromiseService::new(
+            Arc::new(InMemoryKeyValueStorage::new()),
+            Arc::new(BlockingPromiseWorkerAccess {
+                invoked: invoked.clone(),
+                invocations: invocations.clone(),
+            }),
+        );
+        let id = promise_id();
+        let id = service.create(&id.agent_id, id.oplog_idx).await;
+        let handle = service.poll(id.clone()).await.unwrap();
+
+        let written = tokio::time::timeout(
+            COMPLETE_TIMEOUT,
+            service.complete(id.clone(), vec![7], activation),
+        )
+        .await
+        .expect("complete blocked on the owner's activation")
+        .unwrap();
+
+        assert!(written);
+        assert_eq!(handle.get().await, Some(vec![7]));
+        assert_eq!(service.completed_data(&id).await, Some(vec![7]));
+        (invoked, invocations, handle)
+    }
+
+    #[test]
+    async fn self_owned_completion_never_activates_the_owner() {
+        let (_invoked, invocations, _handle) =
+            complete_with_blocking_owner(OwnerActivation::SkipSelf).await;
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    async fn completion_does_not_wait_for_owner_activation_but_triggers_it() {
+        let (invoked, invocations, _handle) =
+            complete_with_blocking_owner(OwnerActivation::Activate).await;
+        tokio::time::timeout(COMPLETE_TIMEOUT, invoked.notified())
+            .await
+            .expect("detached activation never ran");
+        assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[test]
     async fn local_completion_updates_handle_before_returning() {
         let promise_id = promise_id();
@@ -692,8 +803,18 @@ mod tests {
         let id = service_a.create(&id.agent_id, id.oplog_idx).await;
         let handle = service_b.poll(id.clone()).await.unwrap();
 
-        assert!(service_a.complete(id.clone(), vec![1]).await.unwrap());
-        assert!(!service_b.complete(id, vec![2]).await.unwrap());
+        assert!(
+            service_a
+                .complete(id.clone(), vec![1], OwnerActivation::Activate)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !service_b
+                .complete(id, vec![2], OwnerActivation::Activate)
+                .await
+                .unwrap()
+        );
         assert_eq!(handle.get().await, Some(vec![1]));
     }
 

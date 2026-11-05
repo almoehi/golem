@@ -28,7 +28,7 @@ use crate::preview2::golem_api_1_x::oplog::{
 };
 use crate::preview2::{Pollable, golem_api_1_x};
 use crate::services::oplog::CommitLevel;
-use crate::services::promise::{PromiseHandle, PromiseService};
+use crate::services::promise::{OwnerActivation, PromiseHandle, PromiseService};
 use crate::services::worker_proxy::WorkerProxyError;
 use crate::services::{HasOplogService, HasWorker};
 use crate::worker::status::calculate_last_known_status_with_checkpoint;
@@ -223,10 +223,18 @@ impl<Ctx: WorkerCtx> Host for DurableWorkerCtx<Ctx> {
                 Err(other) => Err(other)?,
             };
 
+            // The caller owning the promise is running this very host call: never
+            // activate it (see `OwnerActivation::SkipSelf`).
+            let owner_activation = if *agent_id == self.owned_agent_id.agent_id {
+                OwnerActivation::SkipSelf
+            } else {
+                OwnerActivation::Activate
+            };
+
             let promise_completion_result = if is_local_worker {
                 self.public_state
                     .promise_service
-                    .complete(promise_id.clone(), data)
+                    .complete(promise_id.clone(), data, owner_activation)
                     .await?
             } else {
                 // talk to the executor that actually owns the promise

@@ -427,8 +427,10 @@ impl PromiseService for DefaultPromiseService {
         }
 
         // Wake up the worker that owns the promise, ensuring that it resumes its work.
-        // We do this unconditionally here as the only reason complete will be called again during replay is if we managed to write
-        // the result to storage, but failed before the worker could persist the result.
+        // We do this even when the promise was already completed (`written == false`): the only
+        // reason complete is called again during replay is that a previous call wrote the result
+        // to storage but failed before the worker could persist it. The one exception is
+        // `OwnerActivation::SkipSelf` - the owner is the caller, running this very completion.
         //
         // The activation is detached: the result is already persisted and in-memory handles
         // are woken, so it is only a wakeup hint (`poll` re-reads storage). Awaiting it would

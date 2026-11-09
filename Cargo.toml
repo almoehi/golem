@@ -315,6 +315,8 @@ x509-certificate = "0.23.1"
 zstd = "0.13"
 
 [patch.crates-io]
+# Raises the Wizer host-call fuel for pre-initializing large JS components (see the crate's optimize.rs).
+wasm-rquickjs = { path = "vendor-patches/wasm-rquickjs" }
 wasmtime = { git = "https://github.com/golemcloud/wasmtime.git", branch = "golem-wasmtime-v45.0.0" }
 wasmtime-wasi = { git = "https://github.com/golemcloud/wasmtime.git", branch = "golem-wasmtime-v45.0.0" }
 wasmtime-wasi-http = { git = "https://github.com/golemcloud/wasmtime.git", branch = "golem-wasmtime-v45.0.0" }
